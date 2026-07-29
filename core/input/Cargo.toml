@@ -1,0 +1,8 @@
+[package]
+name = "mycelium-input"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+sdl2 = { version = "0.38", features = ["bundled"] }
