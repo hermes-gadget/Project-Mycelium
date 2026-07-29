@@ -1,6 +1,7 @@
 //! C ABI and MeshCore C++ adapters for Project Mycelium's virtual radio bus.
 
 mod ffi;
+mod flash_ffi;
 
 pub use ffi::{
     meshemu_board_create, meshemu_board_deep_sleep, meshemu_board_destroy,
@@ -31,6 +32,12 @@ pub use ffi::{
     meshemu_wire_read, meshemu_wire_read_idle_levels, meshemu_wire_request_from,
     meshemu_wire_set_clock, meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance,
     meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+};
+pub use flash_ffi::{
+    meshemu_get_otadata_address, meshemu_is_under_launcher, meshemu_nvs_destroy,
+    meshemu_nvs_exists, meshemu_nvs_get_bool, meshemu_nvs_get_string, meshemu_nvs_init,
+    meshemu_nvs_put_bool, meshemu_nvs_put_string, meshemu_nvs_remove, meshemu_partition_find_first,
+    meshemu_partition_find_first_for_instance, meshemu_partition_set_launcher_mode,
 };
 pub use mycelium_board::{meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop};
 
