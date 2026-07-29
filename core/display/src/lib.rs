@@ -1,9 +1,12 @@
 //! SDL2-backed display emulation for virtual T-Deck instances.
 
 mod config;
+mod framebuffer;
 mod lvgl_v8;
 pub mod lvgl_v9;
 pub mod manager;
+pub mod shared_spi;
+pub mod st7789;
 mod version;
 pub mod window;
 
@@ -12,7 +15,10 @@ use std::ffi::{c_char, c_void, CStr};
 
 use libloading::Library;
 
-pub use config::{DisplayConfig, T_DECK_HEIGHT, T_DECK_WIDTH};
+pub use config::{
+    DisplayBackendOptions, DisplayConfig, DEFAULT_DRAW_BUFFER_ROWS, T_DECK_HEIGHT, T_DECK_WIDTH,
+};
+pub use framebuffer::{host_rgb565_to_st7789_wire, st7789_wire_to_host_rgb565, Rgb565ByteOrder};
 pub use lvgl_v8::lvgl_v8_init_sdl;
 pub use lvgl_v9::lvgl_v9_init_sdl;
 pub use manager::DisplayManager;
@@ -76,8 +82,54 @@ pub fn meshemu_display_init(
         return std::ptr::null_mut();
     }
     match version {
-        LvglVersion::V8 => lvgl_v8_init_sdl(instance_id, width, height),
-        LvglVersion::V9 | LvglVersion::Unknown => lvgl_v9_init_sdl(instance_id, width, height),
+        LvglVersion::V8 => lvgl_v8::lvgl_v8_init_sdl_with_options(
+            instance_id,
+            width,
+            height,
+            DisplayBackendOptions::default(),
+        ),
+        LvglVersion::V9 | LvglVersion::Unknown => lvgl_v9::lvgl_v9_init_sdl_with_options(
+            instance_id,
+            width,
+            height,
+            DisplayBackendOptions::default(),
+        ),
+    }
+}
+
+/// Create a display using explicit partial-buffer and controller-fidelity
+/// options.
+///
+/// # Safety
+///
+/// `window_title` and `options` must be null or point to readable values for
+/// the duration of this call.
+pub unsafe extern "C" fn meshemu_display_create_ex(
+    width: i32,
+    height: i32,
+    window_title: *const c_char,
+    lvgl_version: i32,
+    options: *const DisplayBackendOptions,
+) -> *mut c_void {
+    let title = if window_title.is_null() {
+        "T-Deck".into()
+    } else {
+        unsafe { CStr::from_ptr(window_title) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let Some(options) = (if options.is_null() {
+        Some(DisplayBackendOptions::default())
+    } else {
+        unsafe { options.as_ref() }.copied()
+    })
+    .and_then(|options| options.validated(height.max(0) as u32)) else {
+        return std::ptr::null_mut();
+    };
+    match lvgl_version {
+        8 => lvgl_v8::lvgl_v8_init_sdl_with_options(&title, width, height, options),
+        9 => lvgl_v9::lvgl_v9_init_sdl_with_options(&title, width, height, options),
+        _ => std::ptr::null_mut(),
     }
 }
 
@@ -116,20 +168,21 @@ pub unsafe extern "C" fn meshemu_display_create_v(
 /// `display` must be null or point to readable display-handle memory.
 pub unsafe fn capture_managed_rgb565(display: *mut c_void) -> Option<Vec<u8>> {
     unsafe { lvgl_v8::capture_rgb565(display) }
+        .or_else(|| unsafe { lvgl_v9::capture_managed_rgb565(display) })
 }
 
-/// Destroy a host-managed LVGL v8 compatibility display.
+/// Destroy a host-managed LVGL v8 or v9 display with its owning backend API.
 ///
 /// # Safety
 ///
-/// `display` must be null or a live handle returned by [`lvgl_v8_init_sdl`].
+/// `display` must be null or a live handle returned by a display initializer.
 pub unsafe fn destroy_managed_display(display: *mut c_void) {
-    unsafe { lvgl_v8::destroy_display(display) };
+    if !unsafe { lvgl_v8::destroy_display(display) } {
+        unsafe { lvgl_v9::destroy_display(display) };
+    }
 }
 
 /// Destroy a Mycelium-managed compatibility display.
-///
-/// Native LVGL v9 displays remain owned by the firmware's LVGL runtime.
 ///
 /// # Safety
 ///

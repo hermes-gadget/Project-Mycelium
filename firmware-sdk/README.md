@@ -90,7 +90,7 @@ static void* display;
 
 void firmware_setup(void)
 {
-    display = meshemu_display_create("minimal-firmware", 320, 240);
+    display = meshemu_display_create(320, 240, "minimal-firmware");
 }
 
 void firmware_loop(void)
@@ -107,3 +107,15 @@ void* firmware_get_display(void)
 Keep `firmware_loop()` non-blocking so Mycelium can advance every virtual node
 and process UI, radio, and input events each frame. A headless firmware should
 return `NULL` from `firmware_get_display()`.
+
+## Display memory and fidelity
+
+Display capture returns packed RGB565 in host-native `uint16_t` byte order,
+not high-byte-first ST7789 SPI order. The default backend consumes
+already-corrected, top-left-origin logical LVGL pixels and uses a 24-row
+partial draw buffer.
+
+Use `meshemu_display_create_ex()` to choose a different number of draw-buffer
+rows or opt into the ST7789 command/orientation model. See
+[`core/display/README.md`](../core/display/README.md) for the exact pixel,
+controller, shared-SPI, and UI-only backend contract.

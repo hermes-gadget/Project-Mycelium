@@ -812,6 +812,31 @@ pub unsafe extern "C" fn meshemu_display_create_v(
     unsafe { mycelium_display::meshemu_display_create_v(width, height, window_title, lvgl_version) }
 }
 
+/// Creates an LVGL display with explicit partial-buffer and fidelity options.
+///
+/// # Safety
+///
+/// `window_title` and `options` must be null or point to readable values for
+/// this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_display_create_ex(
+    width: i32,
+    height: i32,
+    window_title: *const c_char,
+    lvgl_version: i32,
+    options: *const mycelium_display::DisplayBackendOptions,
+) -> *mut c_void {
+    unsafe {
+        mycelium_display::meshemu_display_create_ex(
+            width,
+            height,
+            window_title,
+            lvgl_version,
+            options,
+        )
+    }
+}
+
 /// Creates a default LVGL v9 display.
 ///
 /// # Safety
@@ -826,7 +851,7 @@ pub unsafe extern "C" fn meshemu_display_create(
     unsafe { meshemu_display_create_v(width, height, window_title, 9) }
 }
 
-/// Captures an LVGL SDL display as a newly allocated packed RGB565 buffer.
+/// Captures an LVGL display as native-endian packed RGB565.
 ///
 /// The caller owns the returned allocation and must release it with
 /// [`meshemu_display_capture_free`], passing the value written to `size_out`.
@@ -877,11 +902,9 @@ pub unsafe extern "C" fn meshemu_display_capture_free(data: *mut u8, size: usize
 
 /// Destroys a Mycelium-managed compatibility display.
 ///
-/// Native LVGL v9 displays remain owned by their firmware runtime.
-///
 /// # Safety
 ///
-/// `display` must be null or a live handle returned by the v8 display creator.
+/// `display` must be null or a live handle returned by a display creator.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_display_destroy(display: *mut c_void) {
     unsafe { mycelium_display::meshemu_display_destroy(display) };
