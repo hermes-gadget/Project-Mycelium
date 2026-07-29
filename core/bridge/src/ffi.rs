@@ -9,7 +9,7 @@ use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
 use mycelium_storage::StorageManager;
-use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
+use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, Sx1262State, TxEvent};
 use sdl2::keyboard::Keycode;
 
 struct BusState {
@@ -30,8 +30,7 @@ impl BusState {
 
 struct RadioHandle {
     node_id: String,
-    channel: RadioChannel,
-    tx_power_dbm: f64,
+    radio: Sx1262State,
     pending: Mutex<VecDeque<RxPacket>>,
     last_rx: Mutex<Option<(f32, f32)>>,
 }
@@ -119,23 +118,18 @@ fn valid_position(lat: f64, lon: f64) -> bool {
         && (-180.0..=180.0).contains(&lon)
 }
 
-fn valid_radio_config(
+fn sx1262_state(
     freq_mhz: f64,
     bandwidth_khz: u16,
     spreading_factor: u8,
     coding_rate: u8,
     tx_power_dbm: f64,
-) -> bool {
+) -> Option<Sx1262State> {
     // SX1262 operating limits and the LoRa modulation settings supported by
     // the bridge. Reject rather than passing unchecked values into airtime
     // arithmetic across the FFI boundary.
-    freq_mhz.is_finite()
-        && (150.0..=960.0).contains(&freq_mhz)
-        && matches!(bandwidth_khz, 125 | 250 | 500)
-        && (7..=12).contains(&spreading_factor)
-        && (5..=8).contains(&coding_rate)
-        && tx_power_dbm.is_finite()
-        && (-17.0..=22.0).contains(&tx_power_dbm)
+    let channel = RadioChannel::new(freq_mhz, bandwidth_khz, spreading_factor, coding_rate)?;
+    Sx1262State::new(channel, tx_power_dbm)
 }
 
 /// Mounts the virtual SPIFFS partition for an emulator instance.
@@ -929,16 +923,16 @@ pub unsafe extern "C" fn meshemu_radio_create(
     lat: f64,
     lon: f64,
 ) -> *mut c_void {
-    if instance_id.is_null()
-        || !valid_radio_config(
-            freq_mhz,
-            bandwidth_khz,
-            spreading_factor,
-            coding_rate,
-            tx_power_dbm,
-        )
-        || !valid_position(lat, lon)
-    {
+    let Some(radio_state) = sx1262_state(
+        freq_mhz,
+        bandwidth_khz,
+        spreading_factor,
+        coding_rate,
+        tx_power_dbm,
+    ) else {
+        return ptr::null_mut();
+    };
+    if instance_id.is_null() || !valid_position(lat, lon) {
         return ptr::null_mut();
     }
 
@@ -949,25 +943,21 @@ pub unsafe extern "C" fn meshemu_radio_create(
         return ptr::null_mut();
     }
 
-    let channel = RadioChannel {
-        freq_mhz,
-        bandwidth_khz,
-        spreading_factor,
-        coding_rate,
-    };
     let mut state = lock(&BUS);
     if !state.node_ids.insert(node_id.clone()) {
         return ptr::null_mut();
     }
-    state
-        .bus
-        .register_node(node_id.clone(), (lat, lon), tx_power_dbm, channel.clone());
+    state.bus.register_node(
+        node_id.clone(),
+        (lat, lon),
+        radio_state.tx_power_dbm,
+        radio_state.channel.clone(),
+    );
     drop(state);
 
     Box::into_raw(Box::new(RadioHandle {
         node_id,
-        channel,
-        tx_power_dbm,
+        radio: radio_state,
         pending: Mutex::new(VecDeque::new()),
         last_rx: Mutex::new(None),
     })) as *mut c_void
@@ -999,9 +989,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     };
     let airtime_ms = propagation::airtime_ms(
         bytes.len(),
-        handle.channel.spreading_factor,
-        handle.channel.bandwidth_khz,
-        handle.channel.coding_rate,
+        handle.radio.channel.spreading_factor,
+        handle.radio.channel.bandwidth_khz,
+        handle.radio.channel.coding_rate,
         8,
         true,
     );
@@ -1009,9 +999,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     let timestamp_ms = state.now_ms;
     state.bus.broadcast(TxEvent {
         node_id: handle.node_id.clone(),
-        channel: handle.channel.clone(),
+        channel: handle.radio.channel.clone(),
         data: bytes.to_vec(),
-        tx_power_dbm: handle.tx_power_dbm,
+        tx_power_dbm: handle.radio.tx_power_dbm,
         airtime_ms,
         position: (0.0, 0.0),
         timestamp_ms,
@@ -1020,19 +1010,24 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
 
 /// Copies one queued packet into `buffer`, returning zero when none is ready.
 ///
-/// If the buffer is too small, the packet remains queued and its required
-/// length is returned as a negative value.
+/// If the buffer is too small, `truncated` is set, the packet remains queued,
+/// and its required length is returned as a negative value.
 ///
 /// # Safety
 ///
 /// `radio` must be a live bridge handle, and `buffer` must reference at least
-/// `max_len` writable bytes when `max_len` is positive.
+/// `max_len` writable bytes when `max_len` is positive. When non-null,
+/// `truncated` must point to writable storage.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_radio_recv_raw(
     radio: *mut c_void,
     buffer: *mut u8,
     max_len: i32,
+    truncated: *mut bool,
 ) -> i32 {
+    if !truncated.is_null() {
+        unsafe { *truncated = false };
+    }
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0;
     };
@@ -1049,6 +1044,9 @@ pub unsafe extern "C" fn meshemu_radio_recv_raw(
         return 0;
     };
     if packet.data.len() > max_len as usize {
+        if !truncated.is_null() {
+            unsafe { *truncated = true };
+        }
         return -(packet.data.len().min(i32::MAX as usize) as i32);
     }
     let packet = pending.pop_front().expect("front was checked above");
@@ -1073,9 +1071,9 @@ pub unsafe extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: 
     }
     propagation::airtime_ms(
         len as usize,
-        handle.channel.spreading_factor,
-        handle.channel.bandwidth_khz,
-        handle.channel.coding_rate,
+        handle.radio.channel.spreading_factor,
+        handle.radio.channel.bandwidth_khz,
+        handle.radio.channel.coding_rate,
         8,
         true,
     )
@@ -1150,11 +1148,19 @@ pub unsafe extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
 #[no_mangle]
 pub extern "C" fn meshemu_bus_tick(now_ms: u64) {
     let mut state = lock(&BUS);
-    state.now_ms = now_ms;
-    state.bus.tick(now_ms);
+    // Host clocks can be reset or sampled out of order. Radio airtime and
+    // overlap decisions use a monotonic timeline, so clamp backward jumps.
+    let monotonic_now_ms = state.now_ms.max(now_ms);
+    state.now_ms = monotonic_now_ms;
+    state.bus.tick(monotonic_now_ms);
 }
 
 #[cfg(test)]
 pub(crate) fn reset_bus() {
     *lock(&BUS) = BusState::new();
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn radio_state(radio: *mut c_void) -> Option<Sx1262State> {
+    Some((unsafe { handle_ref(radio) })?.radio.clone())
 }

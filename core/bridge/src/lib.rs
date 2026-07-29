@@ -41,8 +41,16 @@ mod tests {
 
     fn receive(radio: *mut c_void) -> Vec<u8> {
         let mut buffer = [0_u8; 255];
-        let len =
-            unsafe { meshemu_radio_recv_raw(radio, buffer.as_mut_ptr(), buffer.len() as i32) };
+        let mut truncated = false;
+        let len = unsafe {
+            meshemu_radio_recv_raw(
+                radio,
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+                &mut truncated,
+            )
+        };
+        assert!(!truncated);
         buffer[..len.max(0) as usize].to_vec()
     }
 
@@ -144,7 +152,14 @@ mod tests {
         .is_null());
         assert!(!unsafe { meshemu_radio_start_send(std::ptr::null_mut(), std::ptr::null(), 1) });
         assert_eq!(
-            unsafe { meshemu_radio_recv_raw(std::ptr::null_mut(), std::ptr::null_mut(), 0) },
+            unsafe {
+                meshemu_radio_recv_raw(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
             0
         );
         destroy(std::ptr::null_mut());
@@ -216,13 +231,54 @@ mod tests {
         meshemu_bus_tick(u64::from(airtime));
 
         let mut small = [0_u8; 2];
+        let mut truncated = false;
         assert_eq!(
-            unsafe { meshemu_radio_recv_raw(receiver, small.as_mut_ptr(), small.len() as i32) },
+            unsafe {
+                meshemu_radio_recv_raw(
+                    receiver,
+                    small.as_mut_ptr(),
+                    small.len() as i32,
+                    &mut truncated,
+                )
+            },
             -4
         );
+        assert!(truncated);
         assert_eq!(receive(receiver), packet);
 
         destroy(receiver);
+        destroy(sender);
+    }
+
+    #[test]
+    fn radio_initialization_models_sx1262_board_controls() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let radio = create("sx1262-state", (0.0, 0.0));
+
+        let state = unsafe { ffi::radio_state(radio) }.unwrap();
+        assert!(state.dio2_rf_switch_enabled);
+        assert_eq!(state.dio3_tcxo_voltage_v, Some(1.8));
+
+        destroy(radio);
+    }
+
+    #[test]
+    fn bus_time_does_not_move_backward() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let sender = create("sender", (0.0, 0.0));
+        let packet = [1, 2, 3, 4];
+
+        meshemu_bus_tick(1_000);
+        assert!(send(sender, &packet));
+        let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
+        meshemu_bus_tick(10);
+        assert!(!unsafe { meshemu_radio_is_send_complete(sender) });
+        assert!(!send(sender, &packet));
+        meshemu_bus_tick(1_000 + u64::from(airtime));
+        assert!(unsafe { meshemu_radio_is_send_complete(sender) });
+
         destroy(sender);
     }
 
