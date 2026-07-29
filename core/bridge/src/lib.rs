@@ -8,16 +8,18 @@ pub use ffi::{
     meshemu_display_capture_free, meshemu_display_create, meshemu_display_create_v,
     meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read,
     meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_i2c_keyboard_create,
-    meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key_byte, meshemu_input_inject_key,
-    meshemu_input_inject_touch, meshemu_input_poll_key, meshemu_input_poll_touch,
-    meshemu_radio_create, meshemu_radio_destroy, meshemu_radio_get_est_airtime,
-    meshemu_radio_get_rssi, meshemu_radio_get_snr, meshemu_radio_is_send_complete,
-    meshemu_radio_recv_raw, meshemu_radio_set_position, meshemu_radio_start_send,
-    meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_write, meshemu_spiffs_init,
-    meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free, meshemu_wire_available,
-    meshemu_wire_begin, meshemu_wire_begin_transmission, meshemu_wire_end_transmission,
-    meshemu_wire_read, meshemu_wire_request_from, meshemu_wire_set_clock, meshemu_wire_shim_create,
-    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+    meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key_byte, meshemu_input_digital_read,
+    meshemu_input_inject_key, meshemu_input_inject_touch, meshemu_input_poll_key,
+    meshemu_input_poll_touch, meshemu_input_take_falling_edges, meshemu_radio_create,
+    meshemu_radio_destroy, meshemu_radio_get_est_airtime, meshemu_radio_get_rssi,
+    meshemu_radio_get_snr, meshemu_radio_is_send_complete, meshemu_radio_recv_raw,
+    meshemu_radio_set_position, meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read,
+    meshemu_sdcard_write, meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write,
+    meshemu_storage_data_free, meshemu_wire_available, meshemu_wire_begin,
+    meshemu_wire_begin_transmission, meshemu_wire_end_transmission, meshemu_wire_read,
+    meshemu_wire_request_from, meshemu_wire_set_clock, meshemu_wire_shim_create,
+    meshemu_wire_shim_create_for_instance, meshemu_wire_shim_destroy,
+    meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 pub use mycelium_board::{meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop};
 
@@ -271,6 +273,50 @@ mod tests {
     }
 
     #[test]
+    fn instance_wire_observes_input_manager_keyboard_and_touch_state() {
+        let id = CString::new("ffi-shared-input").unwrap();
+        let manager = mycelium_input::register_input_manager("ffi-shared-input", 1.0);
+        let wire = unsafe { meshemu_wire_shim_create_for_instance(id.as_ptr()) };
+        assert!(!wire.is_null());
+
+        {
+            let mut manager = manager.lock().unwrap();
+            manager.inject_key(sdl2::keyboard::Keycode::Q, true);
+            manager.inject_touch(100, 40, true);
+        }
+
+        unsafe {
+            assert!(meshemu_wire_begin(wire));
+            meshemu_wire_set_clock(wire, 100_000);
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            meshemu_wire_write(wire, mycelium_input::KEYBOARD_KEY_MODE_COMMAND);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+            assert_eq!(
+                meshemu_wire_request_from(wire, mycelium_input::KEYBOARD_I2C_ADDRESS, 1),
+                1
+            );
+            assert_eq!(meshemu_wire_read(wire), i32::from(b'q'));
+
+            meshemu_wire_begin_transmission(wire, mycelium_input::GT911_I2C_ADDRESS);
+            for byte in mycelium_input::GT911_STATUS_REGISTER.to_be_bytes() {
+                meshemu_wire_write(wire, byte);
+            }
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+            assert_eq!(
+                meshemu_wire_request_from(wire, mycelium_input::GT911_I2C_ADDRESS, 9),
+                9
+            );
+            assert_eq!(meshemu_wire_read(wire), 0x81);
+            assert!(!meshemu_input_digital_read(
+                id.as_ptr(),
+                mycelium_input::GT911_INT_GPIO
+            ));
+            meshemu_wire_shim_destroy(wire);
+        }
+        mycelium_input::remove_input_manager("ffi-shared-input");
+    }
+
+    #[test]
     fn wire_ffi_rejects_null_handles_and_non_keyboard_addresses() {
         unsafe {
             meshemu_i2c_keyboard_inject_key_byte(std::ptr::null_mut(), 0);
@@ -358,7 +404,7 @@ mod tests {
         }
         assert_eq!(
             unsafe { meshemu_input_poll_touch(id.as_ptr()) },
-            123 | (45 << 16) | (255 << 32)
+            45 | (196 << 16) | (255 << 32)
         );
         assert_eq!(unsafe { meshemu_input_poll_touch(id.as_ptr()) }, 0);
 
