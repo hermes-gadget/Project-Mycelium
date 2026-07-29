@@ -1,7 +1,11 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub const KEYBOARD_I2C_ADDRESS: u8 = 0x55;
+pub const KEYBOARD_BRIGHTNESS_COMMAND: u8 = 0x01;
 pub const KEYBOARD_KEY_MODE_COMMAND: u8 = 0x04;
+
+static PERSISTED_BACKLIGHT: AtomicU8 = AtomicU8::new(0);
 
 /// Simulates the ESP32-C3 keyboard co-processor at I2C address `0x55`.
 ///
@@ -15,6 +19,10 @@ pub struct I2cKeyboardBus {
     key_mode_active: bool,
     /// Last command byte written.
     last_command: u8,
+    /// Keyboard backlight brightness (0 is off, 255 is maximum).
+    backlight: u8,
+    /// Whether C3 backlight state survives an S3-side handle recreation.
+    pub cross_reset_persist: bool,
 }
 
 impl I2cKeyboardBus {
@@ -23,6 +31,8 @@ impl I2cKeyboardBus {
             key_queue: VecDeque::new(),
             key_mode_active: false,
             last_command: 0,
+            backlight: PERSISTED_BACKLIGHT.load(Ordering::SeqCst),
+            cross_reset_persist: true,
         }
     }
 
@@ -36,6 +46,40 @@ impl I2cKeyboardBus {
         self.last_command = byte;
         if byte == KEYBOARD_KEY_MODE_COMMAND {
             self.key_mode_active = true;
+        }
+    }
+
+    /// Apply one complete host I2C write transaction.
+    pub fn write_transaction(&mut self, bytes: &[u8]) {
+        let Some(&command) = bytes.first() else {
+            return;
+        };
+        self.last_command = command;
+        match (command, bytes.get(1).copied()) {
+            (KEYBOARD_BRIGHTNESS_COMMAND, Some(brightness)) => {
+                self.backlight = brightness;
+                if self.cross_reset_persist {
+                    PERSISTED_BACKLIGHT.store(brightness, Ordering::SeqCst);
+                }
+            }
+            (KEYBOARD_KEY_MODE_COMMAND, _) => self.key_mode_active = true,
+            _ => {}
+        }
+    }
+
+    pub fn backlight(&self) -> u8 {
+        self.backlight
+    }
+
+    /// Configure whether this C3's brightness survives future host recreations.
+    pub fn set_cross_reset_persist(&mut self, persist: bool) {
+        self.cross_reset_persist = persist;
+        if persist {
+            PERSISTED_BACKLIGHT.store(self.backlight, Ordering::SeqCst);
+        } else {
+            // A non-persistent device presents power-on darkness after the next
+            // host recreation, regardless of an older retained C3 value.
+            PERSISTED_BACKLIGHT.store(0, Ordering::SeqCst);
         }
     }
 
@@ -59,6 +103,9 @@ impl I2cKeyboardBus {
         self.key_queue.clear();
         self.key_mode_active = false;
         self.last_command = 0;
+        if !self.cross_reset_persist {
+            self.backlight = 0;
+        }
     }
 }
 
@@ -71,6 +118,9 @@ impl Default for I2cKeyboardBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static PERSISTENCE_TEST: Mutex<()> = Mutex::new(());
 
     #[test]
     fn key_mode_command_activates_polled_key_bytes() {
@@ -117,5 +167,32 @@ mod tests {
         assert_eq!(bus.read_key_byte(), 0x00);
         assert!(!bus.key_mode_active);
         assert_eq!(bus.last_command, 0);
+    }
+
+    #[test]
+    fn brightness_survives_host_recreation_by_default() {
+        let _serial = PERSISTENCE_TEST.lock().unwrap();
+        let mut first = I2cKeyboardBus::new();
+        first.write_transaction(&[KEYBOARD_BRIGHTNESS_COMMAND, 128]);
+        assert_eq!(first.backlight(), 128);
+        drop(first);
+
+        let mut fresh = I2cKeyboardBus::new();
+        assert!(fresh.cross_reset_persist);
+        assert_eq!(fresh.backlight(), 128);
+
+        // Leave global state deterministic for unrelated tests.
+        fresh.set_cross_reset_persist(false);
+    }
+
+    #[test]
+    fn disabling_cross_reset_returns_the_next_c3_to_power_on_darkness() {
+        let _serial = PERSISTENCE_TEST.lock().unwrap();
+        let mut bus = I2cKeyboardBus::new();
+        bus.write_transaction(&[KEYBOARD_BRIGHTNESS_COMMAND, 200]);
+        bus.set_cross_reset_persist(false);
+        assert_eq!(bus.backlight(), 200);
+
+        assert_eq!(I2cKeyboardBus::new().backlight(), 0);
     }
 }

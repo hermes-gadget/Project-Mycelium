@@ -1,12 +1,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::gt911::{Gt911Controller, GT911_I2C_ADDRESS};
+pub use crate::gt911::SharedGt911;
+use crate::gt911::{new_shared_gt911, GT911_I2C_ADDRESS};
 use crate::i2c_keyboard::{I2cKeyboardBus, KEYBOARD_I2C_ADDRESS};
 
 pub const KEYBOARD_I2C_CLOCK_HZ: u32 = 100_000;
+pub const FAST_I2C_CLOCK_HZ: u32 = 400_000;
 
 pub type SharedI2cKeyboard = Arc<Mutex<I2cKeyboardBus>>;
-pub type SharedGt911 = Arc<Mutex<Gt911Controller>>;
 
 /// Arduino `Wire`-compatible bus shared by the T-Deck keyboard and GT911.
 pub struct WireShim {
@@ -25,12 +26,12 @@ impl WireShim {
     pub fn new() -> Self {
         Self::with_devices(
             Arc::new(Mutex::new(I2cKeyboardBus::new())),
-            Arc::new(Mutex::new(Gt911Controller::new())),
+            new_shared_gt911(),
         )
     }
 
     pub fn with_keyboard(keyboard_bus: SharedI2cKeyboard) -> Self {
-        Self::with_devices(keyboard_bus, Arc::new(Mutex::new(Gt911Controller::new())))
+        Self::with_devices(keyboard_bus, new_shared_gt911())
     }
 
     pub fn with_devices(keyboard_bus: SharedI2cKeyboard, gt911: SharedGt911) -> Self {
@@ -73,6 +74,16 @@ impl WireShim {
         Arc::clone(&self.gt911)
     }
 
+    /// Probe one address without changing the current transaction state.
+    pub fn probe_address(&self, address: u8) -> bool {
+        self.bus_ready() && matches!(address, KEYBOARD_I2C_ADDRESS | GT911_I2C_ADDRESS)
+    }
+
+    /// Both externally pulled-up T-Deck I2C lines idle HIGH.
+    pub fn idle_levels(&self) -> (u8, u8) {
+        (1, 1)
+    }
+
     pub fn begin_transmission(&mut self, address: u8) {
         self.transmit_address = Some(address);
         self.transmit_buffer.clear();
@@ -98,12 +109,13 @@ impl WireShim {
         let bytes = std::mem::take(&mut self.transmit_buffer);
         match address {
             KEYBOARD_I2C_ADDRESS => {
-                let mut keyboard = lock(&self.keyboard_bus);
-                for command in bytes {
-                    keyboard.write_command(command);
-                }
+                lock(&self.keyboard_bus).write_transaction(&bytes);
             }
             GT911_I2C_ADDRESS => {
+                // An empty write is the address-only ACK used by an I2C scan.
+                if bytes.is_empty() {
+                    return 0;
+                }
                 if bytes.len() < 2 {
                     return 4;
                 }
@@ -119,7 +131,7 @@ impl WireShim {
 
     pub fn request_from(&mut self, address: u8, count: u8) -> u8 {
         self.clear_read_buffer();
-        if !self.begun || self.clock_hz != KEYBOARD_I2C_CLOCK_HZ || count == 0 {
+        if !self.bus_ready() || count == 0 {
             return 0;
         }
 
@@ -129,7 +141,11 @@ impl WireShim {
                 .push(lock(&self.keyboard_bus).read_key_byte()),
             GT911_I2C_ADDRESS => {
                 self.read_buffer.resize(count as usize, 0);
-                lock(&self.gt911).i2c_read(self.gt911_register, &mut self.read_buffer);
+                let read = lock(&self.gt911).i2c_read(self.gt911_register, &mut self.read_buffer);
+                if read != usize::from(count) {
+                    self.clear_read_buffer();
+                    return 0;
+                }
             }
             _ => return 0,
         }
@@ -152,6 +168,10 @@ impl WireShim {
         self.read_buffer.clear();
         self.read_position = 0;
     }
+
+    fn bus_ready(&self) -> bool {
+        self.begun && matches!(self.clock_hz, KEYBOARD_I2C_CLOCK_HZ | FAST_I2C_CLOCK_HZ)
+    }
 }
 
 impl Default for WireShim {
@@ -169,7 +189,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gt911::GT911_STATUS_REGISTER;
+    use crate::gt911::{GT911_CONFIG_X_REGISTER, GT911_PRODUCT_ID_REGISTER, GT911_STATUS_REGISTER};
 
     fn configured_wire(keyboard: SharedI2cKeyboard) -> WireShim {
         let mut wire = WireShim::with_keyboard(keyboard);
@@ -232,6 +252,37 @@ mod tests {
     }
 
     #[test]
+    fn bus_scan_and_gt911_identity_diagnostics_match_the_tdeck() {
+        let mut wire = configured_wire(Arc::new(Mutex::new(I2cKeyboardBus::new())));
+        wire.set_clock(FAST_I2C_CLOCK_HZ);
+        assert_eq!(wire.idle_levels(), (1, 1));
+        assert!(wire.probe_address(KEYBOARD_I2C_ADDRESS));
+        assert!(wire.probe_address(GT911_I2C_ADDRESS));
+        assert!(!wire.probe_address(0x14));
+
+        wire.begin_transmission(GT911_I2C_ADDRESS);
+        assert_eq!(wire.end_transmission(), 0);
+
+        wire.begin_transmission(GT911_I2C_ADDRESS);
+        for byte in GT911_PRODUCT_ID_REGISTER.to_be_bytes() {
+            wire.write_byte(byte);
+        }
+        assert_eq!(wire.end_transmission(), 0);
+        assert_eq!(wire.request_from(GT911_I2C_ADDRESS, 4), 4);
+        let product_id: Vec<_> = (0..4).map(|_| wire.read() as u8).collect();
+        assert_eq!(&product_id, b"911\0");
+
+        wire.begin_transmission(GT911_I2C_ADDRESS);
+        for byte in GT911_CONFIG_X_REGISTER.to_be_bytes() {
+            wire.write_byte(byte);
+        }
+        assert_eq!(wire.end_transmission(), 0);
+        assert_eq!(wire.request_from(GT911_I2C_ADDRESS, 4), 4);
+        let resolution: Vec<_> = (0..4).map(|_| wire.read() as u8).collect();
+        assert_eq!(resolution, [64, 1, 240, 0]);
+    }
+
+    #[test]
     fn bad_addresses_nack_and_keyboard_returns_one_byte_per_poll() {
         let mut wire = WireShim::new();
         wire.begin();
@@ -247,13 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn devices_require_begin_and_a_100_khz_clock() {
+    fn devices_require_begin_and_a_supported_clock() {
         let mut wire = WireShim::new();
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
         wire.begin();
-        wire.set_clock(400_000);
+        wire.set_clock(1_000_000);
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
-        wire.set_clock(KEYBOARD_I2C_CLOCK_HZ);
+        wire.set_clock(FAST_I2C_CLOCK_HZ);
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
     }
 }
