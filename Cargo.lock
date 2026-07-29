@@ -543,6 +543,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libloading",
+ "mycelium-board",
  "mycelium-display",
  "mycelium-input",
  "radio_bus",
@@ -584,6 +585,7 @@ dependencies = [
  "axum",
  "clap",
  "libloading",
+ "meshemu_bridge",
  "mycelium-core",
  "sdl2",
  "serde",
@@ -597,6 +599,10 @@ dependencies = [
 [[package]]
 name = "mycelium-board"
 version = "0.1.0"
+dependencies = [
+ "sdl2",
+ "tracing",
+]
 
 [[package]]
 name = "mycelium-core"
@@ -604,8 +610,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libloading",
+ "mycelium-board",
  "mycelium-display",
+ "mycelium-gps",
  "mycelium-input",
+ "mycelium-storage",
  "serde",
  "serde_json",
 ]
@@ -639,6 +648,7 @@ dependencies = [
 name = "mycelium-storage"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde",
 ]
 

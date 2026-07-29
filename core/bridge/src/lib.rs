@@ -14,6 +14,7 @@ pub use ffi::{
     meshemu_wire_shim_create, meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard,
     meshemu_wire_write,
 };
+pub use mycelium_board::{meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop};
 
 #[cfg(test)]
 mod tests {

@@ -2,15 +2,67 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{bail, Result};
+use mycelium_board::{
+    register_buzzer, remove_buzzer, BoardConfig, SharedVirtualBuzzer, VirtualBoard,
+};
+use mycelium_gps::GpsManager;
+use mycelium_storage::StorageManager;
 use serde::{Deserialize, Serialize};
 
 use crate::loader::FirmwareInstance;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GpsConfig {
+    #[serde(default = "default_latitude")]
+    pub latitude: f64,
+    #[serde(default = "default_longitude")]
+    pub longitude: f64,
+}
+
+impl Default for GpsConfig {
+    fn default() -> Self {
+        Self {
+            latitude: default_latitude(),
+            longitude: default_longitude(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InstanceBoardConfig {
+    #[serde(default = "default_battery_mv")]
+    pub battery_mv: u16,
+}
+
+impl Default for InstanceBoardConfig {
+    fn default() -> Self {
+        Self {
+            battery_mv: default_battery_mv(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct InstanceConfig {
     /// An optional caller-selected ID. When absent, `nodeN` is generated.
     #[serde(default)]
     pub instance_id: Option<String>,
+    #[serde(default)]
+    pub gps: GpsConfig,
+    #[serde(default)]
+    pub board: InstanceBoardConfig,
+}
+
+fn default_latitude() -> f64 {
+    51.5074
+}
+
+fn default_longitude() -> f64 {
+    -0.1278
+}
+
+fn default_battery_mv() -> u16 {
+    3_700
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -20,8 +72,112 @@ pub struct InstanceInfo {
     pub has_display: bool,
 }
 
+pub struct Instance {
+    firmware: FirmwareInstance,
+    storage: StorageManager,
+    gps: GpsManager,
+    board: VirtualBoard,
+    buzzer: SharedVirtualBuzzer,
+}
+
+struct InstancePeripherals {
+    storage: StorageManager,
+    gps: GpsManager,
+    board: VirtualBoard,
+    buzzer: SharedVirtualBuzzer,
+}
+
+fn create_peripherals(id: &str, config: &InstanceConfig) -> Result<InstancePeripherals> {
+    let storage = StorageManager::new(id);
+    storage.init_all()?;
+    let gps = GpsManager::new(config.gps.latitude, config.gps.longitude);
+    let board = VirtualBoard::new(
+        id,
+        BoardConfig {
+            battery_mv: config.board.battery_mv,
+            mcu_temperature: 35.0,
+            manufacturer: "Mycelium Virtual T-Deck".to_owned(),
+            ..BoardConfig::default()
+        },
+    );
+    let buzzer = register_buzzer(id);
+
+    Ok(InstancePeripherals {
+        storage,
+        gps,
+        board,
+        buzzer,
+    })
+}
+
+impl Instance {
+    fn create(id: &str, firmware_path: &Path, config: &InstanceConfig) -> Result<Self> {
+        let firmware = FirmwareInstance::load(id, firmware_path)?;
+        let peripherals = create_peripherals(id, config)?;
+
+        Ok(Self {
+            firmware,
+            storage: peripherals.storage,
+            gps: peripherals.gps,
+            board: peripherals.board,
+            buzzer: peripherals.buzzer,
+        })
+    }
+
+    fn start(&mut self) {
+        self.firmware.start();
+    }
+
+    fn tick(&mut self, delta_ms: u64) {
+        self.firmware.tick();
+        self.gps.tick(delta_ms);
+        self.buzzer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_playing();
+    }
+
+    pub fn name(&self) -> &str {
+        self.firmware.name()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.firmware.is_running()
+    }
+
+    pub fn has_display(&self) -> bool {
+        self.firmware.has_display()
+    }
+
+    pub fn display(&self) -> Option<*mut std::ffi::c_void> {
+        self.firmware.display()
+    }
+
+    pub fn storage(&self) -> &StorageManager {
+        &self.storage
+    }
+
+    pub fn gps(&self) -> &GpsManager {
+        &self.gps
+    }
+
+    pub fn board(&self) -> &VirtualBoard {
+        &self.board
+    }
+
+    pub fn buzzer(&self) -> &SharedVirtualBuzzer {
+        &self.buzzer
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        remove_buzzer(self.firmware.name());
+    }
+}
+
 pub struct InstanceManager {
-    instances: HashMap<String, FirmwareInstance>,
+    instances: HashMap<String, Instance>,
     next_id: u64,
 }
 
@@ -34,12 +190,12 @@ impl InstanceManager {
     }
 
     pub fn spawn(&mut self, firmware_path: &Path, config: InstanceConfig) -> Result<String> {
-        let id = match config.instance_id {
+        let id = match config.instance_id.as_deref() {
             Some(id) => {
                 if id.is_empty() {
                     bail!("instance ID cannot be empty");
                 }
-                id
+                id.to_owned()
             }
             None => self.next_available_id(),
         };
@@ -48,7 +204,7 @@ impl InstanceManager {
             bail!("instance {id} already exists");
         }
 
-        let mut instance = FirmwareInstance::load(&id, firmware_path)?;
+        let mut instance = Instance::create(&id, firmware_path, &config)?;
         instance.start();
         self.instances.insert(id.clone(), instance);
         Ok(id)
@@ -61,9 +217,15 @@ impl InstanceManager {
         Ok(())
     }
 
+    /// Advances all instances by the legacy one-millisecond emulator step.
     pub fn tick_all(&mut self) {
+        self.tick_all_with_delta(1);
+    }
+
+    /// Advances all instances and their time-based peripherals.
+    pub fn tick_all_with_delta(&mut self, delta_ms: u64) {
         for instance in self.instances.values_mut() {
-            instance.tick();
+            instance.tick(delta_ms);
         }
     }
 
@@ -81,7 +243,7 @@ impl InstanceManager {
         instances
     }
 
-    pub fn get(&self, id: &str) -> Option<&FirmwareInstance> {
+    pub fn get(&self, id: &str) -> Option<&Instance> {
         self.instances.get(id)
     }
 
@@ -125,5 +287,18 @@ mod tests {
         manager.next_id = 2;
         assert_eq!(manager.next_available_id(), "node2");
         assert_eq!(manager.next_available_id(), "node3");
+    }
+
+    #[test]
+    fn peripheral_creation_does_not_panic() {
+        let config = InstanceConfig::default();
+        let id = format!("peripheral-test-{}", std::process::id());
+        let peripherals = create_peripherals(&id, &config).unwrap();
+
+        assert!(peripherals.storage.spiffs_path().is_dir());
+        assert_eq!(peripherals.gps.position(), (51.5074, -0.1278));
+        assert_eq!(peripherals.board.battery_mv(), 3_700);
+        assert!(!peripherals.buzzer.lock().unwrap().is_playing());
+        remove_buzzer(&id);
     }
 }
