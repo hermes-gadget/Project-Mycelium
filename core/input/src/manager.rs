@@ -6,8 +6,9 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
 use crate::{
+    gt911::Gt911Controller,
     i2c_keyboard::I2cKeyboardBus,
-    wire_shim::{SharedI2cKeyboard, WireShim},
+    wire_shim::{SharedGt911, SharedI2cKeyboard, WireShim},
 };
 use crate::{
     Gt911TouchEvent, KeyEvent, KeyboardEmulator, TouchEmulator, TrackballEmulator, TrackballEvent,
@@ -31,6 +32,7 @@ pub struct InputManager {
     pub keyboard: KeyboardEmulator,
     pub trackball: TrackballEmulator,
     i2c_keyboard: SharedI2cKeyboard,
+    gt911: SharedGt911,
     instance_id: String,
     last_activity_ms: u64,
     touch_events: VecDeque<Gt911TouchEvent>,
@@ -45,6 +47,7 @@ impl InputManager {
             keyboard: KeyboardEmulator::new(),
             trackball: TrackballEmulator::new(),
             i2c_keyboard: Arc::new(Mutex::new(I2cKeyboardBus::new())),
+            gt911: Arc::new(Mutex::new(Gt911Controller::new())),
             instance_id: instance_id.to_owned(),
             last_activity_ms: monotonic_ms(),
             touch_events: VecDeque::new(),
@@ -64,6 +67,7 @@ impl InputManager {
             Event::MouseMotion { x, y, .. } => {
                 self.wake();
                 if let Some(event) = self.touch.handle_mouse_motion(x, y) {
+                    self.update_gt911(true);
                     self.touch_events.push_back(event);
                     events.push(InputEvent::Touch(event));
                 }
@@ -74,6 +78,7 @@ impl InputManager {
                 self.wake();
                 self.touch.handle_mouse_motion(x, y);
                 if let Some(event) = self.touch.handle_mouse_button(mouse_btn, true) {
+                    self.update_gt911(true);
                     self.touch_events.push_back(event);
                     events.push(InputEvent::Touch(event));
                 }
@@ -84,6 +89,7 @@ impl InputManager {
                 self.wake();
                 self.touch.handle_mouse_motion(x, y);
                 if let Some(event) = self.touch.handle_mouse_button(mouse_btn, false) {
+                    self.update_gt911(false);
                     self.touch_events.push_back(event);
                     events.push(InputEvent::Touch(event));
                 }
@@ -112,6 +118,7 @@ impl InputManager {
         let Some(event) = self.touch.inject(x, y, pressed) else {
             return false;
         };
+        self.update_gt911(pressed);
         self.touch_events.push_back(event);
         true
     }
@@ -127,8 +134,28 @@ impl InputManager {
         Arc::clone(&self.i2c_keyboard)
     }
 
+    pub fn gt911(&self) -> SharedGt911 {
+        Arc::clone(&self.gt911)
+    }
+
     pub fn wire_shim(&self) -> WireShim {
-        WireShim::with_keyboard(self.i2c_keyboard())
+        WireShim::with_devices(self.i2c_keyboard(), self.gt911())
+    }
+
+    /// Read trackball pins or the GT911 interrupt pin.
+    pub fn digital_read(&self, gpio: u8) -> bool {
+        if gpio == crate::GT911_INT_GPIO {
+            return self
+                .gt911
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .gpio16_level();
+        }
+        self.trackball.digital_read(gpio)
+    }
+
+    pub fn take_falling_edges(&mut self, gpio: u8) -> u32 {
+        self.trackball.take_falling_edges(gpio)
     }
 
     pub fn poll_touch(&mut self) -> Option<Gt911TouchEvent> {
@@ -159,12 +186,10 @@ impl InputManager {
 
     fn handle_keycode(&mut self, keycode: Keycode, pressed: bool, events: &mut Vec<InputEvent>) {
         if let Some(event) = self.keyboard.handle_key(keycode, pressed) {
-            if event.pressed && event.key_byte != 0 {
-                self.i2c_keyboard
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .inject_key_byte(event.key_byte);
-            }
+            self.i2c_keyboard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .inject_key(event.row, event.col, event.pressed);
             self.keyboard_events.push_back(event);
             events.push(InputEvent::Keyboard(event));
         }
@@ -174,14 +199,38 @@ impl InputManager {
             events.push(InputEvent::Trackball(event));
         }
     }
+
+    fn update_gt911(&mut self, pressed: bool) {
+        let Some((host_x, host_y)) = self.touch.last_host_position() else {
+            return;
+        };
+        self.gt911
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .inject_touch(host_x, host_y, pressed);
+    }
 }
 
 pub fn register_input_manager(instance_id: &str, scale: f32) -> SharedInputManager {
-    let manager = Arc::new(Mutex::new(InputManager::new(instance_id, scale)));
-    INPUT_MANAGERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(instance_id.to_owned(), Arc::clone(&manager));
+    let (manager, existed) = {
+        let mut managers = INPUT_MANAGERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(manager) = managers.get(instance_id) {
+            (Arc::clone(manager), true)
+        } else {
+            let manager = Arc::new(Mutex::new(InputManager::new(instance_id, scale)));
+            managers.insert(instance_id.to_owned(), Arc::clone(&manager));
+            (manager, false)
+        }
+    };
+    if existed {
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .touch
+            .set_window_scale(scale);
+    }
     manager
 }
 
@@ -252,31 +301,33 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_and_trackball_events_are_queued_independently() {
+    fn return_and_keypad_enter_drive_separate_hardware() {
         let mut manager = InputManager::new("node", 1.0);
         let events = manager.handle_sdl_event(&key_event(1, Keycode::Return, true));
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(manager.poll_keyboard().is_some());
+        assert!(manager.poll_trackball().is_none());
+
+        let events = manager.handle_sdl_event(&key_event(1, Keycode::KpEnter, true));
+        assert_eq!(events.len(), 1);
+        assert!(manager.poll_keyboard().is_none());
         assert_eq!(
             manager.poll_trackball().unwrap().direction,
             crate::TrackballDirection::Center
         );
+        assert!(!manager.digital_read(crate::TRACKBALL_CLICK_GPIO));
     }
 
     #[test]
-    fn keyboard_events_update_lvgl_queue_and_raw_i2c_key_bytes() {
+    fn keyboard_events_update_lvgl_queue_and_raw_i2c_state() {
         let mut manager = InputManager::new("node", 1.0);
         let mut wire = manager.wire_shim();
-        wire.begin();
-        wire.set_clock(crate::wire_shim::KEYBOARD_I2C_CLOCK_HZ);
-        wire.begin_transmission(crate::KEYBOARD_I2C_ADDRESS);
-        wire.write_byte(0x04);
-        assert_eq!(wire.end_transmission(), 0);
+        wire.write_byte(1);
 
         assert_eq!(manager.inject_key(Keycode::D, true).len(), 1);
         assert_eq!(manager.poll_keyboard().unwrap().col, 2);
         assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
-        assert_eq!(wire.read(), i32::from(b'd'));
+        assert_eq!(wire.read(), 0b0000_0100);
 
         manager.inject_key(Keycode::D, false);
         assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
@@ -284,19 +335,40 @@ mod tests {
     }
 
     #[test]
-    fn shifted_host_key_reaches_i2c_as_uppercase_ascii() {
+    fn sdl_touch_and_firmware_wire_share_the_gt911() {
         let mut manager = InputManager::new("node", 1.0);
         let mut wire = manager.wire_shim();
-        wire.begin();
-        wire.set_clock(crate::wire_shim::KEYBOARD_I2C_CLOCK_HZ);
-        wire.begin_transmission(crate::KEYBOARD_I2C_ADDRESS);
-        wire.write_byte(0x04);
+        manager.handle_sdl_event(&Event::MouseButtonDown {
+            timestamp: 0,
+            window_id: 1,
+            which: 0,
+            mouse_btn: sdl2::mouse::MouseButton::Left,
+            clicks: 1,
+            x: 100,
+            y: 40,
+        });
+
+        assert!(!manager.digital_read(crate::GT911_INT_GPIO));
+        wire.begin_transmission(crate::GT911_I2C_ADDRESS);
+        for byte in crate::GT911_STATUS_REGISTER.to_be_bytes() {
+            wire.write_byte(byte);
+        }
         assert_eq!(wire.end_transmission(), 0);
+        assert_eq!(wire.request_from(crate::GT911_I2C_ADDRESS, 9), 9);
+        let bytes: Vec<_> = (0..9).map(|_| wire.read() as u8).collect();
+        assert_eq!(bytes[0], 0x81);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 40);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 219);
+    }
 
-        manager.inject_key(Keycode::LShift, true);
-        manager.inject_key(Keycode::Q, true);
+    #[test]
+    fn arrow_key_drives_active_low_gpio_and_falling_interrupt() {
+        let mut manager = InputManager::new("node", 1.0);
+        manager.handle_sdl_event(&key_event(1, Keycode::Up, true));
+        assert!(!manager.digital_read(crate::TRACKBALL_UP_GPIO));
+        assert_eq!(manager.take_falling_edges(crate::TRACKBALL_UP_GPIO), 1);
 
-        assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
-        assert_eq!(wire.read(), i32::from(b'Q'));
+        manager.handle_sdl_event(&key_event(1, Keycode::Up, false));
+        assert!(manager.digital_read(crate::TRACKBALL_UP_GPIO));
     }
 }

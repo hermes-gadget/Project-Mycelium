@@ -16,8 +16,9 @@ void meshemu_i2c_keyboard_inject_key_byte(void* kb, uint8_t key_byte);
 
 void meshemu_i2c_keyboard_destroy(void* kb);
 
-// Arduino Wire-compatible operations backed by the virtual keyboard bus.
+// Arduino Wire-compatible operations backed by the keyboard and GT911 bus.
 void* meshemu_wire_shim_create(void);
+void* meshemu_wire_shim_create_for_instance(const char* instance_id);
 void meshemu_wire_shim_set_keyboard(void* wire, void* kb);
 bool meshemu_wire_begin(void* wire);
 void meshemu_wire_set_clock(void* wire, uint32_t clock_hz);
@@ -28,6 +29,10 @@ uint8_t meshemu_wire_request_from(void* wire, uint8_t address, uint8_t count);
 int32_t meshemu_wire_available(void* wire);
 int32_t meshemu_wire_read(void* wire);
 void meshemu_wire_shim_destroy(void* wire);
+
+// Active-LOW input GPIO access and FALLING-edge interrupt consumption.
+bool meshemu_input_digital_read(const char* instance_id, uint8_t gpio);
+uint32_t meshemu_input_take_falling_edges(const char* instance_id, uint8_t gpio);
 
 #ifdef __cplusplus
 }

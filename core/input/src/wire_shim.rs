@@ -1,52 +1,44 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::gt911::{Gt911Controller, GT911_I2C_ADDRESS};
 use crate::i2c_keyboard::{I2cKeyboardBus, KEYBOARD_I2C_ADDRESS};
 
-pub const KEYBOARD_I2C_CLOCK_HZ: u32 = 100_000;
-
 pub type SharedI2cKeyboard = Arc<Mutex<I2cKeyboardBus>>;
+pub type SharedGt911 = Arc<Mutex<Gt911Controller>>;
 
-/// Arduino `Wire`-compatible virtual bus for the T-Deck keyboard.
+/// Virtual Arduino `Wire` bus shared by the keyboard and GT911.
 pub struct WireShim {
     keyboard_bus: SharedI2cKeyboard,
-    begun: bool,
-    clock_hz: u32,
-    transmit_address: Option<u8>,
-    transmit_buffer: Vec<u8>,
+    gt911: SharedGt911,
+    current_address: u8,
+    current_register: u16,
+    write_buffer: Vec<u8>,
     read_buffer: Vec<u8>,
     read_position: usize,
 }
 
 impl WireShim {
     pub fn new() -> Self {
-        Self::with_keyboard(Arc::new(Mutex::new(I2cKeyboardBus::new())))
+        Self::with_devices(
+            Arc::new(Mutex::new(I2cKeyboardBus::new())),
+            Arc::new(Mutex::new(Gt911Controller::new())),
+        )
     }
 
     pub fn with_keyboard(keyboard_bus: SharedI2cKeyboard) -> Self {
+        Self::with_devices(keyboard_bus, Arc::new(Mutex::new(Gt911Controller::new())))
+    }
+
+    pub fn with_devices(keyboard_bus: SharedI2cKeyboard, gt911: SharedGt911) -> Self {
         Self {
             keyboard_bus,
-            begun: false,
-            clock_hz: KEYBOARD_I2C_CLOCK_HZ,
-            transmit_address: None,
-            transmit_buffer: Vec::new(),
+            gt911,
+            current_address: 0,
+            current_register: 0,
+            write_buffer: Vec::new(),
             read_buffer: Vec::new(),
             read_position: 0,
         }
-    }
-
-    /// Initialize the virtual I2C controller.
-    pub fn begin(&mut self) -> bool {
-        self.begun = true;
-        true
-    }
-
-    /// Configure the I2C clock, as with Arduino `Wire.setClock()`.
-    pub fn set_clock(&mut self, clock_hz: u32) {
-        self.clock_hz = clock_hz;
-    }
-
-    pub fn clock_hz(&self) -> u32 {
-        self.clock_hz
     }
 
     pub fn set_keyboard(&mut self, keyboard_bus: SharedI2cKeyboard) {
@@ -58,58 +50,72 @@ impl WireShim {
         Arc::clone(&self.keyboard_bus)
     }
 
-    pub fn begin_transmission(&mut self, address: u8) {
-        self.transmit_address = Some(address);
-        self.transmit_buffer.clear();
+    pub fn gt911(&self) -> SharedGt911 {
+        Arc::clone(&self.gt911)
     }
 
-    /// Buffer a byte until `end_transmission`, matching Arduino `Wire.write()`.
+    pub fn begin_transmission(&mut self, address: u8) {
+        self.current_address = address;
+        self.write_buffer.clear();
+    }
+
     pub fn write_byte(&mut self, byte: u8) -> usize {
-        if self.transmit_address.is_none() {
-            return 0;
+        self.write_buffer.push(byte);
+        // Preserve the convenient register-only sequence used by callers that
+        // omit endTransmission before requestFrom.
+        match self.current_address {
+            GT911_I2C_ADDRESS if self.write_buffer.len() >= 2 => {
+                self.current_register =
+                    u16::from_be_bytes([self.write_buffer[0], self.write_buffer[1]]);
+            }
+            _ if self.write_buffer.len() == 1 => self.current_register = u16::from(byte),
+            _ => {}
         }
-        self.transmit_buffer.push(byte);
         1
     }
 
-    /// Finish a transmission.
-    ///
-    /// Arduino-compatible results used here are `0` for success, `2` for an
-    /// address NACK, and `4` for an invalid controller/transaction state.
     pub fn end_transmission(&mut self) -> u8 {
-        let Some(address) = self.transmit_address.take() else {
-            return 4;
-        };
-        if !self.begun {
-            self.transmit_buffer.clear();
-            return 4;
-        }
-        if address != KEYBOARD_I2C_ADDRESS {
-            self.transmit_buffer.clear();
-            return 2;
-        }
-
-        let commands = std::mem::take(&mut self.transmit_buffer);
-        let mut keyboard = lock(&self.keyboard_bus);
-        for command in commands {
-            keyboard.write_command(command);
+        match self.current_address {
+            KEYBOARD_I2C_ADDRESS => {
+                let Some(register) = self.write_buffer.first() else {
+                    return 4;
+                };
+                self.current_register = u16::from(*register);
+            }
+            GT911_I2C_ADDRESS => {
+                if self.write_buffer.len() < 2 {
+                    return 4;
+                }
+                self.current_register =
+                    u16::from_be_bytes([self.write_buffer[0], self.write_buffer[1]]);
+                if self.write_buffer.len() > 2 {
+                    lock(&self.gt911).i2c_write(self.current_register, &self.write_buffer[2..]);
+                }
+            }
+            _ => return 2,
         }
         0
     }
 
-    /// Poll the keyboard. The real C3 supplies exactly one byte per request.
     pub fn request_from(&mut self, address: u8, count: u8) -> u8 {
         self.clear_read_buffer();
-        if !self.begun || self.clock_hz != KEYBOARD_I2C_CLOCK_HZ {
-            return 0;
-        }
-        if address != KEYBOARD_I2C_ADDRESS || count == 0 {
+        if count == 0 {
             return 0;
         }
 
-        self.read_buffer
-            .push(lock(&self.keyboard_bus).read_key_byte());
-        1
+        match address {
+            KEYBOARD_I2C_ADDRESS => {
+                let data = lock(&self.keyboard_bus).read_register(self.current_register as u8);
+                self.read_buffer
+                    .extend(data.into_iter().take(count as usize));
+            }
+            GT911_I2C_ADDRESS => {
+                self.read_buffer.resize(count as usize, 0);
+                lock(&self.gt911).i2c_read(self.current_register, &mut self.read_buffer);
+            }
+            _ => return 0,
+        }
+        self.read_buffer.len() as u8
     }
 
     pub fn read(&mut self) -> i32 {
@@ -145,89 +151,58 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn configured_wire(keyboard: SharedI2cKeyboard) -> WireShim {
-        let mut wire = WireShim::with_keyboard(keyboard);
-        assert!(wire.begin());
-        wire.set_clock(KEYBOARD_I2C_CLOCK_HZ);
-        wire
-    }
+    use crate::gt911::GT911_STATUS_REGISTER;
 
     #[test]
-    fn real_wire_sequence_activates_key_mode_and_reads_fifo_bytes() {
+    fn wire_sequence_selects_and_reads_a_keyboard_register() {
         let keyboard = Arc::new(Mutex::new(I2cKeyboardBus::new()));
-        lock(&keyboard).inject_key_byte(b'q');
-        lock(&keyboard).inject_key_byte(b'W');
-        let mut wire = configured_wire(keyboard);
+        lock(&keyboard).inject_key(3, 5, true);
+        let mut wire = WireShim::with_keyboard(keyboard);
 
         wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
-        assert_eq!(wire.write_byte(0x04), 1);
+        assert_eq!(wire.write_byte(0x03), 1);
         assert_eq!(wire.end_transmission(), 0);
-
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
         assert_eq!(wire.available(), 1);
-        assert_eq!(wire.read(), i32::from(b'q'));
+        assert_eq!(wire.read(), 0b0010_0000);
         assert_eq!(wire.available(), 0);
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
-        assert_eq!(wire.read(), i32::from(b'W'));
-    }
-
-    #[test]
-    fn idle_keyboard_poll_returns_one_zero_byte() {
-        let keyboard = Arc::new(Mutex::new(I2cKeyboardBus::new()));
-        let mut wire = configured_wire(keyboard);
-        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
-        wire.write_byte(0x04);
-        assert_eq!(wire.end_transmission(), 0);
-
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
-        assert_eq!(wire.read(), 0x00);
         assert_eq!(wire.read(), -1);
     }
 
     #[test]
-    fn writes_are_buffered_until_end_transmission() {
-        let keyboard = Arc::new(Mutex::new(I2cKeyboardBus::new()));
-        lock(&keyboard).inject_key_byte(b'a');
-        let mut wire = configured_wire(Arc::clone(&keyboard));
-        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
-        wire.write_byte(0x04);
+    fn gt911_uses_two_byte_registers_and_clears_interrupt_via_wire() {
+        let mut wire = WireShim::new();
+        lock(&wire.gt911()).inject_touch(100, 40, true);
 
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
-        assert_eq!(wire.read(), 0x00);
+        wire.begin_transmission(GT911_I2C_ADDRESS);
+        for byte in GT911_STATUS_REGISTER.to_be_bytes() {
+            wire.write_byte(byte);
+        }
         assert_eq!(wire.end_transmission(), 0);
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
-        assert_eq!(wire.read(), i32::from(b'a'));
+        assert_eq!(wire.request_from(GT911_I2C_ADDRESS, 9), 9);
+        let bytes: Vec<_> = (0..9).map(|_| wire.read() as u8).collect();
+        assert_eq!(bytes[0], 0x81);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 40);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 219);
+
+        wire.begin_transmission(GT911_I2C_ADDRESS);
+        for byte in GT911_STATUS_REGISTER.to_be_bytes() {
+            wire.write_byte(byte);
+        }
+        wire.write_byte(0);
+        assert_eq!(wire.end_transmission(), 0);
+        assert!(lock(&wire.gt911()).gpio16_level());
     }
 
     #[test]
-    fn bad_addresses_nack_and_only_one_byte_is_returned_per_poll() {
+    fn unknown_addresses_return_no_data_and_clear_stale_reads() {
         let mut wire = WireShim::new();
-        wire.begin();
-        wire.set_clock(KEYBOARD_I2C_CLOCK_HZ);
-
-        wire.begin_transmission(0x42);
+        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
         wire.write_byte(0x04);
-        assert_eq!(wire.end_transmission(), 2);
+        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
+
         assert_eq!(wire.request_from(0x42, 1), 0);
-
-        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
-        wire.write_byte(0x04);
-        assert_eq!(wire.end_transmission(), 0);
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 8), 1);
-    }
-
-    #[test]
-    fn keyboard_requires_begin_and_a_100_khz_clock() {
-        let mut wire = WireShim::new();
-        assert_eq!(wire.clock_hz(), KEYBOARD_I2C_CLOCK_HZ);
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
-
-        wire.begin();
-        wire.set_clock(400_000);
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
-
-        wire.set_clock(KEYBOARD_I2C_CLOCK_HZ);
-        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
+        assert_eq!(wire.available(), 0);
+        assert_eq!(wire.read(), -1);
     }
 }

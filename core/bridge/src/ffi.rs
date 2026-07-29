@@ -489,6 +489,25 @@ pub extern "C" fn meshemu_wire_shim_create() -> *mut c_void {
     Box::into_raw(Box::new(WireShim::new())).cast()
 }
 
+/// Creates a Wire shim attached to the same peripherals as an SDL input manager.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_shim_create_for_instance(
+    instance_id: *const c_char,
+) -> *mut c_void {
+    let Some(manager) = (unsafe { input_manager(instance_id, true) }) else {
+        return ptr::null_mut();
+    };
+    let wire = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .wire_shim();
+    Box::into_raw(Box::new(wire)).cast()
+}
+
 /// Assigns a keyboard to a Wire shim.
 ///
 /// # Safety
@@ -713,6 +732,43 @@ pub unsafe extern "C" fn meshemu_input_poll_key(instance_id: *const c_char) -> u
         return 0;
     };
     u64::from(event.row) | (u64::from(event.col) << 8) | (u64::from(event.pressed) << 16)
+}
+
+/// Reads a T-Deck input GPIO, including GT911 INT on GPIO16.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_digital_read(instance_id: *const c_char, gpio: u8) -> bool {
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return true;
+    };
+    let level = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .digital_read(gpio);
+    level
+}
+
+/// Consumes pending FALLING interrupts for one trackball GPIO.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_take_falling_edges(
+    instance_id: *const c_char,
+    gpio: u8,
+) -> u32 {
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return 0;
+    };
+    let edges = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take_falling_edges(gpio);
+    edges
 }
 
 /// Creates an SDL display for the requested LVGL major version.
