@@ -1,0 +1,220 @@
+use std::collections::{HashSet, VecDeque};
+use std::ffi::{c_char, c_void, CStr};
+use std::ptr;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
+
+struct BusState {
+    bus: RadioBus,
+    node_ids: HashSet<String>,
+    now_ms: u64,
+}
+
+impl BusState {
+    fn new() -> Self {
+        Self {
+            bus: RadioBus::new(),
+            node_ids: HashSet::new(),
+            now_ms: 0,
+        }
+    }
+}
+
+struct RadioHandle {
+    node_id: String,
+    channel: RadioChannel,
+    tx_power_dbm: f64,
+    pending: Mutex<VecDeque<RxPacket>>,
+    last_rx: Mutex<Option<(f32, f32)>>,
+}
+
+static BUS: LazyLock<Mutex<BusState>> = LazyLock::new(|| Mutex::new(BusState::new()));
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+unsafe fn handle_ref<'a>(radio: *mut c_void) -> Option<&'a RadioHandle> {
+    (radio as *const RadioHandle).as_ref()
+}
+
+/// Creates a radio and registers its node with the process-wide radio bus.
+///
+/// Returns null when the identifier or radio configuration is invalid, or when
+/// another live radio already uses the same identifier.
+#[no_mangle]
+pub extern "C" fn meshemu_radio_create(
+    instance_id: *const c_char,
+    freq_mhz: f64,
+    bandwidth_khz: u16,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: f64,
+    lat: f64,
+    lon: f64,
+) -> *mut c_void {
+    if instance_id.is_null()
+        || !freq_mhz.is_finite()
+        || freq_mhz <= 0.0
+        || bandwidth_khz == 0
+        || !tx_power_dbm.is_finite()
+        || !lat.is_finite()
+        || !lon.is_finite()
+    {
+        return ptr::null_mut();
+    }
+
+    let node_id = unsafe { CStr::from_ptr(instance_id) }
+        .to_string_lossy()
+        .into_owned();
+    if node_id.is_empty() {
+        return ptr::null_mut();
+    }
+
+    let channel = RadioChannel {
+        freq_mhz,
+        bandwidth_khz,
+        spreading_factor,
+        coding_rate,
+    };
+    let mut state = lock(&BUS);
+    if !state.node_ids.insert(node_id.clone()) {
+        return ptr::null_mut();
+    }
+    state
+        .bus
+        .register_node(node_id.clone(), (lat, lon), tx_power_dbm, channel.clone());
+    drop(state);
+
+    Box::into_raw(Box::new(RadioHandle {
+        node_id,
+        channel,
+        tx_power_dbm,
+        pending: Mutex::new(VecDeque::new()),
+        last_rx: Mutex::new(None),
+    })) as *mut c_void
+}
+
+/// Starts an instantaneous virtual transmission.
+#[no_mangle]
+pub extern "C" fn meshemu_radio_start_send(radio: *mut c_void, data: *const u8, len: u32) -> bool {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return false;
+    };
+    if data.is_null() && len != 0 {
+        return false;
+    }
+
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len as usize) }
+    };
+    let airtime_ms = propagation::airtime_ms(
+        bytes.len(),
+        handle.channel.spreading_factor,
+        handle.channel.bandwidth_khz,
+        handle.channel.coding_rate,
+        8,
+        true,
+    );
+    let mut state = lock(&BUS);
+    let timestamp_ms = state.now_ms;
+    state.bus.broadcast(TxEvent {
+        node_id: handle.node_id.clone(),
+        channel: handle.channel.clone(),
+        data: bytes.to_vec(),
+        tx_power_dbm: handle.tx_power_dbm,
+        airtime_ms,
+        position: (0.0, 0.0),
+        timestamp_ms,
+    });
+    true
+}
+
+/// Copies one queued packet into `buffer`, returning zero when none is ready.
+#[no_mangle]
+pub extern "C" fn meshemu_radio_recv_raw(radio: *mut c_void, buffer: *mut u8, max_len: i32) -> i32 {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return 0;
+    };
+    if buffer.is_null() || max_len <= 0 {
+        return 0;
+    }
+
+    let mut pending = lock(&handle.pending);
+    if pending.is_empty() {
+        let packets = lock(&BUS).bus.poll(&handle.node_id);
+        pending.extend(packets);
+    }
+    let Some(packet) = pending.pop_front() else {
+        return 0;
+    };
+
+    let len = packet.data.len().min(max_len as usize);
+    unsafe {
+        ptr::copy_nonoverlapping(packet.data.as_ptr(), buffer, len);
+    }
+    *lock(&handle.last_rx) = Some((packet.rssi_dbm as f32, packet.snr_db as f32));
+    len as i32
+}
+
+#[no_mangle]
+pub extern "C" fn meshemu_radio_get_rssi(radio: *mut c_void) -> f32 {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return 0.0;
+    };
+    lock(&handle.last_rx).map(|(rssi, _)| rssi).unwrap_or(0.0)
+}
+
+#[no_mangle]
+pub extern "C" fn meshemu_radio_get_snr(radio: *mut c_void) -> f32 {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return 0.0;
+    };
+    lock(&handle.last_rx).map(|(_, snr)| snr).unwrap_or(0.0)
+}
+
+#[no_mangle]
+pub extern "C" fn meshemu_radio_is_send_complete(radio: *mut c_void) -> bool {
+    !radio.is_null()
+}
+
+#[no_mangle]
+pub extern "C" fn meshemu_radio_set_position(radio: *mut c_void, lat: f64, lon: f64) {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return;
+    };
+    if lat.is_finite() && lon.is_finite() {
+        lock(&BUS).bus.update_position(&handle.node_id, (lat, lon));
+    }
+}
+
+/// Destroys a radio handle. The caller must pass each non-null handle once.
+#[no_mangle]
+pub extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
+    if radio.is_null() {
+        return;
+    }
+
+    let handle = unsafe { Box::from_raw(radio as *mut RadioHandle) };
+    let mut state = lock(&BUS);
+    state.bus.unregister_node(&handle.node_id);
+    state.node_ids.remove(&handle.node_id);
+}
+
+/// Advances virtual radio time and expires completed transmissions.
+#[no_mangle]
+pub extern "C" fn meshemu_bus_tick(now_ms: u64) {
+    let mut state = lock(&BUS);
+    state.now_ms = now_ms;
+    state.bus.tick(now_ms);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_bus() {
+    *lock(&BUS) = BusState::new();
+}
