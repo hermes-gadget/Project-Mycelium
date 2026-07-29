@@ -545,6 +545,7 @@ dependencies = [
  "libloading",
  "mycelium-board",
  "mycelium-display",
+ "mycelium-gps",
  "mycelium-input",
  "radio_bus",
  "sdl2",

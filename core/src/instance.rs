@@ -296,8 +296,14 @@ mod tests {
         let peripherals = create_peripherals(&id, &config).unwrap();
 
         assert!(peripherals.storage.spiffs_path().is_dir());
-        assert_eq!(peripherals.gps.position(), (51.5074, -0.1278));
-        assert_eq!(peripherals.board.battery_mv(), 3_700);
+        assert_eq!(
+            (
+                peripherals.gps.state().latitude,
+                peripherals.gps.state().longitude
+            ),
+            (51.5074, -0.1278)
+        );
+        assert_eq!(peripherals.board.get_battery_mv(), 3_700);
         assert!(!peripherals.buzzer.lock().unwrap().is_playing());
         remove_buzzer(&id);
     }
