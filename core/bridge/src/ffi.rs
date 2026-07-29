@@ -375,6 +375,18 @@ pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_le
     gps.read(output).min(i32::MAX as usize) as i32
 }
 
+/// Advances the virtual GPS clock and movement model.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
+    if let Some(gps) = unsafe { gps_mut(gps) } {
+        gps.tick(delta_ms);
+    }
+}
+
 /// Enables or disables NMEA output.
 ///
 /// # Safety
@@ -383,7 +395,7 @@ pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_le
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool) {
     if let Some(gps) = unsafe { gps_mut(gps) } {
-        gps.state_mut().enabled = enabled;
+        gps.set_enabled(enabled);
     }
 }
 

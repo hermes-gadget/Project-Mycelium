@@ -7,7 +7,7 @@ pub use ffi::{
     meshemu_board_set_battery, meshemu_bus_tick, meshemu_display_capture,
     meshemu_display_capture_free, meshemu_display_create, meshemu_display_create_ex,
     meshemu_display_create_v, meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy,
-    meshemu_gps_read, meshemu_gps_set_enabled, meshemu_gps_set_position,
+    meshemu_gps_read, meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_tick,
     meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
     meshemu_i2c_keyboard_inject_key_byte, meshemu_input_digital_read, meshemu_input_inject_key,
     meshemu_input_inject_touch, meshemu_input_poll_key, meshemu_input_poll_touch,
@@ -438,6 +438,7 @@ mod tests {
         assert!(!gps.is_null());
         let mut buffer = [0_u8; 256];
 
+        unsafe { meshemu_gps_tick(gps, 1_000) };
         let len = unsafe { meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32) };
         let sentence = std::str::from_utf8(&buffer[..len as usize]).unwrap();
         assert!(sentence.starts_with("$GPGGA,"));

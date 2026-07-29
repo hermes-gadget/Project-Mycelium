@@ -65,25 +65,31 @@ impl GpsState {
         finish_sentence(body)
     }
 
-    /// Generate the first `$GPGSV` satellites-in-view sentence.
+    /// Generate the complete set of `$GPGSV` satellites-in-view sentences.
     ///
-    /// A GSV sentence can describe at most four satellites. The reported
-    /// message count tells a consumer how many sentences the full view would
-    /// occupy; this generator emits the first one on each rotation.
-    pub fn generate_gsv(&self) -> String {
+    /// A GSV sentence can describe at most four satellites, so a complete
+    /// view may contain multiple ordered fragments.
+    pub fn generate_gsv(&self) -> Vec<String> {
         let satellites = self.satellites;
         let message_count = satellites.max(1).div_ceil(4);
-        let mut body = format!("GPGSV,{message_count},1,{satellites:02}");
-        for prn in 1..=satellites.min(4) {
-            let elevation = 30 + u16::from(prn) * 5;
-            let azimuth = (u16::from(prn) * 67) % 360;
-            let snr = 35 + u16::from(prn);
-            body.push_str(&format!(",{prn:02},{elevation:02},{azimuth:03},{snr:02}"));
-        }
-        finish_sentence(body)
+        (0..message_count)
+            .map(|fragment| {
+                let message_number = fragment + 1;
+                let first_prn = fragment.saturating_mul(4).saturating_add(1);
+                let last_prn = first_prn.saturating_add(3).min(satellites);
+                let mut body = format!("GPGSV,{message_count},{message_number},{satellites:02}");
+                for prn in first_prn..=last_prn {
+                    let elevation = 30 + u16::from(prn) * 5;
+                    let azimuth = (u16::from(prn) * 67) % 360;
+                    let snr = 35 + u16::from(prn);
+                    body.push_str(&format!(",{prn:02},{elevation:02},{azimuth:03},{snr:02}"));
+                }
+                finish_sentence(body)
+            })
+            .collect()
     }
 
-    fn generate_gga_at(&self, now: DateTime<Utc>) -> String {
+    pub(crate) fn generate_gga_at(&self, now: DateTime<Utc>) -> String {
         let (lat_deg, lat_min, lat_dir, lon_deg, lon_min, lon_dir) = self.coordinate_fields();
         let fix_quality = if self.enabled { self.fix_quality } else { 0 };
         let satellites = if fix_quality == 0 { 0 } else { self.satellites };
@@ -101,7 +107,7 @@ impl GpsState {
         finish_sentence(body)
     }
 
-    fn generate_rmc_at(&self, now: DateTime<Utc>) -> String {
+    pub(crate) fn generate_rmc_at(&self, now: DateTime<Utc>) -> String {
         let (lat_deg, lat_min, lat_dir, lon_deg, lon_min, lon_dir) = self.coordinate_fields();
         let status = if self.enabled && self.fix_quality > 0 {
             "A"
@@ -206,5 +212,31 @@ mod tests {
             calculate_checksum("GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"),
             0x47
         );
+    }
+
+    #[test]
+    fn generates_complete_gsv_vector_for_eight_satellites() {
+        let state = GpsState::new(48.1173, 11.5166667);
+
+        let sentences = state.generate_gsv();
+
+        assert_eq!(
+            sentences,
+            [
+                "$GPGSV,2,1,08,01,35,067,36,02,40,134,37,03,45,201,38,04,50,268,39*78\r\n",
+                "$GPGSV,2,2,08,05,55,335,40,06,60,042,41,07,65,109,42,08,70,176,43*74\r\n",
+            ]
+        );
+        sentences
+            .iter()
+            .for_each(|sentence| assert_valid_checksum(sentence));
+    }
+
+    #[test]
+    fn generates_one_empty_gsv_fragment_when_no_satellites_are_visible() {
+        let mut state = GpsState::new(48.1173, 11.5166667);
+        state.satellites = 0;
+
+        assert_eq!(state.generate_gsv(), ["$GPGSV,1,1,00*79\r\n"]);
     }
 }
