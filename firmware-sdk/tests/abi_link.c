@@ -20,11 +20,21 @@ int main(void)
     (void)meshemu_board_get_battery(board);
     (void)meshemu_board_get_adc(board, 4);
     (void)meshemu_board_get_temp(board);
+    (void)meshemu_board_psram_found(board);
+    (void)meshemu_board_get_psram_free(board);
+    (void)meshemu_board_psram_readback_test(board);
+    (void)meshemu_board_psram_reserve(board, 1024);
+    meshemu_board_psram_release(board, 1024);
     meshemu_board_digital_write(board, 10, true);
     meshemu_board_ledc_attach(board, 0, 46);
     (void)meshemu_board_ledc_write(board, 0, 1000, 500);
     meshemu_board_set_external_power(board, true);
     (void)meshemu_board_get_charger_state(board);
+    meshemu_board_rtc_gpio_hold(board, 9, true);
+    meshemu_board_set_boot_phase(2);
+    (void)meshemu_board_get_last_boot_phase();
+    (void)meshemu_board_deep_sleep(id, 1, UINT64_C(1) << 45);
+    (void)meshemu_board_get_sleep_wake_cause();
     meshemu_board_destroy(board);
 
     meshemu_buzzer_beep(id, 440, 10);
