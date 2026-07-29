@@ -9,20 +9,22 @@ pub use ffi::{
     meshemu_board_get_psram_free, meshemu_board_get_sleep_wake_cause, meshemu_board_get_temp,
     meshemu_board_ledc_attach, meshemu_board_ledc_write, meshemu_board_psram_found,
     meshemu_board_psram_readback_test, meshemu_board_psram_release, meshemu_board_psram_reserve,
-    meshemu_board_rtc_gpio_hold, meshemu_board_set_battery, meshemu_board_set_boot_phase,
-    meshemu_board_set_external_power, meshemu_bus_tick, meshemu_display_capture,
-    meshemu_display_capture_free, meshemu_display_create, meshemu_display_create_ex,
-    meshemu_display_create_v, meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy,
-    meshemu_gps_read, meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_tick,
+    meshemu_board_rtc_gpio_hold, meshemu_board_set_adc_calibration, meshemu_board_set_battery,
+    meshemu_board_set_boot_phase, meshemu_board_set_external_power, meshemu_board_set_periph_power,
+    meshemu_bus_tick, meshemu_display_capture, meshemu_display_capture_free,
+    meshemu_display_create, meshemu_display_create_ex, meshemu_display_create_v,
+    meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read,
+    meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_tick,
     meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
     meshemu_i2c_keyboard_inject_key_byte, meshemu_i2c_keyboard_set_cross_reset,
     meshemu_input_digital_read, meshemu_input_get_touch_mapped, meshemu_input_get_touch_raw,
     meshemu_input_gt911_get_status, meshemu_input_gt911_set_failure_mode, meshemu_input_inject_key,
     meshemu_input_inject_touch, meshemu_input_poll_key, meshemu_input_poll_touch,
     meshemu_input_take_falling_edges, meshemu_radio_create, meshemu_radio_destroy,
-    meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
-    meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
-    meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_write,
+    meshemu_radio_get_dio2_config, meshemu_radio_get_est_airtime, meshemu_radio_get_rssi,
+    meshemu_radio_get_snr, meshemu_radio_is_send_complete, meshemu_radio_recv_raw,
+    meshemu_radio_set_dio2_config, meshemu_radio_set_position, meshemu_radio_start_send,
+    meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_set_behavior, meshemu_sdcard_write,
     meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free,
     meshemu_storage_destroy, meshemu_wire_available, meshemu_wire_begin,
     meshemu_wire_begin_transmission, meshemu_wire_end_transmission, meshemu_wire_probe_address,
@@ -41,6 +43,7 @@ mod tests {
     use super::*;
 
     static TEST_BUS: Mutex<()> = Mutex::new(());
+    static TEST_STORAGE: Mutex<()> = Mutex::new(());
 
     fn create(id: &str, position: (f64, f64)) -> *mut c_void {
         let id = CString::new(id).unwrap();
@@ -265,10 +268,40 @@ mod tests {
         let radio = create("sx1262-state", (0.0, 0.0));
 
         let state = unsafe { ffi::radio_state(radio) }.unwrap();
-        assert!(state.dio2_rf_switch_enabled);
+        assert!(!state.dio2_rf_switch_enabled);
+        assert!(!unsafe { meshemu_radio_get_dio2_config(radio) });
         assert_eq!(state.dio3_tcxo_voltage_v, Some(1.8));
 
+        unsafe { meshemu_radio_set_dio2_config(radio, true) };
+        assert!(unsafe { meshemu_radio_get_dio2_config(radio) });
+
         destroy(radio);
+    }
+
+    #[test]
+    fn dio2_ffi_switch_restores_sixteen_db_tx_path() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let sender = create("dio2-sender", (0.0, 0.0));
+        let receiver = create("dio2-receiver", (0.0, 0.0001));
+        unsafe { meshemu_radio_set_dio2_config(receiver, true) };
+        let packet = [42];
+        let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
+
+        assert!(send(sender, &packet));
+        meshemu_bus_tick(u64::from(airtime));
+        assert_eq!(receive(receiver), packet);
+        let lossy_rssi = unsafe { meshemu_radio_get_rssi(receiver) };
+
+        unsafe { meshemu_radio_set_dio2_config(sender, true) };
+        assert!(send(sender, &packet));
+        meshemu_bus_tick(2 * u64::from(airtime));
+        assert_eq!(receive(receiver), packet);
+        let normal_rssi = unsafe { meshemu_radio_get_rssi(receiver) };
+        assert!((normal_rssi - lossy_rssi - 16.0).abs() < 0.01);
+
+        destroy(receiver);
+        destroy(sender);
     }
 
     #[test]
@@ -395,6 +428,39 @@ mod tests {
     }
 
     #[test]
+    fn gpio10_power_loss_makes_instance_wire_nack() {
+        let id = CString::new("ffi-wire-power-node").unwrap();
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+        let wire = unsafe { meshemu_wire_shim_create_for_instance(id.as_ptr()) };
+
+        unsafe {
+            assert!(meshemu_wire_begin(wire));
+            meshemu_wire_set_clock(wire, 100_000);
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_write(wire, 0x04), 1);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+
+            meshemu_board_set_periph_power(board, false);
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_write(wire, 0x04), 0);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0x02);
+            assert_eq!(
+                meshemu_wire_request_from(wire, mycelium_input::KEYBOARD_I2C_ADDRESS, 1),
+                0
+            );
+
+            meshemu_board_set_periph_power(board, true);
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_write(wire, 0x04), 1);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+
+            meshemu_wire_shim_destroy(wire);
+            meshemu_board_destroy(board);
+        }
+        mycelium_input::remove_input_manager("ffi-wire-power-node");
+    }
+
+    #[test]
     fn wire_ffi_rejects_null_handles_and_non_keyboard_addresses() {
         unsafe {
             meshemu_i2c_keyboard_inject_key_byte(std::ptr::null_mut(), 0);
@@ -426,6 +492,7 @@ mod tests {
 
     #[test]
     fn storage_ffi_round_trips_spiffs_and_sdcard_files() {
+        let _serial = TEST_STORAGE.lock().unwrap();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -465,6 +532,7 @@ mod tests {
 
     #[test]
     fn storage_ffi_rejects_null_arguments() {
+        let _serial = TEST_STORAGE.lock().unwrap();
         let mut len = usize::MAX;
         unsafe {
             assert!(!meshemu_spiffs_init(std::ptr::null()));
@@ -544,12 +612,21 @@ mod tests {
 
         unsafe {
             assert_eq!(meshemu_board_get_battery(board), 3_850);
-            assert_eq!(meshemu_board_get_adc(board, 4), 2_391);
+            assert_eq!(meshemu_board_get_adc(board, 4), 2_389);
             assert_eq!(meshemu_board_get_adc(board, 5), 0);
             assert_eq!(meshemu_board_get_temp(board), 37.5);
             meshemu_board_set_battery(board, 3_700);
             assert_eq!(meshemu_board_get_battery(board), 3_700);
-            assert_eq!(meshemu_board_get_adc(board, 4), 2_298);
+            assert_eq!(meshemu_board_get_adc(board, 4), 2_296);
+            meshemu_board_set_battery(board, 4_200);
+            meshemu_board_set_adc_calibration(board, false);
+            let uncalibrated_mv = f64::from(meshemu_board_get_adc(board, 4))
+                * mycelium_board::BATTERY_MV_PER_ADC_COUNT;
+            assert!((uncalibrated_mv - 3_780.0).abs() < 5.0);
+            meshemu_board_set_adc_calibration(board, true);
+            let calibrated_mv = f64::from(meshemu_board_get_adc(board, 4))
+                * mycelium_board::BATTERY_MV_PER_ADC_COUNT;
+            assert!((calibrated_mv - 4_200.0).abs() < 5.0);
             meshemu_board_set_battery(board, u16::MAX);
             assert_eq!(meshemu_board_get_adc(board, 4), 4_095);
             meshemu_board_destroy(board);
@@ -700,6 +777,7 @@ mod tests {
 
     #[test]
     fn board_power_gpio_gates_gps_sd_and_gpio46_pwm_buzzer() {
+        let _serial = TEST_STORAGE.lock().unwrap();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -715,6 +793,7 @@ mod tests {
 
         unsafe {
             meshemu_board_ledc_attach(board, 3, mycelium_board::BUZZER_GPIO);
+            meshemu_gps_tick(gps, 1_000);
             assert!(meshemu_board_ledc_write(board, 3, 500, 125));
             {
                 let buzzer = buzzer
@@ -773,6 +852,24 @@ mod tests {
             meshemu_board_destroy(board);
         }
         mycelium_board::remove_buzzer(&instance);
+    }
+
+    #[test]
+    fn sdcard_ffi_runs_slow_card_retry_ladder() {
+        let _serial = TEST_STORAGE.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = CString::new(format!("ffi-slow-sd-{}-{nonce}", std::process::id())).unwrap();
+
+        meshemu_sdcard_set_behavior(true, 3_000);
+        assert!(!unsafe { meshemu_sdcard_init(id.as_ptr()) });
+        meshemu_sdcard_set_behavior(true, 2_000);
+        assert!(unsafe { meshemu_sdcard_init(id.as_ptr()) });
+
+        assert!(unsafe { meshemu_storage_destroy(id.as_ptr()) });
+        meshemu_sdcard_set_behavior(false, 0);
     }
 
     #[test]

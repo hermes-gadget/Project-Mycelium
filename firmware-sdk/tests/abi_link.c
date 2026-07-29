@@ -19,6 +19,7 @@ int main(void)
     meshemu_board_set_battery(board, 3600);
     (void)meshemu_board_get_battery(board);
     (void)meshemu_board_get_adc(board, 4);
+    meshemu_board_set_adc_calibration(board, true);
     (void)meshemu_board_get_temp(board);
     (void)meshemu_board_psram_found(board);
     (void)meshemu_board_get_psram_free(board);
@@ -26,6 +27,7 @@ int main(void)
     (void)meshemu_board_psram_reserve(board, 1024);
     meshemu_board_psram_release(board, 1024);
     meshemu_board_digital_write(board, 10, true);
+    meshemu_board_set_periph_power(board, true);
     meshemu_board_ledc_attach(board, 0, 46);
     (void)meshemu_board_ledc_write(board, 0, 1000, 500);
     meshemu_board_set_external_power(board, true);
@@ -96,6 +98,8 @@ int main(void)
     (void)meshemu_radio_get_rssi(radio);
     (void)meshemu_radio_get_snr(radio);
     (void)meshemu_radio_is_send_complete(radio);
+    meshemu_radio_set_dio2_config(radio, true);
+    (void)meshemu_radio_get_dio2_config(radio);
     meshemu_radio_set_position(radio, 51.5, -0.1);
     meshemu_bus_tick(1);
     meshemu_radio_destroy(radio);
@@ -104,6 +108,7 @@ int main(void)
     uint8_t* spiffs_data = meshemu_spiffs_read(id, id, &size);
     (void)meshemu_spiffs_write(id, id, &byte, 1);
     meshemu_storage_data_free(spiffs_data);
+    meshemu_sdcard_set_behavior(false, 0);
     (void)meshemu_sdcard_init(id);
     uint8_t* sdcard_data = meshemu_sdcard_read(id, id, &size);
     (void)meshemu_sdcard_write(id, id, &byte, 1);

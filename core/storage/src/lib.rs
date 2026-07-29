@@ -7,7 +7,8 @@ pub mod spiffs;
 pub use manager::StorageManager;
 pub use sdcard::{
     SdCardInfo, SdFilesystem, SdPartitionTable, VirtualSdCard, FAT32_MAX_FILE_SIZE,
-    FAT32_MAX_VOLUME_SIZE, SDHC_MAX_CAPACITY, TDECK_LORA_CS_PIN, TDECK_SDCARD_CS_PIN,
+    FAT32_MAX_VOLUME_SIZE, SDHC_MAX_CAPACITY, SD_FAST_INIT_HZ, SD_INIT_LADDER, SD_SLOW_INIT_HZ,
+    TDECK_LORA_CS_PIN, TDECK_SDCARD_CS_PIN,
 };
 pub use spiffs::{
     SpiffsInfo, VirtualSpiffs, DEFAULT_SPIFFS_BLOCK_SIZE, DEFAULT_SPIFFS_PARTITION_SIZE,
@@ -260,5 +261,41 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn slow_sdcard_fails_fast_and_mounts_on_retry_ladder() {
+        let root = test_directory("sdcard-slow-init");
+        let mut sdcard = VirtualSdCard::at_path("test", root.clone());
+        sdcard.set_behavior(true, 2_000);
+
+        assert!(!sdcard.mount().unwrap());
+        assert!(!sdcard.is_mounted());
+        assert_eq!(
+            sdcard.last_init_frequency_hz(),
+            Some(super::SD_FAST_INIT_HZ)
+        );
+        assert_eq!(sdcard.last_init_elapsed_ms(), 0);
+
+        assert!(sdcard.mount_with_retry_ladder().unwrap());
+        assert!(sdcard.is_mounted());
+        assert_eq!(
+            sdcard.last_init_frequency_hz(),
+            Some(super::SD_SLOW_INIT_HZ)
+        );
+        assert_eq!(sdcard.last_init_elapsed_ms(), 2_660);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn slow_sdcard_stays_unmounted_when_wake_delay_exceeds_ladder() {
+        let root = test_directory("sdcard-too-slow");
+        let mut sdcard = VirtualSdCard::at_path("test", root.clone());
+        sdcard.set_behavior(true, 3_000);
+
+        assert!(!sdcard.mount_with_retry_ladder().unwrap());
+        assert!(!sdcard.is_mounted());
+        assert_eq!(sdcard.last_init_elapsed_ms(), 2_660);
+        assert!(!root.exists());
     }
 }

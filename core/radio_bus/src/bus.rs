@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 
 use crate::propagation::{self, PropagationModel};
-use crate::types::{RadioChannel, RxPacket, TxEvent};
+use crate::types::{
+    RadioChannel, RxPacket, TxEvent, SX1262_DIO2_RX_LOSS_DB, SX1262_DIO2_TX_LOSS_DB,
+};
 
 const THERMAL_NOISE_DENSITY_DBM_PER_HZ: f64 = -174.0;
 const DEFAULT_NOISE_FIGURE_DB: f64 = 6.0;
@@ -22,6 +24,11 @@ pub struct RadioBusConfig {
     /// Signals this close to a receiver's center frequency contribute
     /// interference, even when their modulation settings are not decodable.
     pub frequency_tolerance_khz: f64,
+    /// Initial DIO2 RF-switch configuration for newly registered radios.
+    ///
+    /// Upstream SX1262 libraries default this off. T-Deck firmware must enable
+    /// it or the external antenna switch introduces substantial TX/RX loss.
+    pub dio2_as_rf_switch: bool,
 }
 
 impl Default for RadioBusConfig {
@@ -36,6 +43,7 @@ impl Default for RadioBusConfig {
             system_loss_db: 6.0,
             noise_figure_db: DEFAULT_NOISE_FIGURE_DB,
             frequency_tolerance_khz: 125.0,
+            dio2_as_rf_switch: false,
         }
     }
 }
@@ -54,6 +62,7 @@ struct NodeState {
     inbox: Vec<RxPacket>,
     tx_busy_until_ms: u64,
     rx_enabled: bool,
+    dio2_as_rf_switch: bool,
 }
 
 #[derive(Clone)]
@@ -119,6 +128,7 @@ impl RadioBus {
                 inbox: Vec::new(),
                 tx_busy_until_ms: 0,
                 rx_enabled: true,
+                dio2_as_rf_switch: self.config.dio2_as_rf_switch,
             },
         );
     }
@@ -145,6 +155,16 @@ impl RadioBus {
         }
     }
 
+    pub fn set_dio2_as_rf_switch(&mut self, id: &str, as_rf_switch: bool) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.dio2_as_rf_switch = as_rf_switch;
+        }
+    }
+
+    pub fn dio2_as_rf_switch(&self, id: &str) -> Option<bool> {
+        self.nodes.get(id).map(|node| node.dio2_as_rf_switch)
+    }
+
     /// Schedules a packet for delivery after its airtime has elapsed.
     ///
     /// Returns false for an unknown sender or when that radio is already
@@ -160,7 +180,12 @@ impl RadioBus {
         // Registered node state is authoritative, which also makes position
         // updates apply even when a caller constructed the event earlier.
         tx.position = sender.position;
-        tx.tx_power_dbm = sender.tx_power_dbm;
+        tx.tx_power_dbm = sender.tx_power_dbm
+            - if sender.dio2_as_rf_switch {
+                0.0
+            } else {
+                SX1262_DIO2_TX_LOSS_DB
+            };
         tx.channel = sender.current_channel.clone();
         sender.tx_busy_until_ms = tx.timestamp_ms.saturating_add(u64::from(tx.airtime_ms));
         self.transmissions.push(ScheduledTransmission {
@@ -243,6 +268,11 @@ impl RadioBus {
             }
 
             let distance = propagation::distance_km(event.position, receiver.position);
+            let receiver_loss_db = if receiver.dio2_as_rf_switch {
+                0.0
+            } else {
+                SX1262_DIO2_RX_LOSS_DB
+            };
             let Some(rssi_dbm) = propagation::received_rssi_with_model(
                 event.tx_power_dbm,
                 distance,
@@ -251,7 +281,8 @@ impl RadioBus {
                 config.antenna_gain_rx_dbi,
                 config.system_loss_db,
                 config.propagation_model,
-            ) else {
+            )
+            .map(|rssi| rssi - receiver_loss_db) else {
                 continue;
             };
             if !rssi_dbm.is_finite() || rssi_dbm < propagation::sensitivity(&event.channel) {
@@ -280,6 +311,7 @@ impl RadioBus {
                         config.system_loss_db,
                         config.propagation_model,
                     )
+                    .map(|rssi| rssi - receiver_loss_db)
                     .filter(|rssi| rssi.is_finite())
                 })
                 .collect();
@@ -384,6 +416,37 @@ mod tests {
 
     fn register(bus: &mut RadioBus, id: &str, position: (f64, f64), tx_power_dbm: f64) {
         bus.register_node(id.into(), position, tx_power_dbm, channel());
+        bus.set_dio2_as_rf_switch(id, true);
+    }
+
+    #[test]
+    fn dio2_rf_switch_defaults_off_and_models_tx_and_rx_loss() {
+        let mut bus = RadioBus::with_config(RadioBusConfig {
+            propagation_model: PropagationModel::FreeSpace,
+            system_loss_db: 0.0,
+            ..RadioBusConfig::default()
+        });
+        assert!(!bus.config().dio2_as_rf_switch);
+        bus.register_node("sender".into(), (0.0, 0.0), 14.0, channel());
+        bus.register_node("receiver".into(), (0.0, 0.001), 14.0, channel());
+        assert_eq!(bus.dio2_as_rf_switch("sender"), Some(false));
+
+        bus.set_dio2_as_rf_switch("receiver", true);
+        assert!(bus.broadcast(transmission("sender", 1, 1_000)));
+        bus.tick(1_100);
+        let lossy_tx_rssi = bus.poll("receiver")[0].rssi_dbm;
+
+        bus.set_dio2_as_rf_switch("sender", true);
+        assert!(bus.broadcast(transmission("sender", 2, 1_100)));
+        bus.tick(1_200);
+        let normal_rssi = bus.poll("receiver")[0].rssi_dbm;
+        assert!((normal_rssi - lossy_tx_rssi - SX1262_DIO2_TX_LOSS_DB).abs() < 0.001);
+
+        bus.set_dio2_as_rf_switch("receiver", false);
+        assert!(bus.broadcast(transmission("sender", 3, 1_200)));
+        bus.tick(1_300);
+        let lossy_rx_rssi = bus.poll("receiver")[0].rssi_dbm;
+        assert!((normal_rssi - lossy_rx_rssi - SX1262_DIO2_RX_LOSS_DB).abs() < 0.001);
     }
 
     #[test]
@@ -483,6 +546,7 @@ mod tests {
                 ..channel_at(915.001)
             },
         );
+        bus.set_dio2_as_rf_switch("interferer", true);
 
         assert!(bus.broadcast(transmission("wanted", 1, 1_000)));
         let mut interference = transmission("interferer", 2, 1_000);

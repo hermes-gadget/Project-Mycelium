@@ -23,6 +23,7 @@ bool meshemu_spiffs_write(
 );
 
 bool meshemu_sdcard_init(const char *instance_id);
+void meshemu_sdcard_set_behavior(bool slow_init, uint32_t wake_delay_ms);
 uint8_t *meshemu_sdcard_read(
     const char *instance_id,
     const char *path,
