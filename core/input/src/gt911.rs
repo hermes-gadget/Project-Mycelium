@@ -2,6 +2,7 @@ pub const GT911_I2C_ADDRESS: u8 = 0x5d;
 pub const GT911_STATUS_REGISTER: u16 = 0x814e;
 pub const GT911_INT_GPIO: u8 = 16;
 pub const GT911_MAX_TOUCHES: usize = 5;
+pub const DEFAULT_GT911_CONTACT_SIZE: u16 = 50;
 
 /// One contact reported by the GT911 controller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +16,7 @@ pub struct Gt911Point {
 /// Register-level model of the T-Deck GT911 touch controller.
 pub struct Gt911Controller {
     touch_points: [Option<Gt911Point>; GT911_MAX_TOUCHES],
+    contact_size: u16,
     int_asserted: bool,
     frame_ready: bool,
 }
@@ -23,9 +25,19 @@ impl Gt911Controller {
     pub fn new() -> Self {
         Self {
             touch_points: [None; GT911_MAX_TOUCHES],
+            contact_size: DEFAULT_GT911_CONTACT_SIZE,
             int_asserted: false,
             frame_ready: false,
         }
+    }
+
+    /// Configure the GT911 contact size/weight used for primary touch injection.
+    pub fn set_contact_size(&mut self, contact_size: u16) {
+        self.contact_size = contact_size;
+    }
+
+    pub fn contact_size(&self) -> u16 {
+        self.contact_size
     }
 
     /// Inject a primary contact from landscape host coordinates.
@@ -37,7 +49,7 @@ impl Gt911Controller {
                 track_id: 0,
                 x: mouse_y.clamp(0, 239) as u16,
                 y: (319 - mouse_x).clamp(0, 319) as u16,
-                size: 50,
+                size: self.contact_size,
             };
             self.touch_points[0] = Some(point);
             self.frame_ready = true;
@@ -137,6 +149,7 @@ mod tests {
     #[test]
     fn touch_is_encoded_in_gt911_register_format_with_portrait_swap() {
         let mut controller = Gt911Controller::new();
+        controller.set_contact_size(321);
         controller.inject_touch(100, 40, true);
         let mut registers = [0; 9];
 
@@ -148,8 +161,19 @@ mod tests {
         assert_eq!(registers[1], 0);
         assert_eq!(u16::from_le_bytes([registers[2], registers[3]]), 40);
         assert_eq!(u16::from_le_bytes([registers[4], registers[5]]), 219);
-        assert_eq!(u16::from_le_bytes([registers[6], registers[7]]), 50);
+        assert_eq!(u16::from_le_bytes([registers[6], registers[7]]), 321);
         assert_eq!(registers[8], 0);
+    }
+
+    #[test]
+    fn primary_contact_size_is_configurable() {
+        let mut controller = Gt911Controller::new();
+        assert_eq!(controller.contact_size(), DEFAULT_GT911_CONTACT_SIZE);
+
+        controller.set_contact_size(u16::MAX);
+        controller.inject_touch(10, 20, true);
+
+        assert_eq!(controller.touch_points()[0].unwrap().size, u16::MAX);
     }
 
     #[test]

@@ -415,7 +415,7 @@ mod tests {
         }
         assert_eq!(
             unsafe { meshemu_input_poll_touch(id.as_ptr()) },
-            45 | (196 << 16) | (255 << 32)
+            45 | (196 << 16) | (u64::from(mycelium_input::DEFAULT_GT911_CONTACT_SIZE) << 32)
         );
         assert_eq!(unsafe { meshemu_input_poll_touch(id.as_ptr()) }, 0);
 

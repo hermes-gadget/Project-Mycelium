@@ -113,6 +113,9 @@ impl TrackballGpio {
             Keycode::KpEnter => TrackballDirection::Center,
             _ => return None,
         };
+        if self.is_pressed(direction) == pressed {
+            return None;
+        }
         if pressed {
             self.press(direction);
         } else {
@@ -129,6 +132,16 @@ impl TrackballGpio {
 
     pub fn get_last(&self) -> Option<TrackballEvent> {
         self.last_event
+    }
+
+    fn is_pressed(&self, direction: TrackballDirection) -> bool {
+        !match direction {
+            TrackballDirection::Up => self.up,
+            TrackballDirection::Down => self.down,
+            TrackballDirection::Left => self.left,
+            TrackballDirection::Right => self.right,
+            TrackballDirection::Center => self.click,
+        }
     }
 
     fn pin(&mut self, direction: TrackballDirection) -> &mut bool {
@@ -221,5 +234,15 @@ mod tests {
             TrackballDirection::Center
         );
         assert!(!trackball.digital_read(TRACKBALL_CLICK_GPIO));
+    }
+
+    #[test]
+    fn suppresses_duplicate_transitions() {
+        let mut trackball = TrackballGpio::new();
+        assert!(trackball.handle_key(Keycode::Up, true).is_some());
+        assert!(trackball.handle_key(Keycode::Up, true).is_none());
+        assert!(trackball.handle_key(Keycode::Up, false).is_some());
+        assert!(trackball.handle_key(Keycode::Up, false).is_none());
+        assert_eq!(trackball.take_falling_edges(TRACKBALL_UP_GPIO), 1);
     }
 }

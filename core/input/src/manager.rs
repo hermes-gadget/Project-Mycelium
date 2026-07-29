@@ -65,7 +65,6 @@ impl InputManager {
         let mut events = Vec::with_capacity(2);
         match *event {
             Event::MouseMotion { x, y, .. } => {
-                self.wake();
                 if let Some(event) = self.touch.handle_mouse_motion(x, y) {
                     self.update_gt911(true);
                     self.touch_events.push_back(event);
@@ -75,9 +74,7 @@ impl InputManager {
             Event::MouseButtonDown {
                 mouse_btn, x, y, ..
             } => {
-                self.wake();
-                self.touch.handle_mouse_motion(x, y);
-                if let Some(event) = self.touch.handle_mouse_button(mouse_btn, true) {
+                if let Some(event) = self.touch.handle_mouse_button_at(mouse_btn, true, x, y) {
                     self.update_gt911(true);
                     self.touch_events.push_back(event);
                     events.push(InputEvent::Touch(event));
@@ -86,9 +83,7 @@ impl InputManager {
             Event::MouseButtonUp {
                 mouse_btn, x, y, ..
             } => {
-                self.wake();
-                self.touch.handle_mouse_motion(x, y);
-                if let Some(event) = self.touch.handle_mouse_button(mouse_btn, false) {
+                if let Some(event) = self.touch.handle_mouse_button_at(mouse_btn, false, x, y) {
                     self.update_gt911(false);
                     self.touch_events.push_back(event);
                     events.push(InputEvent::Touch(event));
@@ -98,36 +93,52 @@ impl InputManager {
                 keycode: Some(keycode),
                 ..
             } => {
-                self.wake();
                 self.handle_keycode(keycode, true, &mut events);
             }
             Event::KeyUp {
                 keycode: Some(keycode),
                 ..
             } => {
-                self.wake();
                 self.handle_keycode(keycode, false, &mut events);
             }
             _ => {}
+        }
+        if !events.is_empty() {
+            self.wake();
         }
         events
     }
 
     pub fn inject_touch(&mut self, x: u16, y: u16, pressed: bool) -> bool {
-        self.wake();
         let Some(event) = self.touch.inject(x, y, pressed) else {
             return false;
         };
         self.update_gt911(pressed);
         self.touch_events.push_back(event);
+        self.wake();
         true
     }
 
     pub fn inject_key(&mut self, keycode: Keycode, pressed: bool) -> Vec<InputEvent> {
-        self.wake();
         let mut events = Vec::with_capacity(2);
         self.handle_keycode(keycode, pressed, &mut events);
+        if !events.is_empty() {
+            self.wake();
+        }
         events
+    }
+
+    /// Configure the contact size used by both queued touch events and GT911 registers.
+    pub fn set_touch_contact_size(&mut self, contact_size: u16) {
+        self.touch.set_contact_size(contact_size);
+        self.gt911
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_contact_size(contact_size);
+    }
+
+    pub fn touch_contact_size(&self) -> u16 {
+        self.touch.contact_size()
     }
 
     pub fn i2c_keyboard(&self) -> SharedI2cKeyboard {
@@ -213,6 +224,10 @@ impl InputManager {
     }
 }
 
+/// Register an instance route, or return its existing shared manager.
+///
+/// Duplicate registration updates only the window scale and never replaces the
+/// live `Arc`, so existing producers and later lookups cannot diverge.
 pub fn register_input_manager(instance_id: &str, scale: f32) -> SharedInputManager {
     let (manager, existed) = {
         let mut managers = INPUT_MANAGERS
@@ -300,6 +315,125 @@ mod tests {
         assert!(!manager.should_auto_off(1_099, 1_000));
         assert!(manager.should_auto_off(1_100, 1_000));
         assert!(!manager.should_auto_off(50, 1_000));
+    }
+
+    #[test]
+    fn ignored_sdl_input_does_not_reset_activity() {
+        let mut manager = InputManager::new("node", 1.0);
+        manager.last_activity_ms = 4_242;
+
+        let ignored = [
+            Event::MouseMotion {
+                timestamp: 0,
+                window_id: 1,
+                which: 0,
+                mousestate: sdl2::mouse::MouseState::from_sdl_state(0),
+                x: 10,
+                y: 10,
+                xrel: 1,
+                yrel: 1,
+            },
+            Event::MouseMotion {
+                timestamp: 0,
+                window_id: 1,
+                which: 0,
+                mousestate: sdl2::mouse::MouseState::from_sdl_state(0),
+                x: 320,
+                y: 10,
+                xrel: 1,
+                yrel: 0,
+            },
+            Event::MouseButtonDown {
+                timestamp: 0,
+                window_id: 1,
+                which: 0,
+                mouse_btn: sdl2::mouse::MouseButton::Right,
+                clicks: 1,
+                x: 10,
+                y: 10,
+            },
+            key_event(1, Keycode::F1, true),
+        ];
+
+        for event in ignored {
+            assert!(manager.handle_sdl_event(&event).is_empty());
+            assert_eq!(manager.last_activity_ms(), 4_242);
+        }
+
+        assert_eq!(
+            manager
+                .handle_sdl_event(&key_event(1, Keycode::Q, true))
+                .len(),
+            1
+        );
+        manager.last_activity_ms = 4_242;
+        assert!(manager
+            .handle_sdl_event(&key_event(1, Keycode::Q, true))
+            .is_empty());
+        assert_eq!(manager.last_activity_ms(), 4_242);
+
+        assert_eq!(
+            manager
+                .handle_sdl_event(&key_event(1, Keycode::Up, true))
+                .len(),
+            1
+        );
+        manager.last_activity_ms = 4_242;
+        assert!(manager
+            .handle_sdl_event(&key_event(1, Keycode::Up, true))
+            .is_empty());
+        assert_eq!(manager.last_activity_ms(), 4_242);
+    }
+
+    #[test]
+    fn accepted_hardware_input_resets_activity() {
+        let mut manager = InputManager::new("node", 1.0);
+        manager.last_activity_ms = u64::MAX;
+
+        assert_eq!(
+            manager
+                .handle_sdl_event(&key_event(1, Keycode::Q, true))
+                .len(),
+            1
+        );
+        assert_ne!(manager.last_activity_ms(), u64::MAX);
+
+        manager.last_activity_ms = u64::MAX;
+        assert!(manager.inject_touch(20, 30, true));
+        assert_ne!(manager.last_activity_ms(), u64::MAX);
+    }
+
+    #[test]
+    fn configured_contact_size_reaches_event_queue_and_gt911_registers() {
+        let mut manager = InputManager::new("node", 1.0);
+        manager.set_touch_contact_size(123);
+        assert_eq!(manager.touch_contact_size(), 123);
+        assert!(manager.inject_touch(100, 40, true));
+        assert_eq!(manager.poll_touch().unwrap().pressure, 123);
+        assert_eq!(
+            manager.gt911().lock().unwrap().touch_points()[0]
+                .unwrap()
+                .size,
+            123
+        );
+    }
+
+    #[test]
+    fn duplicate_registration_preserves_one_shared_route() {
+        let instance_id = "duplicate-registration-preserves-route";
+        remove_input_manager(instance_id);
+        let original = register_input_manager(instance_id, 1.0);
+        original.lock().unwrap().inject_key(Keycode::Q, true);
+
+        let duplicate = register_input_manager(instance_id, 2.0);
+        let lookup = get_input_manager(instance_id).unwrap();
+        assert!(Arc::ptr_eq(&original, &duplicate));
+        assert!(Arc::ptr_eq(&original, &lookup));
+        assert_eq!(
+            duplicate.lock().unwrap().poll_keyboard().unwrap().key_byte,
+            b'q'
+        );
+        remove_input_manager(instance_id);
     }
 
     #[test]
