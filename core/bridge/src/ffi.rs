@@ -739,6 +739,23 @@ pub unsafe extern "C" fn meshemu_i2c_keyboard_inject_key_byte(keyboard: *mut c_v
     lock(keyboard).inject_key_byte(key_byte);
 }
 
+/// Configure whether the emulated C3 retains its backlight across host resets.
+///
+/// # Safety
+///
+/// `keyboard` must be null or a live keyboard handle returned by
+/// [`meshemu_i2c_keyboard_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_i2c_keyboard_set_cross_reset(
+    keyboard: *mut c_void,
+    persist: bool,
+) {
+    let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
+        return;
+    };
+    lock(keyboard).set_cross_reset_persist(persist);
+}
+
 /// Destroys a keyboard handle.
 ///
 /// Wire shims attached to this keyboard retain shared ownership and remain
@@ -816,6 +833,48 @@ pub unsafe extern "C" fn meshemu_wire_begin(wire: *mut c_void) -> bool {
 pub unsafe extern "C" fn meshemu_wire_set_clock(wire: *mut c_void, clock_hz: u32) {
     if let Some(wire) = unsafe { wire_mut(wire) } {
         wire.set_clock(clock_hz);
+    }
+}
+
+/// Return whether a device ACKs an address-only I2C probe.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_probe_address(wire: *mut c_void, address: u8) -> bool {
+    unsafe { wire_mut(wire) }.is_some_and(|wire| wire.probe_address(address))
+}
+
+/// Read the externally pulled-up idle levels of SDA and SCL.
+///
+/// Invalid handles report LOW to non-null outputs.
+///
+/// # Safety
+///
+/// `wire` must be null or a live Wire shim handle. Output pointers may be null,
+/// otherwise each must be valid for one `u8` write.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_read_idle_levels(
+    wire: *mut c_void,
+    sda: *mut u8,
+    scl: *mut u8,
+) {
+    if !sda.is_null() {
+        unsafe { *sda = 0 };
+    }
+    if !scl.is_null() {
+        unsafe { *scl = 0 };
+    }
+    let Some(wire) = (unsafe { wire_mut(wire) }) else {
+        return;
+    };
+    let (sda_level, scl_level) = wire.idle_levels();
+    if !sda.is_null() {
+        unsafe { *sda = sda_level };
+    }
+    if !scl.is_null() {
+        unsafe { *scl = scl_level };
     }
 }
 
@@ -981,6 +1040,84 @@ pub unsafe extern "C" fn meshemu_input_poll_touch(instance_id: *const c_char) ->
         return 0;
     };
     u64::from(event.x) | (u64::from(event.y) << 16) | (u64::from(event.pressure) << 32)
+}
+
+/// Return the latest touch coordinate before the historical portrait mapping.
+///
+/// Missing instances or touches report `(0, 0)`.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+/// Output pointers may be null, otherwise each must be valid for one `u16`
+/// write.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_get_touch_raw(
+    instance_id: *const c_char,
+    x: *mut u16,
+    y: *mut u16,
+) {
+    unsafe { write_touch_position(instance_id, x, y, false) };
+}
+
+/// Return the latest touch coordinate after the historical portrait mapping.
+///
+/// This is the same coordinate space returned by `meshemu_input_poll_touch`.
+/// Missing instances or touches report `(0, 0)`.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+/// Output pointers may be null, otherwise each must be valid for one `u16`
+/// write.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_get_touch_mapped(
+    instance_id: *const c_char,
+    x: *mut u16,
+    y: *mut u16,
+) {
+    unsafe { write_touch_position(instance_id, x, y, true) };
+}
+
+unsafe fn write_touch_position(instance_id: *const c_char, x: *mut u16, y: *mut u16, mapped: bool) {
+    if !x.is_null() {
+        unsafe { *x = 0 };
+    }
+    if !y.is_null() {
+        unsafe { *y = 0 };
+    }
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return;
+    };
+    let manager = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let position = if mapped {
+        manager.touch_mapped_position()
+    } else {
+        manager.touch_raw_position()
+    };
+    let Some((touch_x, touch_y)) = position else {
+        return;
+    };
+    if !x.is_null() {
+        unsafe { *x = touch_x };
+    }
+    if !y.is_null() {
+        unsafe { *y = touch_y };
+    }
+}
+
+/// Configure a GT911 failure mode for all live and future controllers.
+#[no_mangle]
+pub extern "C" fn meshemu_input_gt911_set_failure_mode(mode: u8, value: u32) {
+    mycelium_input::set_global_failure_mode(mode, value);
+}
+
+/// Return sticky watchdog-fired flags across live GT911 controllers.
+#[no_mangle]
+pub extern "C" fn meshemu_input_gt911_get_status() -> u64 {
+    mycelium_input::global_watchdog_status()
 }
 
 /// Polls one keyboard event, packed as row[0..7], col[8..15], pressed[16].
@@ -1409,6 +1546,7 @@ pub unsafe extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
 /// Advances virtual radio time and expires completed transmissions.
 #[no_mangle]
 pub extern "C" fn meshemu_bus_tick(now_ms: u64) {
+    mycelium_input::tick_all_gt911(now_ms);
     let mut state = lock(&BUS);
     let monotonic_now_ms = state.now_ms.max(now_ms);
     state.now_ms = monotonic_now_ms;
@@ -1429,4 +1567,35 @@ pub(crate) unsafe fn radio_state(radio: *mut c_void) -> Option<Sx1262State> {
 #[cfg(test)]
 pub(crate) fn sleep_request(instance_id: &str) -> Option<(u64, u64, u32, u64, bool)> {
     lock(&BUS).sleep_requests.get(instance_id).copied()
+}
+
+#[cfg(test)]
+mod input_ffi_tests {
+    use super::*;
+    use mycelium_input::KEYBOARD_BRIGHTNESS_COMMAND;
+
+    #[test]
+    fn c3_backlight_survives_keyboard_handle_recreation() {
+        let keyboard = meshemu_i2c_keyboard_create();
+        let wire = meshemu_wire_shim_create();
+        unsafe {
+            meshemu_wire_shim_set_keyboard(wire, keyboard);
+            assert!(meshemu_wire_begin(wire));
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_write(wire, KEYBOARD_BRIGHTNESS_COMMAND), 1);
+            assert_eq!(meshemu_wire_write(wire, 128), 1);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+            meshemu_wire_shim_destroy(wire);
+            meshemu_i2c_keyboard_destroy(keyboard);
+        }
+
+        let fresh = meshemu_i2c_keyboard_create();
+        let fresh_keyboard = unsafe { keyboard_ref(fresh) }.unwrap();
+        assert!(lock(fresh_keyboard).cross_reset_persist);
+        assert_eq!(lock(fresh_keyboard).backlight(), 128);
+        unsafe {
+            meshemu_i2c_keyboard_set_cross_reset(fresh, false);
+            meshemu_i2c_keyboard_destroy(fresh);
+        }
+    }
 }

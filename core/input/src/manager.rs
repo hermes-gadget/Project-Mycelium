@@ -6,7 +6,7 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
 use crate::{
-    gt911::Gt911Controller,
+    gt911::new_shared_gt911,
     i2c_keyboard::I2cKeyboardBus,
     wire_shim::{SharedGt911, SharedI2cKeyboard, WireShim},
 };
@@ -47,7 +47,7 @@ impl InputManager {
             keyboard: KeyboardEmulator::new(),
             trackball: TrackballEmulator::new(),
             i2c_keyboard: Arc::new(Mutex::new(I2cKeyboardBus::new())),
-            gt911: Arc::new(Mutex::new(Gt911Controller::new())),
+            gt911: new_shared_gt911(),
             instance_id: instance_id.to_owned(),
             last_activity_ms: monotonic_ms(),
             touch_events: VecDeque::new(),
@@ -147,6 +147,20 @@ impl InputManager {
 
     pub fn gt911(&self) -> SharedGt911 {
         Arc::clone(&self.gt911)
+    }
+
+    pub fn touch_raw_position(&self) -> Option<(u16, u16)> {
+        self.gt911
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .raw_position()
+    }
+
+    pub fn touch_mapped_position(&self) -> Option<(u16, u16)> {
+        self.gt911
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mapped_position()
     }
 
     pub fn wire_shim(&self) -> WireShim {
