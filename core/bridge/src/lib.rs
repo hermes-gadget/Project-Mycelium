@@ -5,18 +5,19 @@ mod ffi;
 pub use ffi::{
     meshemu_board_create, meshemu_board_destroy, meshemu_board_get_battery, meshemu_board_get_temp,
     meshemu_board_set_battery, meshemu_bus_tick, meshemu_display_capture,
-    meshemu_display_capture_free, meshemu_display_create, meshemu_gps_create, meshemu_gps_destroy,
-    meshemu_gps_read, meshemu_gps_set_enabled, meshemu_gps_set_position,
-    meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key,
-    meshemu_input_inject_key, meshemu_input_inject_touch, meshemu_input_poll_key,
-    meshemu_input_poll_touch, meshemu_radio_create, meshemu_radio_destroy,
-    meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
-    meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
-    meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_write,
-    meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free,
-    meshemu_wire_available, meshemu_wire_begin_transmission, meshemu_wire_end_transmission,
-    meshemu_wire_read, meshemu_wire_request_from, meshemu_wire_shim_create,
-    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+    meshemu_display_capture_free, meshemu_display_create, meshemu_display_create_v,
+    meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read,
+    meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_i2c_keyboard_create,
+    meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key, meshemu_input_inject_key,
+    meshemu_input_inject_touch, meshemu_input_poll_key, meshemu_input_poll_touch,
+    meshemu_radio_create, meshemu_radio_destroy, meshemu_radio_get_est_airtime,
+    meshemu_radio_get_rssi, meshemu_radio_get_snr, meshemu_radio_is_send_complete,
+    meshemu_radio_recv_raw, meshemu_radio_set_position, meshemu_radio_start_send,
+    meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_write, meshemu_spiffs_init,
+    meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free, meshemu_wire_available,
+    meshemu_wire_begin_transmission, meshemu_wire_end_transmission, meshemu_wire_read,
+    meshemu_wire_request_from, meshemu_wire_shim_create, meshemu_wire_shim_destroy,
+    meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 pub use mycelium_board::{meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop};
 
@@ -141,15 +142,18 @@ mod tests {
 
     #[test]
     fn display_ffi_rejects_null_and_invalid_arguments() {
-        let id = CString::new("node1").unwrap();
-        assert!(unsafe { meshemu_display_create(std::ptr::null(), 320, 240) }.is_null());
-        assert!(unsafe { meshemu_display_create(id.as_ptr(), 0, 240) }.is_null());
+        let title = CString::new("node1").unwrap();
+        assert!(unsafe { meshemu_display_create(640, 480, std::ptr::null()) }.is_null());
+        assert!(unsafe { meshemu_display_create(0, 240, title.as_ptr()) }.is_null());
+        assert!(unsafe { meshemu_display_create_v(320, 200, title.as_ptr(), 8) }.is_null());
+        assert!(unsafe { meshemu_display_create_v(320, 240, title.as_ptr(), 7) }.is_null());
 
         let mut size = usize::MAX;
         assert!(unsafe { meshemu_display_capture(std::ptr::null_mut(), &mut size) }.is_null());
         assert_eq!(size, 0);
         unsafe {
             meshemu_display_capture_free(std::ptr::null_mut(), 0);
+            meshemu_display_destroy(std::ptr::null_mut());
         }
     }
 

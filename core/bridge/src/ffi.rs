@@ -677,25 +677,40 @@ pub unsafe extern "C" fn meshemu_input_poll_key(instance_id: *const c_char) -> u
     u64::from(event.row) | (u64::from(event.col) << 8) | (u64::from(event.pressed) << 16)
 }
 
-/// Creates an LVGL v9 SDL display for a firmware instance.
+/// Creates an SDL display for the requested LVGL major version.
 ///
-/// Returns null for invalid arguments or when the loaded firmware does not
-/// export the LVGL v9 SDL driver API.
+/// Returns null for non-T-Deck geometry, an unsupported ABI, or when v9 was
+/// requested but the active firmware does not export a compatible RGB565 LVGL
+/// SDL driver.
 ///
 /// # Safety
 ///
-/// `instance_id` must point to a valid NUL-terminated string for this call.
+/// `window_title` must be null or point to a valid NUL-terminated string.
 #[no_mangle]
-pub unsafe extern "C" fn meshemu_display_create(
-    instance_id: *const c_char,
+pub unsafe extern "C" fn meshemu_display_create_v(
     width: i32,
     height: i32,
+    window_title: *const c_char,
+    lvgl_version: i32,
 ) -> *mut c_void {
-    if instance_id.is_null() || width <= 0 || height <= 0 {
+    if !matches!(lvgl_version, 8 | 9) {
         return ptr::null_mut();
     }
-    let instance_id = unsafe { CStr::from_ptr(instance_id) }.to_string_lossy();
-    mycelium_display::lvgl_v9::lvgl_v9_init_sdl(&instance_id, width, height)
+    unsafe { mycelium_display::meshemu_display_create_v(width, height, window_title, lvgl_version) }
+}
+
+/// Creates a default LVGL v9 display.
+///
+/// # Safety
+///
+/// `window_title` must be null or point to a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_display_create(
+    width: i32,
+    height: i32,
+    window_title: *const c_char,
+) -> *mut c_void {
+    unsafe { meshemu_display_create_v(width, height, window_title, 9) }
 }
 
 /// Captures an LVGL SDL display as a newly allocated packed RGB565 buffer.
@@ -745,6 +760,14 @@ pub unsafe extern "C" fn meshemu_display_capture(
 pub unsafe extern "C" fn meshemu_display_capture_free(data: *mut u8, size: usize) {
     let _ = size;
     unsafe { libc::free(data.cast()) };
+}
+
+/// Destroys a Mycelium-managed compatibility display.
+///
+/// Native LVGL v9 displays remain owned by their firmware runtime.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_display_destroy(display: *mut c_void) {
+    unsafe { mycelium_display::meshemu_display_destroy(display) };
 }
 
 /// Creates a radio and registers its node with the process-wide radio bus.

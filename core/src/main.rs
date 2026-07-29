@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::{ensure, Result};
 use clap::{Parser, Subcommand};
 use meshemu_bridge::meshemu_bus_tick;
-use mycelium_core::display::{DisplayConfig, DisplayEvent, DisplayManager};
+use mycelium_core::display::{
+    DisplayConfig, DisplayEvent, DisplayManager, LvglVersion, Rect, T_DECK_HEIGHT, T_DECK_WIDTH,
+};
 use mycelium_core::instance::{InstanceConfig, InstanceManager};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
@@ -74,7 +76,17 @@ async fn run(firmware: PathBuf, nodes: usize) -> Result<()> {
                 Some(displays) => displays,
                 None => display_manager.insert(DisplayManager::new()?),
             };
-            displays.create_window(&id, DisplayConfig::default())?;
+            let lvgl_version = manager
+                .get(&id)
+                .map(|instance| instance.display_version())
+                .unwrap_or(LvglVersion::Unknown);
+            displays.create_window(
+                &id,
+                DisplayConfig {
+                    lvgl_version,
+                    ..DisplayConfig::default()
+                },
+            )?;
             info!(instance_id = %id, "created firmware display window");
         }
     }
@@ -96,6 +108,26 @@ async fn run(firmware: PathBuf, nodes: usize) -> Result<()> {
                 manager.tick_all_with_delta(16);
                 meshemu_bus_tick(started_at.elapsed().as_millis() as u64);
                 if let Some(displays) = display_manager.as_mut() {
+                    for instance_id in displays.list_windows() {
+                        let Some(pixels) = manager
+                            .get(&instance_id)
+                            .and_then(|instance| instance.capture_display_rgb565())
+                        else {
+                            continue;
+                        };
+                        if let Err(error) = displays.present_framebuffer(
+                            &instance_id,
+                            &pixels,
+                            Rect {
+                                x: 0,
+                                y: 0,
+                                width: T_DECK_WIDTH,
+                                height: T_DECK_HEIGHT,
+                            },
+                        ) {
+                            warn!(%instance_id, %error, "failed to present firmware framebuffer");
+                        }
+                    }
                     for event in displays.handle_events() {
                         match event {
                             DisplayEvent::Close { instance_id } => {

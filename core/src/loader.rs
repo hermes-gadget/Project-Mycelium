@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use libloading::Library;
+use mycelium_display::{capture_managed_rgb565, lvgl_v9, with_firmware_library, LvglVersion};
 
 type FirmwareSetupFn = unsafe extern "C" fn();
 type FirmwareLoopFn = unsafe extern "C" fn();
@@ -18,7 +19,7 @@ pub struct FirmwareInstance {
     loop_fn: FirmwareLoopFn,
     get_display: Option<FirmwareGetDisplayFn>,
     running: bool,
-    _lib: Library,
+    lib: Library,
 }
 
 impl FirmwareInstance {
@@ -47,7 +48,7 @@ impl FirmwareInstance {
                 loop_fn,
                 get_display,
                 running: false,
-                _lib: lib,
+                lib,
             })
         }
     }
@@ -60,7 +61,7 @@ impl FirmwareInstance {
 
         // SAFETY: The symbol was resolved with this signature during loading
         // and its library remains owned by this instance.
-        unsafe { (self.setup)() };
+        with_firmware_library(&self.lib, || unsafe { (self.setup)() });
         self.running = true;
     }
 
@@ -72,7 +73,7 @@ impl FirmwareInstance {
 
         // SAFETY: The symbol was resolved with this signature and the owning
         // library remains loaded.
-        unsafe { (self.loop_fn)() };
+        with_firmware_library(&self.lib, || unsafe { (self.loop_fn)() });
     }
 
     pub fn name(&self) -> &str {
@@ -89,9 +90,30 @@ impl FirmwareInstance {
 
     pub fn display(&self) -> Option<*mut c_void> {
         self.get_display.map(|get_display| {
-            // SAFETY: The optional symbol was resolved with this signature and
-            // its library remains loaded.
-            unsafe { get_display() }
+            with_firmware_library(&self.lib, || {
+                // SAFETY: The optional symbol was resolved with this signature and
+                // its library remains loaded.
+                unsafe { get_display() }
+            })
+        })
+    }
+
+    pub fn display_version(&self) -> LvglVersion {
+        self.display()
+            .map_or(LvglVersion::Unknown, LvglVersion::detect)
+    }
+
+    pub fn capture_display_rgb565(&self) -> Option<Vec<u8>> {
+        let display = self.display()?;
+        if display.is_null() {
+            return None;
+        }
+        with_firmware_library(&self.lib, || {
+            // SAFETY: `display` comes from this firmware and its library stays
+            // loaded throughout capture.
+            unsafe {
+                capture_managed_rgb565(display).or_else(|| lvgl_v9::capture_lvgl_rgb565(display))
+            }
         })
     }
 }

@@ -6,7 +6,7 @@ use sdl2::event::Event;
 use sdl2::{EventPump, Sdl};
 
 use crate::window::{event_for_window, DisplayEvent, DisplayWindow, Rect};
-use crate::DisplayConfig;
+use crate::{DisplayConfig, LvglVersion, T_DECK_HEIGHT, T_DECK_WIDTH};
 
 pub struct DisplayManager {
     windows: HashMap<String, DisplayWindow>,
@@ -34,6 +34,12 @@ impl DisplayManager {
         if self.windows.contains_key(instance_id) {
             bail!("display window {instance_id} already exists");
         }
+        if (config.width, config.height) != (T_DECK_WIDTH, T_DECK_HEIGHT) {
+            bail!("T-Deck displays must be {T_DECK_WIDTH}x{T_DECK_HEIGHT} logical pixels");
+        }
+        if config.lvgl_version == LvglVersion::Unknown {
+            bail!("display window {instance_id} requires LVGL v8 or v9");
+        }
 
         let video = self.sdl_context.video().map_err(anyhow::Error::msg)?;
         let title = format!("T-Deck — {instance_id}");
@@ -45,6 +51,7 @@ impl DisplayManager {
             config.scale,
         )?;
         window.id = instance_id.to_owned();
+        window.lvgl_version = config.lvgl_version;
         self.windows.insert(instance_id.to_owned(), window);
         self.input_managers.insert(
             instance_id.to_owned(),
@@ -93,6 +100,12 @@ impl DisplayManager {
         let mut ids: Vec<_> = self.windows.keys().cloned().collect();
         ids.sort_unstable();
         ids
+    }
+
+    pub fn lvgl_version(&self, instance_id: &str) -> Option<LvglVersion> {
+        self.windows
+            .get(instance_id)
+            .map(|window| window.lvgl_version)
     }
 
     pub fn handle_events(&mut self) -> Vec<DisplayEvent> {
@@ -149,9 +162,8 @@ mod tests {
         std::env::set_var("SDL_RENDER_DRIVER", "software");
         let mut manager = DisplayManager::new().unwrap();
         let config = DisplayConfig {
-            width: 4,
-            height: 3,
             scale: 1,
+            lvgl_version: LvglVersion::V8,
             ..DisplayConfig::default()
         };
 
@@ -160,7 +172,9 @@ mod tests {
         assert_eq!(manager.list_windows(), ["node1", "node2"]);
         assert!(manager.create_window("node1", config).is_err());
 
-        let frame = vec![0xff; 4 * 3 * 2];
+        assert_eq!(manager.lvgl_version("node1"), Some(LvglVersion::V8));
+
+        let frame = vec![0xff; T_DECK_WIDTH as usize * T_DECK_HEIGHT as usize * 2];
         manager
             .present_framebuffer(
                 "node1",
@@ -168,8 +182,8 @@ mod tests {
                 Rect {
                     x: 0,
                     y: 0,
-                    width: 4,
-                    height: 3,
+                    width: T_DECK_WIDTH,
+                    height: T_DECK_HEIGHT,
                 },
             )
             .unwrap();
@@ -182,6 +196,33 @@ mod tests {
         manager.destroy_window("node1");
         assert_eq!(manager.list_windows(), ["node2"]);
         assert!(manager.capture_screenshot("node1").is_err());
+    }
+
+    #[test]
+    fn rejects_non_t_deck_logical_geometry() {
+        let _serial = crate::SDL_TEST_LOCK.lock().unwrap();
+        std::env::set_var("SDL_VIDEODRIVER", "dummy");
+        let mut manager = DisplayManager::new().unwrap();
+        let config = DisplayConfig {
+            width: 640,
+            height: 480,
+            ..DisplayConfig::default()
+        };
+
+        assert!(manager.create_window("node1", config).is_err());
+    }
+
+    #[test]
+    fn rejects_an_unknown_lvgl_version() {
+        let _serial = crate::SDL_TEST_LOCK.lock().unwrap();
+        std::env::set_var("SDL_VIDEODRIVER", "dummy");
+        let mut manager = DisplayManager::new().unwrap();
+        let config = DisplayConfig {
+            lvgl_version: LvglVersion::Unknown,
+            ..DisplayConfig::default()
+        };
+
+        assert!(manager.create_window("node1", config).is_err());
     }
 
     #[test]

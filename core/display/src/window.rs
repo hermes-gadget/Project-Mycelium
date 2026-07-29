@@ -7,6 +7,8 @@ use sdl2::render::{Canvas, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 use sdl2::{Sdl, VideoSubsystem};
 
+use crate::LvglVersion;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rect {
     pub x: u32,
@@ -32,6 +34,7 @@ pub struct DisplayWindow {
     pub width: u32,
     pub height: u32,
     pub scale: u32,
+    pub lvgl_version: LvglVersion,
     canvas: Canvas<Window>,
     texture_creator: TextureCreator<WindowContext>,
     framebuffer: Vec<u8>,
@@ -83,6 +86,7 @@ impl DisplayWindow {
             width,
             height,
             scale,
+            lvgl_version: LvglVersion::Unknown,
             canvas,
             texture_creator,
             framebuffer: vec![0; framebuffer_len],

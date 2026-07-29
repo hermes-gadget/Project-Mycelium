@@ -44,6 +44,9 @@ unsafe extern "C" fn sdl_flush_callback_v8(_driver: *mut LvDispDrv) {
 
 /// Initializes the LVGL v8-style draw buffer and display driver over SDL2.
 pub fn lvgl_v8_init_sdl(instance_id: &str, width: i32, height: i32) -> *mut c_void {
+    if instance_id.is_empty() || !crate::is_t_deck_resolution(width, height) {
+        return ptr::null_mut();
+    }
     let Some(pixel_count) = width.try_into().ok().and_then(|width: usize| {
         height
             .try_into()
