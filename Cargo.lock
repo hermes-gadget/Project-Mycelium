@@ -605,6 +605,7 @@ dependencies = [
  "anyhow",
  "libloading",
  "mycelium-display",
+ "mycelium-input",
  "serde",
  "serde_json",
 ]

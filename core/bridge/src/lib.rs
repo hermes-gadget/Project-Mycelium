@@ -4,11 +4,15 @@ mod ffi;
 
 pub use ffi::{
     meshemu_bus_tick, meshemu_display_capture, meshemu_display_capture_free,
-    meshemu_display_create, meshemu_input_inject_key, meshemu_input_inject_touch,
+    meshemu_display_create, meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
+    meshemu_i2c_keyboard_inject_key, meshemu_input_inject_key, meshemu_input_inject_touch,
     meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_radio_create, meshemu_radio_destroy,
     meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
     meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
-    meshemu_radio_start_send,
+    meshemu_radio_start_send, meshemu_wire_available, meshemu_wire_begin_transmission,
+    meshemu_wire_end_transmission, meshemu_wire_read, meshemu_wire_request_from,
+    meshemu_wire_shim_create, meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard,
+    meshemu_wire_write,
 };
 
 #[cfg(test)]
@@ -140,6 +144,58 @@ mod tests {
         assert_eq!(size, 0);
         unsafe {
             meshemu_display_capture_free(std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[test]
+    fn keyboard_and_wire_ffi_share_injected_matrix_state() {
+        let keyboard = meshemu_i2c_keyboard_create();
+        let wire = meshemu_wire_shim_create();
+        assert!(!keyboard.is_null());
+        assert!(!wire.is_null());
+
+        unsafe {
+            meshemu_wire_shim_set_keyboard(wire, keyboard);
+            meshemu_i2c_keyboard_inject_key(keyboard, 0, 1, 1);
+            meshemu_i2c_keyboard_inject_key(keyboard, 0, 6, 1);
+            meshemu_wire_begin_transmission(wire, 0x55);
+            assert_eq!(meshemu_wire_write(wire, 0), 1);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+            assert_eq!(meshemu_wire_request_from(wire, 0x55, 1), 1);
+            assert_eq!(meshemu_wire_available(wire), 1);
+            assert_eq!(meshemu_wire_read(wire), 0b0100_0010);
+            assert_eq!(meshemu_wire_read(wire), -1);
+
+            // The shim owns a shared reference, so destroying the creator's
+            // handle does not invalidate an attached Wire instance.
+            meshemu_i2c_keyboard_destroy(keyboard);
+            meshemu_wire_begin_transmission(wire, 0x55);
+            meshemu_wire_write(wire, 4);
+            assert_eq!(meshemu_wire_request_from(wire, 0x55, 1), 1);
+            assert_eq!(meshemu_wire_read(wire), 1);
+            meshemu_wire_shim_destroy(wire);
+        }
+    }
+
+    #[test]
+    fn wire_ffi_rejects_null_handles_and_non_keyboard_addresses() {
+        unsafe {
+            meshemu_i2c_keyboard_inject_key(std::ptr::null_mut(), 0, 0, 1);
+            meshemu_wire_shim_set_keyboard(std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(meshemu_wire_write(std::ptr::null_mut(), 0), 0);
+            assert_eq!(meshemu_wire_end_transmission(std::ptr::null_mut()), 4);
+            assert_eq!(meshemu_wire_request_from(std::ptr::null_mut(), 0x55, 1), 0);
+            assert_eq!(meshemu_wire_available(std::ptr::null_mut()), 0);
+            assert_eq!(meshemu_wire_read(std::ptr::null_mut()), -1);
+            meshemu_i2c_keyboard_destroy(std::ptr::null_mut());
+            meshemu_wire_shim_destroy(std::ptr::null_mut());
+        }
+
+        let wire = meshemu_wire_shim_create();
+        unsafe {
+            assert_eq!(meshemu_wire_request_from(wire, 0x42, 1), 0);
+            assert_eq!(meshemu_wire_available(wire), 0);
+            meshemu_wire_shim_destroy(wire);
         }
     }
 

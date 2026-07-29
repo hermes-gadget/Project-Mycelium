@@ -6,6 +6,10 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
 use crate::{
+    i2c_keyboard::I2cKeyboardBus,
+    wire_shim::{SharedI2cKeyboard, WireShim},
+};
+use crate::{
     Gt911TouchEvent, KeyEvent, KeyboardEmulator, TouchEmulator, TrackballEmulator, TrackballEvent,
 };
 
@@ -26,6 +30,7 @@ pub struct InputManager {
     pub touch: TouchEmulator,
     pub keyboard: KeyboardEmulator,
     pub trackball: TrackballEmulator,
+    i2c_keyboard: SharedI2cKeyboard,
     instance_id: String,
     last_activity_ms: u64,
     touch_events: VecDeque<Gt911TouchEvent>,
@@ -39,6 +44,7 @@ impl InputManager {
             touch: TouchEmulator::new(320, 240, scale),
             keyboard: KeyboardEmulator::new(),
             trackball: TrackballEmulator::new(),
+            i2c_keyboard: Arc::new(Mutex::new(I2cKeyboardBus::new())),
             instance_id: instance_id.to_owned(),
             last_activity_ms: monotonic_ms(),
             touch_events: VecDeque::new(),
@@ -117,6 +123,14 @@ impl InputManager {
         events
     }
 
+    pub fn i2c_keyboard(&self) -> SharedI2cKeyboard {
+        Arc::clone(&self.i2c_keyboard)
+    }
+
+    pub fn wire_shim(&self) -> WireShim {
+        WireShim::with_keyboard(self.i2c_keyboard())
+    }
+
     pub fn poll_touch(&mut self) -> Option<Gt911TouchEvent> {
         self.touch_events.pop_front()
     }
@@ -145,6 +159,10 @@ impl InputManager {
 
     fn handle_keycode(&mut self, keycode: Keycode, pressed: bool, events: &mut Vec<InputEvent>) {
         if let Some(event) = self.keyboard.handle_key(keycode, pressed) {
+            self.i2c_keyboard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .inject_key(event.row, event.col, event.pressed);
             self.keyboard_events.push_back(event);
             events.push(InputEvent::Keyboard(event));
         }
@@ -241,5 +259,21 @@ mod tests {
             manager.poll_trackball().unwrap().direction,
             crate::TrackballDirection::Center
         );
+    }
+
+    #[test]
+    fn keyboard_events_update_lvgl_queue_and_raw_i2c_state() {
+        let mut manager = InputManager::new("node", 1.0);
+        let mut wire = manager.wire_shim();
+        wire.write_byte(1);
+
+        assert_eq!(manager.inject_key(Keycode::D, true).len(), 1);
+        assert_eq!(manager.poll_keyboard().unwrap().col, 2);
+        assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
+        assert_eq!(wire.read(), 0b0000_0100);
+
+        manager.inject_key(Keycode::D, false);
+        assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
+        assert_eq!(wire.read(), 0);
     }
 }

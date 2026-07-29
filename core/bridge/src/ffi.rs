@@ -3,6 +3,8 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use mycelium_input::i2c_keyboard::I2cKeyboardBus;
+use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
 use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
 use sdl2::keyboard::Keycode;
@@ -41,6 +43,163 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 unsafe fn handle_ref<'a>(radio: *mut c_void) -> Option<&'a RadioHandle> {
     (radio as *const RadioHandle).as_ref()
+}
+
+unsafe fn keyboard_ref<'a>(keyboard: *mut c_void) -> Option<&'a SharedI2cKeyboard> {
+    unsafe { (keyboard as *const SharedI2cKeyboard).as_ref() }
+}
+
+unsafe fn wire_mut<'a>(wire: *mut c_void) -> Option<&'a mut WireShim> {
+    unsafe { (wire as *mut WireShim).as_mut() }
+}
+
+/// Creates an independently owned virtual T-Deck keyboard.
+#[no_mangle]
+pub extern "C" fn meshemu_i2c_keyboard_create() -> *mut c_void {
+    let keyboard = std::sync::Arc::new(Mutex::new(I2cKeyboardBus::new()));
+    Box::into_raw(Box::new(keyboard)).cast()
+}
+
+/// Injects a matrix key transition into a virtual T-Deck keyboard.
+///
+/// # Safety
+///
+/// `keyboard` must be null or a live keyboard handle returned by
+/// [`meshemu_i2c_keyboard_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_i2c_keyboard_inject_key(
+    keyboard: *mut c_void,
+    row: u8,
+    col: u8,
+    pressed: u8,
+) {
+    let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
+        return;
+    };
+    lock(keyboard).inject_key(row, col, pressed != 0);
+}
+
+/// Destroys a keyboard handle.
+///
+/// Wire shims attached to this keyboard retain shared ownership and remain
+/// valid until they are destroyed or assigned another keyboard.
+///
+/// # Safety
+///
+/// `keyboard` must be null or a live keyboard handle, passed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_i2c_keyboard_destroy(keyboard: *mut c_void) {
+    if !keyboard.is_null() {
+        unsafe { drop(Box::from_raw(keyboard.cast::<SharedI2cKeyboard>())) };
+    }
+}
+
+/// Creates a virtual Arduino Wire shim with its own keyboard bus.
+#[no_mangle]
+pub extern "C" fn meshemu_wire_shim_create() -> *mut c_void {
+    Box::into_raw(Box::new(WireShim::new())).cast()
+}
+
+/// Assigns a keyboard to a Wire shim.
+///
+/// # Safety
+///
+/// Both arguments must be null or live handles of their corresponding types.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_shim_set_keyboard(wire: *mut c_void, keyboard: *mut c_void) {
+    let Some(wire) = (unsafe { wire_mut(wire) }) else {
+        return;
+    };
+    let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
+        return;
+    };
+    wire.set_keyboard(std::sync::Arc::clone(keyboard));
+}
+
+/// Selects the I2C target for a Wire transaction.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_begin_transmission(wire: *mut c_void, address: u8) {
+    if let Some(wire) = unsafe { wire_mut(wire) } {
+        wire.begin_transmission(address);
+    }
+}
+
+/// Writes one byte to the current Wire transaction.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_write(wire: *mut c_void, byte: u8) -> usize {
+    unsafe { wire_mut(wire) }
+        .map(|wire| wire.write_byte(byte))
+        .unwrap_or(0)
+}
+
+/// Finishes the current Wire transmission.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_end_transmission(wire: *mut c_void) -> u8 {
+    unsafe { wire_mut(wire) }
+        .map(WireShim::end_transmission)
+        .unwrap_or(4)
+}
+
+/// Requests bytes from an I2C target.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_request_from(
+    wire: *mut c_void,
+    address: u8,
+    count: u8,
+) -> u8 {
+    unsafe { wire_mut(wire) }
+        .map(|wire| wire.request_from(address, count))
+        .unwrap_or(0)
+}
+
+/// Returns the number of unread bytes buffered by the Wire shim.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_available(wire: *mut c_void) -> i32 {
+    unsafe { wire_mut(wire) }
+        .map(|wire| wire.available())
+        .unwrap_or(0)
+}
+
+/// Reads the next buffered byte or `-1` when none is available.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_read(wire: *mut c_void) -> i32 {
+    unsafe { wire_mut(wire) }.map(WireShim::read).unwrap_or(-1)
+}
+
+/// Destroys a Wire shim.
+///
+/// # Safety
+///
+/// `wire` must be null or a live Wire shim handle, passed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_shim_destroy(wire: *mut c_void) {
+    if !wire.is_null() {
+        unsafe { drop(Box::from_raw(wire.cast::<WireShim>())) };
+    }
 }
 
 unsafe fn input_manager(instance_id: *const c_char, create: bool) -> Option<SharedInputManager> {
