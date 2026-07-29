@@ -564,6 +564,7 @@ dependencies = [
 name = "mycelium-display"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sdl2",
 ]
 
