@@ -19,13 +19,22 @@ mod tests {
 
     fn create(id: &str, position: (f64, f64)) -> *mut c_void {
         let id = CString::new(id).unwrap();
-        meshemu_radio_create(id.as_ptr(), 915.0, 125, 7, 5, 14.0, position.0, position.1)
+        unsafe { meshemu_radio_create(id.as_ptr(), 915.0, 125, 7, 5, 14.0, position.0, position.1) }
     }
 
     fn receive(radio: *mut c_void) -> Vec<u8> {
         let mut buffer = [0_u8; 255];
-        let len = meshemu_radio_recv_raw(radio, buffer.as_mut_ptr(), buffer.len() as i32);
+        let len =
+            unsafe { meshemu_radio_recv_raw(radio, buffer.as_mut_ptr(), buffer.len() as i32) };
         buffer[..len.max(0) as usize].to_vec()
+    }
+
+    fn send(radio: *mut c_void, packet: &[u8]) -> bool {
+        unsafe { meshemu_radio_start_send(radio, packet.as_ptr(), packet.len() as u32) }
+    }
+
+    fn destroy(radio: *mut c_void) {
+        unsafe { meshemu_radio_destroy(radio) }
     }
 
     #[test]
@@ -38,19 +47,15 @@ mod tests {
         assert!(!receiver.is_null());
 
         let packet = [1, 2, 3, 4];
-        assert!(meshemu_radio_start_send(
-            sender,
-            packet.as_ptr(),
-            packet.len() as u32
-        ));
+        assert!(send(sender, &packet));
         assert_eq!(receive(receiver), packet);
-        assert!(meshemu_radio_get_rssi(receiver) < 0.0);
-        assert!(meshemu_radio_get_snr(receiver) > 0.0);
-        assert_eq!(meshemu_radio_get_est_airtime(sender, 16), 56);
+        assert!(unsafe { meshemu_radio_get_rssi(receiver) } < 0.0);
+        assert!(unsafe { meshemu_radio_get_snr(receiver) } > 0.0);
+        assert_eq!(unsafe { meshemu_radio_get_est_airtime(sender, 16) }, 56);
         assert!(meshemu_radio_is_send_complete(sender));
 
-        meshemu_radio_destroy(receiver);
-        meshemu_radio_destroy(sender);
+        destroy(receiver);
+        destroy(sender);
     }
 
     #[test]
@@ -60,18 +65,14 @@ mod tests {
         let sender = create("sender", (0.0, 0.0));
         let receiver = create("receiver", (0.0, 0.0001));
 
-        meshemu_radio_set_position(receiver, 0.0, 180.0);
+        unsafe { meshemu_radio_set_position(receiver, 0.0, 180.0) };
         meshemu_bus_tick(1_000);
         let packet = [42];
-        assert!(meshemu_radio_start_send(
-            sender,
-            packet.as_ptr(),
-            packet.len() as u32
-        ));
+        assert!(send(sender, &packet));
         assert!(receive(receiver).is_empty());
 
-        meshemu_radio_destroy(receiver);
-        meshemu_radio_destroy(sender);
+        destroy(receiver);
+        destroy(sender);
     }
 
     #[test]
@@ -82,24 +83,16 @@ mod tests {
         let receiver = create("receiver", (0.0, 180.0));
         let packet = [7, 8, 9];
 
-        assert!(meshemu_radio_start_send(
-            sender,
-            packet.as_ptr(),
-            packet.len() as u32
-        ));
+        assert!(send(sender, &packet));
         assert!(receive(receiver).is_empty());
 
-        meshemu_radio_set_position(receiver, 0.0, 0.0001);
+        unsafe { meshemu_radio_set_position(receiver, 0.0, 0.0001) };
         meshemu_bus_tick(1_000);
-        assert!(meshemu_radio_start_send(
-            sender,
-            packet.as_ptr(),
-            packet.len() as u32
-        ));
+        assert!(send(sender, &packet));
         assert_eq!(receive(receiver), packet);
 
-        meshemu_radio_destroy(receiver);
-        meshemu_radio_destroy(sender);
+        destroy(receiver);
+        destroy(sender);
     }
 
     #[test]
@@ -110,10 +103,10 @@ mod tests {
         assert!(!first.is_null());
         assert!(create("reusable", (0.0, 0.0)).is_null());
 
-        meshemu_radio_destroy(first);
+        destroy(first);
         let replacement = create("reusable", (0.0, 0.0));
         assert!(!replacement.is_null());
-        meshemu_radio_destroy(replacement);
+        destroy(replacement);
     }
 
     #[test]
@@ -121,16 +114,15 @@ mod tests {
         let _serial = TEST_BUS.lock().unwrap();
         ffi::reset_bus();
 
-        assert!(meshemu_radio_create(std::ptr::null(), 915.0, 125, 7, 5, 14.0, 0.0, 0.0).is_null());
-        assert!(!meshemu_radio_start_send(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            1
-        ));
+        assert!(unsafe {
+            meshemu_radio_create(std::ptr::null(), 915.0, 125, 7, 5, 14.0, 0.0, 0.0)
+        }
+        .is_null());
+        assert!(!unsafe { meshemu_radio_start_send(std::ptr::null_mut(), std::ptr::null(), 1) });
         assert_eq!(
-            meshemu_radio_recv_raw(std::ptr::null_mut(), std::ptr::null_mut(), 0),
+            unsafe { meshemu_radio_recv_raw(std::ptr::null_mut(), std::ptr::null_mut(), 0) },
             0
         );
-        meshemu_radio_destroy(std::ptr::null_mut());
+        destroy(std::ptr::null_mut());
     }
 }
