@@ -8,6 +8,7 @@ pub const KEYBOARD_I2C_CLOCK_HZ: u32 = 100_000;
 pub const FAST_I2C_CLOCK_HZ: u32 = 400_000;
 
 pub type SharedI2cKeyboard = Arc<Mutex<I2cKeyboardBus>>;
+type PeripheralPowerCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Arduino `Wire`-compatible bus shared by the T-Deck keyboard and GT911.
 pub struct WireShim {
@@ -20,6 +21,7 @@ pub struct WireShim {
     gt911_register: u16,
     read_buffer: Vec<u8>,
     read_position: usize,
+    peripheral_power_check: Option<PeripheralPowerCheck>,
 }
 
 impl WireShim {
@@ -45,6 +47,7 @@ impl WireShim {
             gt911_register: 0,
             read_buffer: Vec::new(),
             read_position: 0,
+            peripheral_power_check: None,
         }
     }
 
@@ -84,13 +87,20 @@ impl WireShim {
         (1, 1)
     }
 
+    pub fn set_peripheral_power_check<F>(&mut self, check: F)
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.peripheral_power_check = Some(Arc::new(check));
+    }
+
     pub fn begin_transmission(&mut self, address: u8) {
         self.transmit_address = Some(address);
         self.transmit_buffer.clear();
     }
 
     pub fn write_byte(&mut self, byte: u8) -> usize {
-        if self.transmit_address.is_none() {
+        if self.transmit_address.is_none() || !self.peripherals_powered() {
             return 0;
         }
         self.transmit_buffer.push(byte);
@@ -101,6 +111,11 @@ impl WireShim {
         let Some(address) = self.transmit_address.take() else {
             return 4;
         };
+        if !self.peripherals_powered() {
+            self.transmit_buffer.clear();
+            self.clear_read_buffer();
+            return 2;
+        }
         if !self.begun {
             self.transmit_buffer.clear();
             return 4;
@@ -153,6 +168,9 @@ impl WireShim {
     }
 
     pub fn read(&mut self) -> i32 {
+        if !self.peripherals_powered() {
+            return -1;
+        }
         let Some(byte) = self.read_buffer.get(self.read_position).copied() else {
             return -1;
         };
@@ -161,7 +179,16 @@ impl WireShim {
     }
 
     pub fn available(&self) -> i32 {
+        if !self.peripherals_powered() {
+            return 0;
+        }
         self.read_buffer.len().saturating_sub(self.read_position) as i32
+    }
+
+    fn peripherals_powered(&self) -> bool {
+        self.peripheral_power_check
+            .as_ref()
+            .is_none_or(|check| check())
     }
 
     fn clear_read_buffer(&mut self) {
@@ -170,7 +197,9 @@ impl WireShim {
     }
 
     fn bus_ready(&self) -> bool {
-        self.begun && matches!(self.clock_hz, KEYBOARD_I2C_CLOCK_HZ | FAST_I2C_CLOCK_HZ)
+        self.peripherals_powered()
+            && self.begun
+            && matches!(self.clock_hz, KEYBOARD_I2C_CLOCK_HZ | FAST_I2C_CLOCK_HZ)
     }
 }
 
@@ -188,6 +217,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::gt911::{GT911_CONFIG_X_REGISTER, GT911_PRODUCT_ID_REGISTER, GT911_STATUS_REGISTER};
 
@@ -306,5 +337,25 @@ mod tests {
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
         wire.set_clock(FAST_I2C_CLOCK_HZ);
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
+    }
+
+    #[test]
+    fn peripheral_power_loss_nacks_all_i2c_transactions() {
+        let powered = Arc::new(AtomicBool::new(true));
+        let power_check = Arc::clone(&powered);
+        let mut wire = configured_wire(Arc::new(Mutex::new(I2cKeyboardBus::new())));
+        wire.set_peripheral_power_check(move || power_check.load(Ordering::Relaxed));
+
+        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
+        assert_eq!(wire.write_byte(0x04), 1);
+        assert_eq!(wire.end_transmission(), 0);
+
+        powered.store(false, Ordering::Relaxed);
+        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
+        assert_eq!(wire.write_byte(0x04), 0);
+        assert_eq!(wire.end_transmission(), 0x02);
+        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
+        assert_eq!(wire.available(), 0);
+        assert_eq!(wire.read(), -1);
     }
 }

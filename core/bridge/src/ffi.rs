@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use mycelium_board::{
@@ -12,9 +13,7 @@ use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
 use mycelium_storage::StorageManager;
-#[cfg(test)]
-use radio_bus::Sx1262State;
-use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
+use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, Sx1262State, TxEvent};
 use sdl2::keyboard::Keycode;
 
 struct BusState {
@@ -39,8 +38,7 @@ impl BusState {
 
 struct RadioHandle {
     node_id: String,
-    channel: RadioChannel,
-    tx_power_dbm: f64,
+    radio: Mutex<Sx1262State>,
     pending: Mutex<VecDeque<RxPacket>>,
     last_rx: Mutex<Option<(f32, f32)>>,
 }
@@ -53,6 +51,8 @@ struct GpsHandle {
 static BUS: LazyLock<Mutex<BusState>> = LazyLock::new(|| Mutex::new(BusState::new()));
 static STORAGE: LazyLock<Mutex<HashMap<String, StorageManager>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static SDCARD_REQUIRES_SLOW_INIT: AtomicBool = AtomicBool::new(false);
+static SDCARD_WAKE_DELAY_MS: AtomicU32 = AtomicU32::new(0);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -133,23 +133,18 @@ fn valid_position(lat: f64, lon: f64) -> bool {
         && (-180.0..=180.0).contains(&lon)
 }
 
-fn valid_radio_config(
+fn sx1262_state(
     freq_mhz: f64,
     bandwidth_khz: u16,
     spreading_factor: u8,
     coding_rate: u8,
     tx_power_dbm: f64,
-) -> bool {
+) -> Option<Sx1262State> {
     // SX1262 operating limits and the LoRa modulation settings supported by
     // the bridge. Reject rather than passing unchecked values into airtime
     // arithmetic across the FFI boundary.
-    freq_mhz.is_finite()
-        && (150.0..=960.0).contains(&freq_mhz)
-        && matches!(bandwidth_khz, 125 | 250 | 500)
-        && (7..=12).contains(&spreading_factor)
-        && (5..=8).contains(&coding_rate)
-        && tx_power_dbm.is_finite()
-        && (-17.0..=22.0).contains(&tx_power_dbm)
+    let channel = RadioChannel::new(freq_mhz, bandwidth_khz, spreading_factor, coding_rate)?;
+    Sx1262State::new(channel, tx_power_dbm)
 }
 
 /// Mounts the virtual SPIFFS partition for an emulator instance.
@@ -243,13 +238,28 @@ pub unsafe extern "C" fn meshemu_sdcard_init(instance_id: *const c_char) -> bool
     if !peripherals_powered(instance_id) {
         return false;
     }
+    let requires_slow_init = SDCARD_REQUIRES_SLOW_INIT.load(Ordering::Relaxed);
+    let wake_delay_ms = SDCARD_WAKE_DELAY_MS.load(Ordering::Relaxed);
     let mut storage = lock(&STORAGE);
-    storage
+    let sdcard = &mut storage
         .entry(instance_id.to_owned())
         .or_insert_with(|| StorageManager::new(instance_id))
-        .sdcard
-        .mount()
-        .is_ok()
+        .sdcard;
+    sdcard.set_behavior(requires_slow_init, wake_delay_ms);
+    sdcard.mount_with_retry_ladder().unwrap_or(false)
+}
+
+/// Configures the process-wide virtual SD-card personality.
+///
+/// Slow cards reject 4 MHz and 1 MHz initialization and only mount on a
+/// 400 kHz ladder step after at least `wake_delay_ms` of cumulative settling.
+#[no_mangle]
+pub extern "C" fn meshemu_sdcard_set_behavior(slow_init: bool, wake_delay_ms: u32) {
+    SDCARD_REQUIRES_SLOW_INIT.store(slow_init, Ordering::Relaxed);
+    SDCARD_WAKE_DELAY_MS.store(wake_delay_ms, Ordering::Relaxed);
+    for manager in lock(&STORAGE).values_mut() {
+        manager.sdcard.set_behavior(slow_init, wake_delay_ms);
+    }
 }
 
 /// Reads an SD card file into a caller-owned allocation.
@@ -564,6 +574,18 @@ pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) 
     }
 }
 
+/// Selects calibrated `analogReadMilliVolts()`-equivalent ADC behavior.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_adc_calibration(board: *mut c_void, calibrated: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.set_adc_calibration(calibrated);
+    }
+}
+
 /// Drives one board GPIO. GPIO10 is the active-HIGH peripheral power rail.
 ///
 /// # Safety
@@ -573,6 +595,18 @@ pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) 
 pub unsafe extern "C" fn meshemu_board_digital_write(board: *mut c_void, gpio: u8, high: bool) {
     if let Some(board) = unsafe { board_mut(board) } {
         board.digital_write(gpio, high);
+    }
+}
+
+/// Drives GPIO10, the active-HIGH T-Deck peripheral power rail.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_periph_power(board: *mut c_void, enabled: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.digital_write(mycelium_board::PERIPH_PWR_EN_GPIO, enabled);
     }
 }
 
@@ -789,10 +823,13 @@ pub unsafe extern "C" fn meshemu_wire_shim_create_for_instance(
     let Some(manager) = (unsafe { input_manager(instance_id, true) }) else {
         return ptr::null_mut();
     };
-    let wire = manager
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .wire_shim();
+    let (mut wire, instance_id) = {
+        let manager = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (manager.wire_shim(), manager.instance_id().to_owned())
+    };
+    wire.set_peripheral_power_check(move || peripherals_powered(&instance_id));
     Box::into_raw(Box::new(wire)).cast()
 }
 
@@ -1318,16 +1355,16 @@ pub unsafe extern "C" fn meshemu_radio_create(
     lat: f64,
     lon: f64,
 ) -> *mut c_void {
-    if instance_id.is_null()
-        || !valid_radio_config(
-            freq_mhz,
-            bandwidth_khz,
-            spreading_factor,
-            coding_rate,
-            tx_power_dbm,
-        )
-        || !valid_position(lat, lon)
-    {
+    let Some(radio_state) = sx1262_state(
+        freq_mhz,
+        bandwidth_khz,
+        spreading_factor,
+        coding_rate,
+        tx_power_dbm,
+    ) else {
+        return ptr::null_mut();
+    };
+    if instance_id.is_null() || !valid_position(lat, lon) {
         return ptr::null_mut();
     }
 
@@ -1338,25 +1375,21 @@ pub unsafe extern "C" fn meshemu_radio_create(
         return ptr::null_mut();
     }
 
-    let channel = RadioChannel {
-        freq_mhz,
-        bandwidth_khz,
-        spreading_factor,
-        coding_rate,
-    };
     let mut state = lock(&BUS);
     if !state.node_ids.insert(node_id.clone()) {
         return ptr::null_mut();
     }
-    state
-        .bus
-        .register_node(node_id.clone(), (lat, lon), tx_power_dbm, channel.clone());
+    state.bus.register_node(
+        node_id.clone(),
+        (lat, lon),
+        radio_state.tx_power_dbm,
+        radio_state.channel.clone(),
+    );
     drop(state);
 
     Box::into_raw(Box::new(RadioHandle {
         node_id,
-        channel,
-        tx_power_dbm,
+        radio: Mutex::new(radio_state),
         pending: Mutex::new(VecDeque::new()),
         last_rx: Mutex::new(None),
     })) as *mut c_void
@@ -1386,11 +1419,12 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     } else {
         unsafe { std::slice::from_raw_parts(data, len as usize) }
     };
+    let radio = lock(&handle.radio);
     let airtime_ms = propagation::airtime_ms(
         bytes.len(),
-        handle.channel.spreading_factor,
-        handle.channel.bandwidth_khz,
-        handle.channel.coding_rate,
+        radio.channel.spreading_factor,
+        radio.channel.bandwidth_khz,
+        radio.channel.coding_rate,
         8,
         true,
     );
@@ -1398,9 +1432,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     let timestamp_ms = state.now_ms;
     state.bus.broadcast(TxEvent {
         node_id: handle.node_id.clone(),
-        channel: handle.channel.clone(),
+        channel: radio.channel.clone(),
         data: bytes.to_vec(),
-        tx_power_dbm: handle.tx_power_dbm,
+        tx_power_dbm: radio.tx_power_dbm,
         airtime_ms,
         position: (0.0, 0.0),
         timestamp_ms,
@@ -1468,11 +1502,12 @@ pub unsafe extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: 
     if len < 0 {
         return 0;
     }
+    let radio = lock(&handle.radio);
     propagation::airtime_ms(
         len as usize,
-        handle.channel.spreading_factor,
-        handle.channel.bandwidth_khz,
-        handle.channel.coding_rate,
+        radio.channel.spreading_factor,
+        radio.channel.bandwidth_khz,
+        radio.channel.coding_rate,
         8,
         true,
     )
@@ -1525,6 +1560,39 @@ pub unsafe extern "C" fn meshemu_radio_set_position(radio: *mut c_void, lat: f64
     }
 }
 
+/// Configures whether DIO2 drives the T-Deck's external SX1262 RF switch.
+///
+/// Upstream-compatible radio handles start with this disabled. Wadamesh,
+/// Meshtastic, and other T-Deck firmware must set it to `true` for the normal
+/// antenna path; leaving it off applies 16 dB TX and 3 dB RX loss.
+///
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_radio_set_dio2_config(radio: *mut c_void, as_rf_switch: bool) {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return;
+    };
+    lock(&handle.radio).dio2_rf_switch_enabled = as_rf_switch;
+    lock(&BUS)
+        .bus
+        .set_dio2_as_rf_switch(&handle.node_id, as_rf_switch);
+}
+
+/// Returns whether DIO2 currently drives the external RF switch.
+///
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_radio_get_dio2_config(radio: *mut c_void) -> bool {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return false;
+    };
+    lock(&handle.radio).dio2_rf_switch_enabled
+}
+
 /// Destroys a radio handle. The caller must pass each non-null handle once.
 ///
 /// # Safety
@@ -1560,8 +1628,7 @@ pub(crate) fn reset_bus() {
 
 #[cfg(test)]
 pub(crate) unsafe fn radio_state(radio: *mut c_void) -> Option<Sx1262State> {
-    let handle = unsafe { handle_ref(radio) }?;
-    Sx1262State::new(handle.channel.clone(), handle.tx_power_dbm)
+    Some(lock(&(unsafe { handle_ref(radio) })?.radio).clone())
 }
 
 #[cfg(test)]

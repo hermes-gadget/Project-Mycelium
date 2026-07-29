@@ -22,6 +22,7 @@ void* meshemu_board_create(const char* instance_id, uint16_t millivolts,
 void meshemu_board_set_battery(void* board, uint16_t millivolts);
 uint16_t meshemu_board_get_battery(void* board);
 uint16_t meshemu_board_get_adc(void* board, uint8_t gpio);
+void meshemu_board_set_adc_calibration(void* board, bool calibrated);
 float meshemu_board_get_temp(void* board);
 bool meshemu_board_psram_found(void* board);
 uint32_t meshemu_board_get_psram_free(void* board);
@@ -29,6 +30,7 @@ bool meshemu_board_psram_readback_test(void* board);
 bool meshemu_board_psram_reserve(void* board, uint32_t bytes);
 void meshemu_board_psram_release(void* board, uint32_t bytes);
 void meshemu_board_digital_write(void* board, uint8_t gpio, bool high);
+void meshemu_board_set_periph_power(void* board, bool enabled);
 void meshemu_board_ledc_attach(void* board, uint8_t channel, uint8_t gpio);
 bool meshemu_board_ledc_write(void* board, uint8_t channel, uint32_t period_us,
                               uint32_t high_time_us);
