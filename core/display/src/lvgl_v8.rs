@@ -1,17 +1,14 @@
 //! Runtime-bound LVGL v8 display driver backed by SDL2.
 //!
 //! Firmware shared libraries bring their own LVGL build. Resolving the v8
-//! symbols from the current process avoids linking a second LVGL copy while
-//! still registering a real `lv_disp_drv_t` with that firmware runtime.
+//! symbols from the active firmware library avoids linking a second LVGL copy
+//! while still registering a real `lv_disp_drv_t` with that firmware runtime.
 
 use std::cell::RefCell;
 use std::ffi::{c_int, c_void, CString};
 use std::ptr;
 
-#[cfg(unix)]
-use libloading::os::unix::Library;
-#[cfg(windows)]
-use libloading::os::windows::Library;
+use libloading::Library;
 use sdl2::pixels::PixelFormatEnum;
 
 use crate::framebuffer_size;
@@ -108,8 +105,7 @@ struct LvglV8Api {
 }
 
 impl LvglV8Api {
-    unsafe fn load() -> Option<Self> {
-        let library = current_process_library()?;
+    unsafe fn load(library: &Library) -> Option<Self> {
         Some(Self {
             init: *unsafe { library.get::<LvInit>(b"lv_init\0").ok()? },
             draw_buf_init: *unsafe {
@@ -138,16 +134,6 @@ impl LvglV8Api {
     }
 }
 
-#[cfg(unix)]
-fn current_process_library() -> Option<Library> {
-    Some(Library::this())
-}
-
-#[cfg(windows)]
-fn current_process_library() -> Option<Library> {
-    Library::this().ok()
-}
-
 struct SdlDisplay {
     _sdl: sdl2::Sdl,
     window: *mut sdl2::sys::SDL_Window,
@@ -169,7 +155,7 @@ impl SdlDisplay {
                 sdl2::sys::SDL_WINDOWPOS_CENTERED_MASK as i32,
                 width,
                 height,
-                sdl2::sys::SDL_WindowFlags::SDL_WINDOW_SHOWN as u32,
+                sdl2::sys::SDL_WindowFlags::SDL_WINDOW_HIDDEN as u32,
             );
             if window.is_null() {
                 return None;
@@ -333,7 +319,13 @@ impl LvglV8Display {
 /// The display and its SDL resources are thread-affine and must be used,
 /// captured, and destroyed on the thread that creates them.
 pub fn lvgl_v8_init_sdl(instance_id: &str, width: i32, height: i32) -> *mut c_void {
-    let Some(api) = (unsafe { LvglV8Api::load() }) else {
+    if instance_id.is_empty() || !crate::is_t_deck_resolution(width, height) {
+        return ptr::null_mut();
+    }
+    let Some(api) =
+        crate::with_active_firmware_library(|library| unsafe { LvglV8Api::load(library) })
+            .flatten()
+    else {
         return ptr::null_mut();
     };
     unsafe { lvgl_v8_init_sdl_with_api(instance_id, width, height, api) }

@@ -10,6 +10,7 @@ use mycelium_storage::StorageManager;
 use serde::{Deserialize, Serialize};
 
 use crate::loader::FirmwareInstance;
+use mycelium_display::LvglVersion;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GpsConfig {
@@ -151,6 +152,14 @@ impl Instance {
 
     pub fn display(&self) -> Option<*mut std::ffi::c_void> {
         self.firmware.display()
+    }
+
+    pub fn display_version(&self) -> LvglVersion {
+        self.firmware.display_version()
+    }
+
+    pub fn capture_display_rgb565(&self) -> Option<Vec<u8>> {
+        self.firmware.capture_display_rgb565()
     }
 
     pub fn storage(&self) -> &StorageManager {

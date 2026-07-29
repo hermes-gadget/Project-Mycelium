@@ -7,9 +7,12 @@ pub mod manager;
 mod version;
 pub mod window;
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_void, CStr};
 
-pub use config::DisplayConfig;
+use libloading::Library;
+
+pub use config::{DisplayConfig, T_DECK_HEIGHT, T_DECK_WIDTH};
 pub use lvgl_v8::lvgl_v8_init_sdl;
 pub use lvgl_v9::lvgl_v9_init_sdl;
 pub use manager::DisplayManager;
@@ -18,6 +21,41 @@ pub use window::{DisplayEvent, DisplayWindow, Rect};
 
 pub(crate) const BYTES_PER_PIXEL: usize = 2;
 
+thread_local! {
+    static ACTIVE_FIRMWARE_LIBRARY: Cell<*const Library> = const { Cell::new(std::ptr::null()) };
+}
+
+struct ActiveLibraryGuard(*const Library);
+
+impl Drop for ActiveLibraryGuard {
+    fn drop(&mut self) {
+        ACTIVE_FIRMWARE_LIBRARY.with(|active| active.set(self.0));
+    }
+}
+
+/// Make a firmware library the symbol-resolution scope for one firmware call.
+///
+/// The loader wraps setup, loop, display lookup, and capture calls with this
+/// function so LVGL symbols always come from the firmware being advanced.
+pub fn with_firmware_library<T>(library: &Library, call: impl FnOnce() -> T) -> T {
+    ACTIVE_FIRMWARE_LIBRARY.with(|active| {
+        let previous = active.replace(library);
+        let _guard = ActiveLibraryGuard(previous);
+        call()
+    })
+}
+
+pub(crate) fn with_active_firmware_library<T>(call: impl FnOnce(&Library) -> T) -> Option<T> {
+    ACTIVE_FIRMWARE_LIBRARY.with(|active| {
+        // SAFETY: `with_firmware_library` installs this pointer only for the
+        // dynamic extent of a call while the owning `Library` is borrowed.
+        unsafe { active.get().as_ref() }.map(call)
+    })
+}
+
+pub fn is_t_deck_resolution(width: i32, height: i32) -> bool {
+    width == T_DECK_WIDTH as i32 && height == T_DECK_HEIGHT as i32
+}
 pub(crate) fn framebuffer_size(width: u32, height: u32) -> Option<usize> {
     (width as usize)
         .checked_mul(height as usize)?
@@ -34,6 +72,9 @@ pub fn meshemu_display_init(
     height: i32,
     version: LvglVersion,
 ) -> *mut c_void {
+    if !is_t_deck_resolution(width, height) {
+        return std::ptr::null_mut();
+    }
     match version {
         LvglVersion::V8 => lvgl_v8_init_sdl(instance_id, width, height),
         LvglVersion::V9 | LvglVersion::Unknown => lvgl_v9_init_sdl(instance_id, width, height),
@@ -45,7 +86,6 @@ pub fn meshemu_display_init(
 /// # Safety
 ///
 /// `window_title` must be null or point to a valid NUL-terminated string.
-#[no_mangle]
 pub unsafe extern "C" fn meshemu_display_create_v(
     width: i32,
     height: i32,
@@ -94,7 +134,6 @@ pub unsafe fn destroy_managed_display(display: *mut c_void) {
 /// # Safety
 ///
 /// `display` must be null or point to readable display-handle memory.
-#[no_mangle]
 pub unsafe extern "C" fn meshemu_display_destroy(display: *mut c_void) {
     unsafe { destroy_managed_display(display) };
 }
@@ -110,5 +149,11 @@ mod tests {
     fn framebuffer_size_is_full_screen_rgb565() {
         assert_eq!(framebuffer_size(320, 240), Some(320 * 240 * 2));
         assert_eq!(framebuffer_size(u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn t_deck_initializers_reject_non_native_geometry() {
+        assert!(meshemu_display_init("wide", 640, 480, LvglVersion::V8).is_null());
+        assert!(meshemu_display_init("short", 320, 200, LvglVersion::V9).is_null());
     }
 }
