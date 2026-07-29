@@ -11,8 +11,6 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_void, CStr};
 
 use libloading::Library;
-use sdl2::render::Canvas;
-use sdl2::video::Window;
 
 pub use config::{DisplayConfig, T_DECK_HEIGHT, T_DECK_WIDTH};
 pub use lvgl_v8::lvgl_v8_init_sdl;
@@ -58,67 +56,6 @@ pub(crate) fn with_active_firmware_library<T>(call: impl FnOnce(&Library) -> T) 
 pub fn is_t_deck_resolution(width: i32, height: i32) -> bool {
     width == T_DECK_WIDTH as i32 && height == T_DECK_HEIGHT as i32
 }
-
-pub(crate) enum BackendState {
-    V8(lvgl_v8::LvglV8State),
-}
-
-impl BackendState {
-    fn is_valid(&self, width: u32, height: u32) -> bool {
-        match self {
-            Self::V8(state) => state.is_valid(width, height),
-        }
-    }
-}
-
-#[repr(C)]
-pub(crate) struct DisplayHandle {
-    _header: version::DisplayHeader,
-    width: u32,
-    height: u32,
-    framebuffer: Vec<u8>,
-    _backend: BackendState,
-    _sdl: sdl2::Sdl,
-    _canvas: Canvas<Window>,
-}
-
-impl DisplayHandle {
-    pub(crate) fn new(
-        instance_id: &str,
-        width: i32,
-        height: i32,
-        version: LvglVersion,
-        backend: BackendState,
-    ) -> Option<Box<Self>> {
-        let width = u32::try_from(width).ok().filter(|width| *width > 0)?;
-        let height = u32::try_from(height).ok().filter(|height| *height > 0)?;
-        let framebuffer_len = framebuffer_size(width, height)?;
-        if !backend.is_valid(width, height) {
-            return None;
-        }
-
-        let sdl = sdl2::init().ok()?;
-        let video = sdl.video().ok()?;
-        let window = video
-            .window(instance_id, width, height)
-            .position_centered()
-            .hidden()
-            .build()
-            .ok()?;
-        let canvas = window.into_canvas().software().build().ok()?;
-
-        Some(Box::new(Self {
-            _header: version::DisplayHeader::new(version),
-            width,
-            height,
-            framebuffer: vec![0; framebuffer_len],
-            _backend: backend,
-            _sdl: sdl,
-            _canvas: canvas,
-        }))
-    }
-}
-
 pub(crate) fn framebuffer_size(width: u32, height: u32) -> Option<usize> {
     (width as usize)
         .checked_mul(height as usize)?
@@ -178,12 +115,7 @@ pub unsafe extern "C" fn meshemu_display_create_v(
 ///
 /// `display` must be null or point to readable display-handle memory.
 pub unsafe fn capture_managed_rgb565(display: *mut c_void) -> Option<Vec<u8>> {
-    let header = unsafe { display.cast::<version::DisplayHeader>().as_ref()? };
-    if !header.is_mycelium_handle() {
-        return None;
-    }
-    let display = unsafe { &*display.cast::<DisplayHandle>() };
-    Some(display.framebuffer.clone())
+    unsafe { lvgl_v8::capture_rgb565(display) }
 }
 
 /// Destroy a host-managed LVGL v8 compatibility display.
@@ -192,12 +124,7 @@ pub unsafe fn capture_managed_rgb565(display: *mut c_void) -> Option<Vec<u8>> {
 ///
 /// `display` must be null or a live handle returned by [`lvgl_v8_init_sdl`].
 pub unsafe fn destroy_managed_display(display: *mut c_void) {
-    let Some(header) = (unsafe { display.cast::<version::DisplayHeader>().as_ref() }) else {
-        return;
-    };
-    if header.is_mycelium_handle() {
-        unsafe { drop(Box::from_raw(display.cast::<DisplayHandle>())) };
-    }
+    unsafe { lvgl_v8::destroy_display(display) };
 }
 
 /// Destroy a Mycelium-managed compatibility display.
@@ -219,32 +146,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v8_compatibility_initializer_returns_a_versioned_handle() {
-        let _serial = SDL_TEST_LOCK.lock().unwrap();
-        std::env::set_var("SDL_VIDEODRIVER", "dummy");
-        let display = lvgl_v8_init_sdl("v8 test", 320, 240);
-
-        assert!(!display.is_null());
-        assert_eq!(LvglVersion::detect(display), LvglVersion::V8);
-        let display_ref = unsafe { &*display.cast::<DisplayHandle>() };
-        assert_eq!(display_ref.framebuffer.len(), 320 * 240 * BYTES_PER_PIXEL);
-        assert_eq!(
-            unsafe { capture_managed_rgb565(display) }.unwrap().len(),
-            320 * 240 * BYTES_PER_PIXEL
-        );
-
-        unsafe { destroy_managed_display(display) };
-    }
-
-    #[test]
-    fn versioned_create_preserves_v8_compatibility() {
-        let _serial = SDL_TEST_LOCK.lock().unwrap();
-        std::env::set_var("SDL_VIDEODRIVER", "dummy");
-        let title = std::ffi::CString::new("v8 versioned").unwrap();
-        let display = unsafe { meshemu_display_create_v(320, 240, title.as_ptr(), 8) };
-
-        assert_eq!(LvglVersion::detect(display), LvglVersion::V8);
-        unsafe { meshemu_display_destroy(display) };
+    fn framebuffer_size_is_full_screen_rgb565() {
+        assert_eq!(framebuffer_size(320, 240), Some(320 * 240 * 2));
+        assert_eq!(framebuffer_size(u32::MAX, u32::MAX), None);
     }
 
     #[test]

@@ -435,23 +435,18 @@ pub extern "C" fn meshemu_i2c_keyboard_create() -> *mut c_void {
     Box::into_raw(Box::new(keyboard)).cast()
 }
 
-/// Injects a matrix key transition into a virtual T-Deck keyboard.
+/// Injects the exact key byte returned by the T-Deck ESP32-C3.
 ///
 /// # Safety
 ///
 /// `keyboard` must be null or a live keyboard handle returned by
 /// [`meshemu_i2c_keyboard_create`].
 #[no_mangle]
-pub unsafe extern "C" fn meshemu_i2c_keyboard_inject_key(
-    keyboard: *mut c_void,
-    row: u8,
-    col: u8,
-    pressed: u8,
-) {
+pub unsafe extern "C" fn meshemu_i2c_keyboard_inject_key_byte(keyboard: *mut c_void, key_byte: u8) {
     let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
         return;
     };
-    lock(keyboard).inject_key(row, col, pressed != 0);
+    lock(keyboard).inject_key_byte(key_byte);
 }
 
 /// Destroys a keyboard handle.
@@ -489,6 +484,30 @@ pub unsafe extern "C" fn meshemu_wire_shim_set_keyboard(wire: *mut c_void, keybo
         return;
     };
     wire.set_keyboard(std::sync::Arc::clone(keyboard));
+}
+
+/// Initializes a Wire shim.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_begin(wire: *mut c_void) -> bool {
+    unsafe { wire_mut(wire) }
+        .map(WireShim::begin)
+        .unwrap_or(false)
+}
+
+/// Configures the Wire clock.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_set_clock(wire: *mut c_void, clock_hz: u32) {
+    if let Some(wire) = unsafe { wire_mut(wire) } {
+        wire.set_clock(clock_hz);
+    }
 }
 
 /// Selects the I2C target for a Wire transaction.

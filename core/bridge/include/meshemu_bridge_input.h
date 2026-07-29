@@ -26,12 +26,13 @@ uint64_t meshemu_input_poll_touch(const char *instance_id);
 uint64_t meshemu_input_poll_key(const char *instance_id);
 
 void *meshemu_i2c_keyboard_create(void);
-void meshemu_i2c_keyboard_inject_key(void *keyboard, uint8_t row,
-                                     uint8_t col, uint8_t pressed);
+void meshemu_i2c_keyboard_inject_key_byte(void *keyboard, uint8_t key_byte);
 void meshemu_i2c_keyboard_destroy(void *keyboard);
 
 void *meshemu_wire_shim_create(void);
 void meshemu_wire_shim_set_keyboard(void *wire, void *keyboard);
+bool meshemu_wire_begin(void *wire);
+void meshemu_wire_set_clock(void *wire, uint32_t clock_hz);
 void meshemu_wire_begin_transmission(void *wire, uint8_t address);
 size_t meshemu_wire_write(void *wire, uint8_t byte);
 uint8_t meshemu_wire_end_transmission(void *wire);
@@ -53,6 +54,10 @@ public:
 
     void setKeyboard(void *keyboard) {
         meshemu_wire_shim_set_keyboard(handle_, keyboard);
+    }
+    bool begin() { return meshemu_wire_begin(handle_); }
+    void setClock(uint32_t clock_hz) {
+        meshemu_wire_set_clock(handle_, clock_hz);
     }
     void beginTransmission(uint8_t address) {
         meshemu_wire_begin_transmission(handle_, address);
