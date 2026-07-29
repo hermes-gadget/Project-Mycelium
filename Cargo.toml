@@ -27,6 +27,7 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 libloading = "0.8"
 mycelium-core = { path = "core" }
+meshemu_bridge = { path = "core/bridge" }
 sdl2 = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

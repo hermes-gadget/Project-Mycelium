@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{ensure, Result};
 use clap::{Parser, Subcommand};
+use meshemu_bridge::meshemu_bus_tick;
 use mycelium_core::display::{DisplayConfig, DisplayEvent, DisplayManager};
 use mycelium_core::instance::{InstanceConfig, InstanceManager};
 use tokio::time::MissedTickBehavior;
@@ -78,8 +79,9 @@ async fn run(firmware: PathBuf, nodes: usize) -> Result<()> {
         }
     }
 
-    let mut ticker = tokio::time::interval(Duration::from_millis(1));
+    let mut ticker = tokio::time::interval(Duration::from_millis(16));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let started_at = std::time::Instant::now();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
@@ -91,7 +93,8 @@ async fn run(firmware: PathBuf, nodes: usize) -> Result<()> {
                 break;
             }
             _ = ticker.tick() => {
-                manager.tick_all();
+                manager.tick_all_with_delta(16);
+                meshemu_bus_tick(started_at.elapsed().as_millis() as u64);
                 if let Some(displays) = display_manager.as_mut() {
                     for event in displays.handle_events() {
                         match event {

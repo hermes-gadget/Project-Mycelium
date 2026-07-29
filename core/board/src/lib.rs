@@ -1,4 +1,11 @@
-//! Board-level power and telemetry emulation.
+//! Board-level power, telemetry, and buzzer emulation.
+
+mod buzzer;
+
+pub use buzzer::{
+    get_buzzer, meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop,
+    register_buzzer, remove_buzzer, SharedVirtualBuzzer, VirtualBuzzer,
+};
 
 pub const BD_STARTUP_NORMAL: u8 = 0;
 
