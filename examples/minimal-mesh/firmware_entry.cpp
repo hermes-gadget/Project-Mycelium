@@ -4,6 +4,7 @@
 #include <Dispatcher.h>
 #include <helpers/StaticPoolPacketManager.h>
 
+#include "meshemu_bridge_clock.h"
 #include "meshemu_bridge_radio.h"
 
 namespace {
