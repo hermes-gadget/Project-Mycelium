@@ -1,0 +1,6 @@
+/core/           Rust workspace — the engine
+/firmware-sdk/   C/C++ headers — how firmware integrates
+/gui/            Web control panel — map, fleet, inspector, scenarios
+/cli/            Headless CLI for CI usage
+/examples/       Example firmware integrations (SigurdOS, minimal-mesh)
+/docs/           Design docs, API reference, architecture decisions
