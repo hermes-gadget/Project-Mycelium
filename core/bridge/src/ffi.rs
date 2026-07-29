@@ -48,8 +48,18 @@ struct GpsHandle {
     manager: GpsManager,
 }
 
+struct SdFileHandle {
+    instance_id: String,
+    path: String,
+    position: usize,
+    writable: bool,
+    append: bool,
+}
+
 static BUS: LazyLock<Mutex<BusState>> = LazyLock::new(|| Mutex::new(BusState::new()));
 static STORAGE: LazyLock<Mutex<HashMap<String, StorageManager>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SD_FILE_HANDLES: LazyLock<Mutex<HashMap<u32, SdFileHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SDCARD_REQUIRES_SLOW_INIT: AtomicBool = AtomicBool::new(false);
 static SDCARD_WAKE_DELAY_MS: AtomicU32 = AtomicU32::new(0);
@@ -262,6 +272,310 @@ pub extern "C" fn meshemu_sdcard_set_behavior(slow_init: bool, wake_delay_ms: u3
     }
 }
 
+/// Returns the Arduino SD card type (`3` for the emulated SDHC card).
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_card_type(instance_id: *const c_char) -> u32 {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return 0;
+    };
+    if !peripherals_powered(instance_id) {
+        return 0;
+    }
+    if lock(&STORAGE)
+        .get(instance_id)
+        .is_some_and(|manager| manager.sdcard.is_mounted())
+    {
+        3
+    } else {
+        0
+    }
+}
+
+/// Returns the emulated SDHC capacity, or zero while unmounted.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_total_bytes(instance_id: *const c_char) -> u64 {
+    unsafe { sdcard_info(instance_id) }
+        .map(|info| info.total_bytes)
+        .unwrap_or(0)
+}
+
+/// Returns the bytes currently occupied by files on the emulated SD card.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_used_bytes(instance_id: *const c_char) -> u64 {
+    unsafe { sdcard_info(instance_id) }
+        .map(|info| info.used_bytes)
+        .unwrap_or(0)
+}
+
+unsafe fn sdcard_info(instance_id: *const c_char) -> Option<mycelium_storage::SdCardInfo> {
+    let instance_id = unsafe { ffi_string(instance_id) }?;
+    if !peripherals_powered(instance_id) {
+        return None;
+    }
+    lock(&STORAGE)
+        .get(instance_id)
+        .and_then(|manager| manager.sdcard.info().ok())
+}
+
+/// Creates a directory, including missing parent directories.
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_mkdir(
+    instance_id: *const c_char,
+    path: *const c_char,
+) -> bool {
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return false;
+    };
+    if !peripherals_powered(instance_id) {
+        return false;
+    }
+    lock(&STORAGE)
+        .get(instance_id)
+        .is_some_and(|manager| manager.sdcard.create_dir(path).is_ok())
+}
+
+/// Returns whether a file or directory exists on a mounted card.
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_exists(
+    instance_id: *const c_char,
+    path: *const c_char,
+) -> bool {
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return false;
+    };
+    if !peripherals_powered(instance_id) {
+        return false;
+    }
+    lock(&STORAGE)
+        .get(instance_id)
+        .and_then(|manager| manager.sdcard.exists(path).ok())
+        .unwrap_or(false)
+}
+
+/// Opens a file and returns a handle in the range 1..=255.
+///
+/// Modes are 0=read, 1=write (create/truncate), and 2=append (create).
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_open(
+    instance_id: *const c_char,
+    path: *const c_char,
+    mode: u8,
+) -> u32 {
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return 0;
+    };
+    if !peripherals_powered(instance_id) {
+        return 0;
+    }
+
+    let mut handles = lock(&SD_FILE_HANDLES);
+    let Some(handle) = (1..=255).find(|candidate| !handles.contains_key(candidate)) else {
+        return 0;
+    };
+    let (position, writable, append) = {
+        let storage = lock(&STORAGE);
+        let Some(sdcard) = storage.get(instance_id).map(|manager| &manager.sdcard) else {
+            return 0;
+        };
+        match mode {
+            0 => match sdcard.read_file(path) {
+                Ok(_) => (0, false, false),
+                Err(_) => return 0,
+            },
+            1 => {
+                if sdcard.write_file(path, &[]).is_err() {
+                    return 0;
+                }
+                (0, true, false)
+            }
+            2 => {
+                let position = match sdcard.read_file(path) {
+                    Ok(data) => data.len(),
+                    Err(_) if !sdcard.exists(path).unwrap_or(false) => {
+                        if sdcard.write_file(path, &[]).is_err() {
+                            return 0;
+                        }
+                        0
+                    }
+                    Err(_) => return 0,
+                };
+                (position, true, true)
+            }
+            _ => return 0,
+        }
+    };
+
+    handles.insert(
+        handle,
+        SdFileHandle {
+            instance_id: instance_id.to_owned(),
+            path: path.to_owned(),
+            position,
+            writable,
+            append,
+        },
+    );
+    handle
+}
+
+/// Writes bytes at the current file position.
+///
+/// Returns `-1` for invalid handles, read-only files, bad pointers, or storage
+/// errors.
+///
+/// # Safety
+///
+/// `data` must reference `len` readable bytes, or may be null when `len` is
+/// zero.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_write_file(handle: u32, data: *const u8, len: u32) -> i32 {
+    if len > i32::MAX as u32 || (data.is_null() && len != 0) {
+        return -1;
+    }
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len as usize) }
+    };
+    let mut handles = lock(&SD_FILE_HANDLES);
+    let Some(file) = handles.get_mut(&handle) else {
+        return -1;
+    };
+    if !file.writable || !peripherals_powered(&file.instance_id) {
+        return -1;
+    }
+    let mut storage = lock(&STORAGE);
+    let Some(sdcard) = storage
+        .get_mut(&file.instance_id)
+        .map(|manager| &mut manager.sdcard)
+    else {
+        return -1;
+    };
+    let Ok(mut contents) = sdcard.read_file(&file.path) else {
+        return -1;
+    };
+    if file.append {
+        file.position = contents.len();
+    }
+    if file.position > contents.len() {
+        return -1;
+    }
+    let Some(end) = file.position.checked_add(bytes.len()) else {
+        return -1;
+    };
+    if end > contents.len() {
+        contents.resize(end, 0);
+    }
+    contents[file.position..end].copy_from_slice(bytes);
+    if sdcard.write_file(&file.path, &contents).is_err() {
+        return -1;
+    }
+    file.position = end;
+    len as i32
+}
+
+/// Reads up to `max_len` bytes from the current file position.
+///
+/// # Safety
+///
+/// `buf` must reference `max_len` writable bytes, or may be null when
+/// `max_len` is zero.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_read_file(handle: u32, buf: *mut u8, max_len: u32) -> i32 {
+    if max_len > i32::MAX as u32 || (buf.is_null() && max_len != 0) {
+        return -1;
+    }
+    let mut handles = lock(&SD_FILE_HANDLES);
+    let Some(file) = handles.get_mut(&handle) else {
+        return -1;
+    };
+    if file.writable || !peripherals_powered(&file.instance_id) {
+        return -1;
+    }
+    let storage = lock(&STORAGE);
+    let Some(contents) = storage
+        .get(&file.instance_id)
+        .and_then(|manager| manager.sdcard.read_file(&file.path).ok())
+    else {
+        return -1;
+    };
+    let read_len = (contents.len().saturating_sub(file.position)).min(max_len as usize);
+    if read_len != 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(contents[file.position..].as_ptr(), buf, read_len);
+        }
+    }
+    file.position += read_len;
+    read_len as i32
+}
+
+/// Closes an open SD file handle.
+#[no_mangle]
+pub extern "C" fn meshemu_sdcard_close_file(handle: u32) -> bool {
+    lock(&SD_FILE_HANDLES).remove(&handle).is_some()
+}
+
+/// Removes a regular file from a mounted SD card.
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_remove(
+    instance_id: *const c_char,
+    path: *const c_char,
+) -> bool {
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return false;
+    };
+    if !peripherals_powered(instance_id) {
+        return false;
+    }
+    lock(&STORAGE)
+        .get(instance_id)
+        .is_some_and(|manager| manager.sdcard.remove_file(path).is_ok())
+}
+
+/// Closes instance file handles and unmounts its SD card.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_end(instance_id: *const c_char) {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return;
+    };
+    lock(&SD_FILE_HANDLES).retain(|_, file| file.instance_id != instance_id);
+    if let Some(manager) = lock(&STORAGE).get_mut(instance_id) {
+        manager.sdcard.unmount();
+    }
+}
+
 /// Reads an SD card file into a caller-owned allocation.
 ///
 /// The returned buffer must be released with [`meshemu_storage_data_free`].
@@ -339,6 +653,7 @@ pub unsafe extern "C" fn meshemu_storage_destroy(instance_id: *const c_char) -> 
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return false;
     };
+    lock(&SD_FILE_HANDLES).retain(|_, file| file.instance_id != instance_id);
     let Some(mut manager) = lock(&STORAGE).remove(instance_id) else {
         return false;
     };
@@ -1095,6 +1410,44 @@ pub unsafe extern "C" fn meshemu_wire_read_idle_levels(
     }
 }
 
+/// Clocks SCL nine times to release a slave holding SDA LOW.
+///
+/// Returns 0=already free, 1=recovered, or 2=still stuck.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_clock_out_recovery(wire: *mut c_void) -> u8 {
+    unsafe { wire_mut(wire) }
+        .map(WireShim::clock_out_recovery)
+        .unwrap_or(2)
+}
+
+/// Emits a STOP condition and clears incomplete Wire transaction state.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_emit_stop(wire: *mut c_void) {
+    if let Some(wire) = unsafe { wire_mut(wire) } {
+        wire.emit_stop();
+    }
+}
+
+/// Simulates a slave holding SDA LOW.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_set_sda_stuck(wire: *mut c_void, stuck: bool) {
+    if let Some(wire) = unsafe { wire_mut(wire) } {
+        wire.set_sda_stuck(stuck);
+    }
+}
+
 /// Selects the I2C target for a Wire transaction.
 ///
 /// # Safety
@@ -1394,6 +1747,46 @@ pub unsafe extern "C" fn meshemu_input_take_falling_edges(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take_falling_edges(gpio);
     edges
+}
+
+/// Sets or clears the sticky hardware interrupt-enable bit for a trackball pin.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_set_gpio_intr_enabled(
+    instance_id: *const c_char,
+    gpio: u8,
+    enabled: bool,
+) {
+    let Some(manager) = (unsafe { input_manager(instance_id, true) }) else {
+        return;
+    };
+    manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_gpio_intr_enabled(gpio, enabled);
+}
+
+/// Reads the hardware interrupt-enable bit for a trackball pin.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_get_gpio_intr_enabled(
+    instance_id: *const c_char,
+    gpio: u8,
+) -> bool {
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return false;
+    };
+    let enabled = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .gpio_intr_enabled(gpio);
+    enabled
 }
 
 /// Creates an SDL display for the requested LVGL major version.

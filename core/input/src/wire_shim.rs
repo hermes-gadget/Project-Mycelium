@@ -22,6 +22,7 @@ pub struct WireShim {
     read_buffer: Vec<u8>,
     read_position: usize,
     peripheral_power_check: Option<PeripheralPowerCheck>,
+    sda_stuck: bool,
 }
 
 impl WireShim {
@@ -48,6 +49,7 @@ impl WireShim {
             read_buffer: Vec::new(),
             read_position: 0,
             peripheral_power_check: None,
+            sda_stuck: false,
         }
     }
 
@@ -84,7 +86,36 @@ impl WireShim {
 
     /// Both externally pulled-up T-Deck I2C lines idle HIGH.
     pub fn idle_levels(&self) -> (u8, u8) {
-        (1, 1)
+        (u8::from(!self.sda_stuck), 1)
+    }
+
+    /// Clock SCL nine times, as the firmware recovery path does.
+    ///
+    /// Returns 0 when SDA was already free, 1 when the pulses released it, and
+    /// 2 when an unpowered peripheral rail leaves it stuck.
+    pub fn clock_out_recovery(&mut self) -> u8 {
+        if !self.sda_stuck {
+            return 0;
+        }
+        if !self.peripherals_powered() {
+            return 2;
+        }
+        self.sda_stuck = false;
+        1
+    }
+
+    /// Emit an I2C STOP and discard any incomplete transaction state.
+    pub fn emit_stop(&mut self) {
+        self.transmit_address = None;
+        self.transmit_buffer.clear();
+        self.clear_read_buffer();
+    }
+
+    pub fn set_sda_stuck(&mut self, stuck: bool) {
+        self.sda_stuck = stuck;
+        if stuck {
+            self.emit_stop();
+        }
     }
 
     pub fn set_peripheral_power_check<F>(&mut self, check: F)
@@ -100,7 +131,7 @@ impl WireShim {
     }
 
     pub fn write_byte(&mut self, byte: u8) -> usize {
-        if self.transmit_address.is_none() || !self.peripherals_powered() {
+        if self.transmit_address.is_none() || !self.peripherals_powered() || self.sda_stuck {
             return 0;
         }
         self.transmit_buffer.push(byte);
@@ -112,6 +143,11 @@ impl WireShim {
             return 4;
         };
         if !self.peripherals_powered() {
+            self.transmit_buffer.clear();
+            self.clear_read_buffer();
+            return 2;
+        }
+        if self.sda_stuck {
             self.transmit_buffer.clear();
             self.clear_read_buffer();
             return 2;
@@ -199,6 +235,7 @@ impl WireShim {
     fn bus_ready(&self) -> bool {
         self.peripherals_powered()
             && self.begun
+            && !self.sda_stuck
             && matches!(self.clock_hz, KEYBOARD_I2C_CLOCK_HZ | FAST_I2C_CLOCK_HZ)
     }
 }
@@ -221,6 +258,7 @@ mod tests {
 
     use super::*;
     use crate::gt911::{GT911_CONFIG_X_REGISTER, GT911_PRODUCT_ID_REGISTER, GT911_STATUS_REGISTER};
+    use crate::KEYBOARD_KEY_MODE_COMMAND;
 
     fn configured_wire(keyboard: SharedI2cKeyboard) -> WireShim {
         let mut wire = WireShim::with_keyboard(keyboard);
@@ -337,6 +375,26 @@ mod tests {
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
         wire.set_clock(FAST_I2C_CLOCK_HZ);
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
+    }
+
+    #[test]
+    fn stuck_sda_nacks_until_nine_clock_recovery_and_stop() {
+        let mut wire = WireShim::new();
+        wire.begin();
+        wire.set_sda_stuck(true);
+
+        assert_eq!(wire.idle_levels(), (0, 1));
+        assert!(!wire.probe_address(KEYBOARD_I2C_ADDRESS));
+        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
+        assert_eq!(wire.write_byte(KEYBOARD_KEY_MODE_COMMAND), 0);
+        assert_eq!(wire.end_transmission(), 2);
+        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
+
+        assert_eq!(wire.clock_out_recovery(), 1);
+        wire.emit_stop();
+        assert_eq!(wire.idle_levels(), (1, 1));
+        assert_eq!(wire.clock_out_recovery(), 0);
+        assert!(wire.probe_address(KEYBOARD_I2C_ADDRESS));
     }
 
     #[test]

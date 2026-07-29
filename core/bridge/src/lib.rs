@@ -23,20 +23,25 @@ pub use ffi::{
     meshemu_gps_set_position, meshemu_gps_tick, meshemu_i2c_keyboard_create,
     meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key_byte,
     meshemu_i2c_keyboard_set_cross_reset, meshemu_input_digital_read,
-    meshemu_input_get_touch_mapped, meshemu_input_get_touch_raw, meshemu_input_gt911_get_status,
+    meshemu_input_get_gpio_intr_enabled, meshemu_input_get_touch_mapped,
+    meshemu_input_get_touch_raw, meshemu_input_gt911_get_status,
     meshemu_input_gt911_set_failure_mode, meshemu_input_inject_key, meshemu_input_inject_touch,
-    meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_input_take_falling_edges,
-    meshemu_radio_create, meshemu_radio_destroy, meshemu_radio_get_dio2_config,
-    meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
-    meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_dio2_config,
-    meshemu_radio_set_position, meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read,
-    meshemu_sdcard_set_behavior, meshemu_sdcard_write, meshemu_spiffs_init, meshemu_spiffs_read,
-    meshemu_spiffs_write, meshemu_storage_data_free, meshemu_storage_destroy,
-    meshemu_wire_available, meshemu_wire_begin, meshemu_wire_begin_transmission,
+    meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_input_set_gpio_intr_enabled,
+    meshemu_input_take_falling_edges, meshemu_radio_create, meshemu_radio_destroy,
+    meshemu_radio_get_dio2_config, meshemu_radio_get_est_airtime, meshemu_radio_get_rssi,
+    meshemu_radio_get_snr, meshemu_radio_is_send_complete, meshemu_radio_recv_raw,
+    meshemu_radio_set_dio2_config, meshemu_radio_set_position, meshemu_radio_start_send,
+    meshemu_sdcard_card_type, meshemu_sdcard_close_file, meshemu_sdcard_end, meshemu_sdcard_exists,
+    meshemu_sdcard_init, meshemu_sdcard_mkdir, meshemu_sdcard_open, meshemu_sdcard_read,
+    meshemu_sdcard_read_file, meshemu_sdcard_remove, meshemu_sdcard_set_behavior,
+    meshemu_sdcard_total_bytes, meshemu_sdcard_used_bytes, meshemu_sdcard_write,
+    meshemu_sdcard_write_file, meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write,
+    meshemu_storage_data_free, meshemu_storage_destroy, meshemu_wire_available, meshemu_wire_begin,
+    meshemu_wire_begin_transmission, meshemu_wire_clock_out_recovery, meshemu_wire_emit_stop,
     meshemu_wire_end_transmission, meshemu_wire_probe_address, meshemu_wire_read,
     meshemu_wire_read_idle_levels, meshemu_wire_request_from, meshemu_wire_set_clock,
-    meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance, meshemu_wire_shim_destroy,
-    meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+    meshemu_wire_set_sda_stuck, meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance,
+    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 pub use flash_ffi::{
     meshemu_get_otadata_address, meshemu_is_under_launcher, meshemu_nvs_destroy,
@@ -411,6 +416,23 @@ mod tests {
             let mut scl = 0;
             meshemu_wire_read_idle_levels(wire, &mut sda, &mut scl);
             assert_eq!((sda, scl), (1, 1));
+            meshemu_wire_set_sda_stuck(wire, true);
+            meshemu_wire_read_idle_levels(wire, &mut sda, &mut scl);
+            assert_eq!((sda, scl), (0, 1));
+            assert!(!meshemu_wire_probe_address(
+                wire,
+                mycelium_input::KEYBOARD_I2C_ADDRESS
+            ));
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_write(wire, 0x04), 0);
+            assert_eq!(meshemu_wire_end_transmission(wire), 2);
+            assert_eq!(meshemu_wire_clock_out_recovery(wire), 1);
+            meshemu_wire_emit_stop(wire);
+            assert_eq!(meshemu_wire_clock_out_recovery(wire), 0);
+            assert!(meshemu_wire_probe_address(
+                wire,
+                mycelium_input::KEYBOARD_I2C_ADDRESS
+            ));
             meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
             meshemu_wire_write(wire, mycelium_input::KEYBOARD_KEY_MODE_COMMAND);
             assert_eq!(meshemu_wire_end_transmission(wire), 0);
@@ -529,6 +551,8 @@ mod tests {
             meshemu_storage_data_free(data);
 
             assert!(meshemu_sdcard_init(id.as_ptr()));
+            assert_eq!(meshemu_sdcard_card_type(id.as_ptr()), 3);
+            assert_eq!(meshemu_sdcard_total_bytes(id.as_ptr()), 34_359_738_368);
             assert!(meshemu_sdcard_write(
                 id.as_ptr(),
                 path.as_ptr(),
@@ -539,6 +563,56 @@ mod tests {
             assert!(!data.is_null());
             assert_eq!(std::slice::from_raw_parts(data, len), sdcard_data);
             meshemu_storage_data_free(data);
+
+            let directory = CString::new("/logs").unwrap();
+            let stream_path = CString::new("/logs/stream.bin").unwrap();
+            assert!(meshemu_sdcard_mkdir(id.as_ptr(), directory.as_ptr()));
+            assert!(meshemu_sdcard_exists(id.as_ptr(), directory.as_ptr()));
+            let write_handle = meshemu_sdcard_open(id.as_ptr(), stream_path.as_ptr(), 1);
+            assert!((1..=255).contains(&write_handle));
+            assert_eq!(
+                meshemu_sdcard_write_file(write_handle, b"one".as_ptr(), 3),
+                3
+            );
+            assert!(meshemu_sdcard_close_file(write_handle));
+
+            let append_handle = meshemu_sdcard_open(id.as_ptr(), stream_path.as_ptr(), 2);
+            let second_append_handle = meshemu_sdcard_open(id.as_ptr(), stream_path.as_ptr(), 2);
+            assert_ne!(append_handle, 0);
+            assert_ne!(second_append_handle, 0);
+            assert_eq!(
+                meshemu_sdcard_write_file(append_handle, b"-two".as_ptr(), 4),
+                4
+            );
+            assert_eq!(
+                meshemu_sdcard_write_file(second_append_handle, b"-three".as_ptr(), 6),
+                6
+            );
+            assert!(meshemu_sdcard_close_file(append_handle));
+            assert!(meshemu_sdcard_close_file(second_append_handle));
+            assert_eq!(meshemu_sdcard_used_bytes(id.as_ptr()), 19);
+
+            let read_handle = meshemu_sdcard_open(id.as_ptr(), stream_path.as_ptr(), 0);
+            let mut buffer = [0_u8; 16];
+            assert_eq!(
+                meshemu_sdcard_read_file(read_handle, buffer.as_mut_ptr(), buffer.len() as u32),
+                13
+            );
+            assert_eq!(&buffer[..13], b"one-two-three");
+            assert_eq!(
+                meshemu_sdcard_read_file(read_handle, buffer.as_mut_ptr(), buffer.len() as u32),
+                0
+            );
+            assert!(meshemu_sdcard_close_file(read_handle));
+            assert!(!meshemu_sdcard_close_file(read_handle));
+            assert!(meshemu_sdcard_remove(id.as_ptr(), stream_path.as_ptr()));
+            assert!(!meshemu_sdcard_exists(id.as_ptr(), stream_path.as_ptr()));
+
+            meshemu_sdcard_end(id.as_ptr());
+            assert_eq!(meshemu_sdcard_card_type(id.as_ptr()), 0);
+            assert_eq!(meshemu_sdcard_total_bytes(id.as_ptr()), 0);
+            assert_eq!(meshemu_sdcard_open(id.as_ptr(), stream_path.as_ptr(), 0), 0);
+            assert!(meshemu_storage_destroy(id.as_ptr()));
         }
     }
 
@@ -589,6 +663,47 @@ mod tests {
         }
         assert_eq!(unsafe { meshemu_input_poll_key(id.as_ptr()) }, 1 << 16);
         assert_eq!(unsafe { meshemu_input_poll_key(id.as_ptr()) }, 0);
+
+        unsafe {
+            meshemu_input_set_gpio_intr_enabled(
+                id.as_ptr(),
+                mycelium_input::TRACKBALL_UP_GPIO,
+                false,
+            );
+            meshemu_input_inject_touch(id.as_ptr(), 1, 2, false);
+            assert!(!meshemu_input_get_gpio_intr_enabled(
+                id.as_ptr(),
+                mycelium_input::TRACKBALL_UP_GPIO
+            ));
+            meshemu_input_inject_key(
+                id.as_ptr(),
+                i32::from(sdl2::keyboard::Keycode::Up) as u32,
+                true,
+            );
+            assert_eq!(
+                meshemu_input_take_falling_edges(id.as_ptr(), mycelium_input::TRACKBALL_UP_GPIO),
+                0
+            );
+            meshemu_input_inject_key(
+                id.as_ptr(),
+                i32::from(sdl2::keyboard::Keycode::Up) as u32,
+                false,
+            );
+            meshemu_input_set_gpio_intr_enabled(
+                id.as_ptr(),
+                mycelium_input::TRACKBALL_UP_GPIO,
+                true,
+            );
+            meshemu_input_inject_key(
+                id.as_ptr(),
+                i32::from(sdl2::keyboard::Keycode::Up) as u32,
+                true,
+            );
+            assert_eq!(
+                meshemu_input_take_falling_edges(id.as_ptr(), mycelium_input::TRACKBALL_UP_GPIO),
+                1
+            );
+        }
         mycelium_input::remove_input_manager("ffi-input-node");
     }
 
