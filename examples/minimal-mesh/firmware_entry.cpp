@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -36,6 +37,7 @@ private:
 struct NodeContext {
     explicit NodeContext(std::size_t node_number)
         : name(std::string(NODE_NAME) + "-" + std::to_string(node_number)),
+          send_delay_ms(static_cast<std::uint32_t>((node_number - 1) * 250)),
           radio(name.c_str(), 868.0, 125, 9, 5, 14.0, 54.5, -1.2),
           packets(8),
           dispatcher(radio, clock, packets, name.c_str()) {
@@ -56,7 +58,8 @@ struct NodeContext {
                 packet->payload_len = std::strlen(HELLO_MESSAGE);
                 std::memcpy(packet->payload, HELLO_MESSAGE,
                             packet->payload_len);
-                packets.queueOutbound(packet, 0, clock.getMillis());
+                packets.queueOutbound(packet, 0,
+                                      clock.getMillis() + send_delay_ms);
                 std::printf("[firmware:%s] Sent hello packet\n", name.c_str());
                 sent_hello = true;
             }
@@ -64,6 +67,7 @@ struct NodeContext {
     }
 
     std::string name;
+    std::uint32_t send_delay_ms;
     MeshemuRadio radio;
     MeshemuClock clock;
     StaticPoolPacketManager packets;

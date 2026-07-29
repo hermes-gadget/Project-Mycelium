@@ -29,9 +29,12 @@ add_dependencies(firmware meshemu-bridge)
 target_compile_options(firmware PRIVATE -Wall -Wextra)
 target_include_directories(firmware PRIVATE
     ${MYCELIUM_ROOT}/core/bridge/include
-    ${MESHCORE_ROOT}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_include_directories(firmware SYSTEM PRIVATE ${MESHCORE_ROOT}/test/mocks)
+target_include_directories(firmware SYSTEM PRIVATE
+    ${MESHCORE_ROOT}/src
+    ${MESHCORE_ROOT}/test/mocks
+)
 target_link_libraries(firmware PRIVATE ${MESHEMU_BRIDGE_LIB})
 set_target_properties(firmware PROPERTIES
     BUILD_RPATH ${MYCELIUM_ROOT}/target/debug

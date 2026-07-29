@@ -1,11 +1,12 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -fPIC -Wall -Wextra \
 	-I../../core/bridge/include \
+	-Iinclude \
 	-isystem ../../lib/meshcore/test/mocks
 LDFLAGS = -shared -L../../target/debug -lmeshemu_bridge \
 	-Wl,-rpath,'$$ORIGIN/../../target/debug'
 
-MESHCORE_INC = -I../../lib/meshcore/src
+MESHCORE_INC = -isystem ../../lib/meshcore/src
 MESHCORE_SRC = \
 	../../lib/meshcore/src/Dispatcher.cpp \
 	../../lib/meshcore/src/Packet.cpp \
