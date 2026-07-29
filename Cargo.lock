@@ -543,7 +543,9 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libloading",
+ "mycelium-board",
  "mycelium-display",
+ "mycelium-gps",
  "mycelium-input",
  "radio_bus",
  "sdl2",
