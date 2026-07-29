@@ -405,7 +405,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let id = CString::new(format!("ffi-storage-{}-{nonce}", std::process::id())).unwrap();
-        let path = CString::new("/nested/data.bin").unwrap();
+        let path = CString::new("data.bin").unwrap();
         let spiffs_data = b"spiffs";
         let sdcard_data = b"sdcard";
 
