@@ -7,7 +7,7 @@ mod touch;
 mod trackball;
 pub mod wire_shim;
 
-pub use i2c_keyboard::{I2cTransaction, KEYBOARD_COLS, KEYBOARD_I2C_ADDRESS, KEYBOARD_ROWS};
+pub use i2c_keyboard::{KEYBOARD_I2C_ADDRESS, KEYBOARD_KEY_MODE_COMMAND};
 pub use keyboard::{KeyEvent, KeyboardEmulator, TDeckKeyMapping};
 pub use manager::{
     get_input_manager, register_input_manager, remove_input_manager, InputEvent, InputManager,

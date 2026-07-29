@@ -1,87 +1,64 @@
-use std::mem;
+use std::collections::VecDeque;
 
 pub const KEYBOARD_I2C_ADDRESS: u8 = 0x55;
-pub const KEYBOARD_ROWS: usize = 4;
-pub const KEYBOARD_COLS: usize = 10;
-
-/// Represents an I2C read from the keyboard co-processor.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct I2cTransaction {
-    pub address: u8,
-    pub register: u8,
-    pub data: Vec<u8>,
-}
+pub const KEYBOARD_KEY_MODE_COMMAND: u8 = 0x04;
 
 /// Simulates the ESP32-C3 keyboard co-processor at I2C address `0x55`.
+///
+/// The real protocol is polled: each I2C read returns one key byte, with
+/// `0x00` indicating that no key is currently waiting.
 #[derive(Debug)]
 pub struct I2cKeyboardBus {
-    /// Current key matrix state: rows x columns bitmap.
-    key_state: [[bool; KEYBOARD_COLS]; KEYBOARD_ROWS],
-    /// I2C register data that the co-processor reports.
-    registers: [u8; 32],
-    /// Completed I2C reads, retained for inspection by the emulator.
-    pending_reads: Vec<I2cTransaction>,
+    /// Queue of key bytes waiting to be read (FIFO).
+    key_queue: VecDeque<u8>,
+    /// Whether key mode (`CMD 0x04`) has been sent.
+    key_mode_active: bool,
+    /// Last command byte written.
+    last_command: u8,
 }
 
 impl I2cKeyboardBus {
     pub fn new() -> Self {
-        let mut registers = [0; 32];
-        registers[0x04] = 0x01;
         Self {
-            key_state: [[false; KEYBOARD_COLS]; KEYBOARD_ROWS],
-            registers,
-            pending_reads: Vec::new(),
+            key_queue: VecDeque::new(),
+            key_mode_active: false,
+            last_command: 0,
         }
     }
 
-    /// Inject a key event from the host keyboard emulator.
-    pub fn inject_key(&mut self, row: u8, col: u8, pressed: bool) {
-        if row < KEYBOARD_ROWS as u8 && col < KEYBOARD_COLS as u8 {
-            self.key_state[row as usize][col as usize] = pressed;
-            self.registers[row as usize] = self.encode_row(row as usize);
+    /// Inject the exact byte that the ESP32-C3 would return for a key press.
+    pub fn inject_key_byte(&mut self, key_byte: u8) {
+        self.key_queue.push_back(key_byte);
+    }
+
+    /// Record and apply a command written to the keyboard co-processor.
+    pub fn write_command(&mut self, byte: u8) {
+        self.last_command = byte;
+        if byte == KEYBOARD_KEY_MODE_COMMAND {
+            self.key_mode_active = true;
         }
     }
 
-    /// Read a register as if it were requested from I2C address `0x55`.
-    pub fn read_register(&mut self, reg: u8) -> Vec<u8> {
-        let data = match reg {
-            0x00..=0x03 => vec![self.registers[reg as usize]],
-            0x04 => vec![self.keyboard_present()],
-            _ => vec![0x00],
-        };
-        self.pending_reads.push(I2cTransaction {
-            address: KEYBOARD_I2C_ADDRESS,
-            register: reg,
-            data: data.clone(),
-        });
-        data
-    }
-
-    /// Return all reads recorded since the bus was created or last drained.
-    pub fn pending_reads(&self) -> &[I2cTransaction] {
-        &self.pending_reads
-    }
-
-    /// Drain the recorded I2C reads.
-    pub fn take_pending_reads(&mut self) -> Vec<I2cTransaction> {
-        mem::take(&mut self.pending_reads)
-    }
-
-    /// Encode the columns representable by the controller's one-byte row
-    /// register. Columns 8 and 9 remain part of the matrix for host/LVGL input,
-    /// but cannot be represented in this legacy register format.
-    fn encode_row(&self, row: usize) -> u8 {
-        let mut byte = 0_u8;
-        for col in 0..u8::BITS as usize {
-            if self.key_state[row][col] {
-                byte |= 1 << col;
-            }
+    /// Return one queued key byte, or `0x00` when key mode is inactive or idle.
+    pub fn read_key_byte(&mut self) -> u8 {
+        if !self.key_mode_active {
+            return 0x00;
         }
-        byte
+        self.key_queue.pop_front().unwrap_or(0x00)
     }
 
-    fn keyboard_present(&self) -> u8 {
-        0x01
+    /// Return how many key bytes the next poll can expose.
+    pub fn available(&self) -> usize {
+        if !self.key_mode_active {
+            return 0;
+        }
+        self.key_queue.len().min(1)
+    }
+
+    pub fn reset(&mut self) {
+        self.key_queue.clear();
+        self.key_mode_active = false;
+        self.last_command = 0;
     }
 }
 
@@ -96,44 +73,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn injected_key_is_exposed_in_its_row_register() {
+    fn key_mode_command_activates_polled_key_bytes() {
         let mut bus = I2cKeyboardBus::new();
+        bus.inject_key_byte(b'q');
 
-        bus.inject_key(2, 3, true);
+        assert_eq!(bus.available(), 0);
+        assert_eq!(bus.read_key_byte(), 0x00);
 
-        assert_eq!(bus.read_register(0x02), [0b0000_1000]);
-        assert_eq!(bus.read_register(0x00), [0]);
-        assert_eq!(bus.read_register(0x04), [1]);
+        bus.write_command(KEYBOARD_KEY_MODE_COMMAND);
+
+        assert!(bus.key_mode_active);
+        assert_eq!(bus.last_command, 0x04);
+        assert_eq!(bus.available(), 1);
+        assert_eq!(bus.read_key_byte(), b'q');
     }
 
     #[test]
-    fn multiple_pressed_keys_are_encoded_and_releases_clear_bits() {
+    fn injected_key_bytes_are_returned_fifo_one_per_poll() {
         let mut bus = I2cKeyboardBus::new();
-        bus.inject_key(1, 0, true);
-        bus.inject_key(1, 3, true);
-        bus.inject_key(1, 7, true);
+        bus.write_command(KEYBOARD_KEY_MODE_COMMAND);
+        bus.inject_key_byte(b'q');
+        bus.inject_key_byte(b'W');
+        bus.inject_key_byte(0x0d);
 
-        assert_eq!(bus.read_register(0x01), [0b1000_1001]);
-
-        bus.inject_key(1, 3, false);
-        assert_eq!(bus.read_register(0x01), [0b1000_0001]);
+        assert_eq!(bus.available(), 1);
+        assert_eq!(bus.read_key_byte(), b'q');
+        assert_eq!(bus.available(), 1);
+        assert_eq!(bus.read_key_byte(), b'W');
+        assert_eq!(bus.read_key_byte(), 0x0d);
+        assert_eq!(bus.available(), 0);
     }
 
     #[test]
-    fn out_of_range_keys_are_ignored_and_reads_are_recorded() {
+    fn idle_poll_returns_zero_and_reset_disables_key_mode() {
         let mut bus = I2cKeyboardBus::new();
-        bus.inject_key(4, 0, true);
-        bus.inject_key(0, 10, true);
+        bus.write_command(KEYBOARD_KEY_MODE_COMMAND);
 
-        assert_eq!(bus.read_register(0), [0]);
-        assert_eq!(
-            bus.take_pending_reads(),
-            [I2cTransaction {
-                address: KEYBOARD_I2C_ADDRESS,
-                register: 0,
-                data: vec![0],
-            }]
-        );
-        assert!(bus.pending_reads().is_empty());
+        assert_eq!(bus.read_key_byte(), 0x00);
+
+        bus.inject_key_byte(0x08);
+        bus.reset();
+        assert_eq!(bus.available(), 0);
+        assert_eq!(bus.read_key_byte(), 0x00);
+        assert!(!bus.key_mode_active);
+        assert_eq!(bus.last_command, 0);
     }
 }

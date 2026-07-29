@@ -16,6 +16,10 @@ pub struct KeyEvent {
     pub row: u8,
     pub col: u8,
     pub pressed: bool,
+    /// Exact byte returned by the T-Deck ESP32-C3 for this key.
+    ///
+    /// Shift keys have no byte of their own and use `0x00`.
+    pub key_byte: u8,
 }
 
 pub struct KeyboardEmulator {
@@ -84,13 +88,13 @@ impl KeyboardEmulator {
         emu.map_key(Keycode::LShift, 3, 0, '\0', '\0');
         emu.map_key(Keycode::RShift, 3, 0, '\0', '\0');
         emu.map_key(Keycode::Space, 3, 1, ' ', ' ');
-        emu.map_key(Keycode::Return, 3, 2, '\n', '\n');
+        emu.map_key(Keycode::Return, 3, 2, '\r', '\r');
         emu.map_key(Keycode::Backspace, 3, 3, '\u{8}', '\u{8}');
         emu
     }
 
     pub fn handle_key(&mut self, keycode: Keycode, pressed: bool) -> Option<KeyEvent> {
-        let mapping = self.keymap.get(&keycode)?;
+        let mapping = *self.keymap.get(&keycode)?;
         let changed = if pressed {
             self.pressed_keys.insert(keycode)
         } else {
@@ -99,10 +103,17 @@ impl KeyboardEmulator {
         if !changed {
             return None;
         }
+        let shift_active = self.pressed_keys.contains(&Keycode::LShift)
+            || self.pressed_keys.contains(&Keycode::RShift);
         let event = KeyEvent {
             row: mapping.row,
             col: mapping.col,
             pressed,
+            key_byte: if shift_active {
+                mapping.shifted as u8
+            } else {
+                mapping.label as u8
+            },
         };
         self.last_event = Some(event);
         Some(event)
@@ -144,6 +155,7 @@ mod tests {
                 row: 0,
                 col: 0,
                 pressed: true,
+                key_byte: b'q',
             })
         );
         assert_eq!(keyboard.handle_key(Keycode::L, true).unwrap().col, 8);
@@ -154,6 +166,7 @@ mod tests {
                 row: 3,
                 col: 3,
                 pressed: true,
+                key_byte: 0x08,
             }
         );
     }
@@ -166,5 +179,53 @@ mod tests {
         assert!(keyboard.handle_key(Keycode::A, false).is_some());
         assert!(keyboard.handle_key(Keycode::A, false).is_none());
         assert!(keyboard.handle_key(Keycode::F1, true).is_none());
+    }
+
+    #[test]
+    fn shift_keys_are_tracked_independently_and_uppercase_letters() {
+        let mut keyboard = KeyboardEmulator::new();
+        assert_eq!(
+            keyboard.handle_key(Keycode::LShift, true).unwrap().key_byte,
+            0x00
+        );
+        keyboard.handle_key(Keycode::RShift, true);
+        assert_eq!(
+            keyboard.handle_key(Keycode::Q, true).unwrap().key_byte,
+            b'Q'
+        );
+        keyboard.handle_key(Keycode::Q, false);
+        keyboard.handle_key(Keycode::LShift, false);
+        assert_eq!(
+            keyboard.handle_key(Keycode::W, true).unwrap().key_byte,
+            b'W'
+        );
+        keyboard.handle_key(Keycode::W, false);
+        keyboard.handle_key(Keycode::RShift, false);
+        assert_eq!(
+            keyboard.handle_key(Keycode::E, true).unwrap().key_byte,
+            b'e'
+        );
+    }
+
+    #[test]
+    fn special_keys_match_the_c3_protocol() {
+        let mut keyboard = KeyboardEmulator::new();
+
+        assert_eq!(
+            keyboard.handle_key(Keycode::Return, true).unwrap().key_byte,
+            0x0d
+        );
+        assert_ne!(keyboard.get_last().unwrap().key_byte, 0x0a);
+        assert_eq!(
+            keyboard
+                .handle_key(Keycode::Backspace, true)
+                .unwrap()
+                .key_byte,
+            0x08
+        );
+        assert_eq!(
+            keyboard.handle_key(Keycode::Space, true).unwrap().key_byte,
+            0x20
+        );
     }
 }
