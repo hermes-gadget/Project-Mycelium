@@ -544,6 +544,7 @@ dependencies = [
  "libc",
  "libloading",
  "mycelium-display",
+ "mycelium-input",
  "radio_bus",
 ]
 
@@ -603,6 +604,7 @@ dependencies = [
  "anyhow",
  "libloading",
  "mycelium-display",
+ "mycelium-input",
  "serde",
  "serde_json",
 ]
