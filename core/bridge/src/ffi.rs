@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -8,6 +8,7 @@ use mycelium_gps::GpsManager;
 use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
+use mycelium_storage::StorageManager;
 use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
 use sdl2::keyboard::Keycode;
 
@@ -36,6 +37,8 @@ struct RadioHandle {
 }
 
 static BUS: LazyLock<Mutex<BusState>> = LazyLock::new(|| Mutex::new(BusState::new()));
+static STORAGE: LazyLock<Mutex<HashMap<String, StorageManager>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -53,6 +56,40 @@ unsafe fn keyboard_ref<'a>(keyboard: *mut c_void) -> Option<&'a SharedI2cKeyboar
 
 unsafe fn wire_mut<'a>(wire: *mut c_void) -> Option<&'a mut WireShim> {
     unsafe { (wire as *mut WireShim).as_mut() }
+}
+
+unsafe fn ffi_string<'a>(value: *const c_char) -> Option<&'a str> {
+    if value.is_null() {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(value) }.to_str().ok()?;
+    (!value.is_empty()).then_some(value)
+}
+
+unsafe fn storage_file_args<'a>(
+    instance_id: *const c_char,
+    path: *const c_char,
+) -> Option<(&'a str, &'a str)> {
+    Some((unsafe { ffi_string(instance_id) }?, unsafe {
+        ffi_string(path)
+    }?))
+}
+
+fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
+    if out_len.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { *out_len = 0 };
+    let allocation_len = data.len().max(1);
+    let output = unsafe { libc::malloc(allocation_len) }.cast::<u8>();
+    if output.is_null() {
+        return ptr::null_mut();
+    }
+    if !data.is_empty() {
+        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), output, data.len()) };
+    }
+    unsafe { *out_len = data.len() };
+    output
 }
 
 unsafe fn gps_mut<'a>(gps: *mut c_void) -> Option<&'a mut GpsManager> {
@@ -80,6 +117,172 @@ fn valid_position(lat: f64, lon: f64) -> bool {
         && lon.is_finite()
         && (-90.0..=90.0).contains(&lat)
         && (-180.0..=180.0).contains(&lon)
+}
+
+/// Mounts the virtual SPIFFS partition for an emulator instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_spiffs_init(instance_id: *const c_char) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    let mut storage = lock(&STORAGE);
+    storage
+        .entry(instance_id.to_owned())
+        .or_insert_with(|| StorageManager::new(instance_id))
+        .spiffs
+        .mount()
+        .is_ok()
+}
+
+/// Reads a SPIFFS file into a caller-owned allocation.
+///
+/// The returned buffer must be released with [`meshemu_storage_data_free`].
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings. `out_len` must be null
+/// or point to writable memory for one `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_spiffs_read(
+    instance_id: *const c_char,
+    path: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if !out_len.is_null() {
+        unsafe { *out_len = 0 };
+    }
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return ptr::null_mut();
+    };
+    let storage = lock(&STORAGE);
+    let Some(data) = storage
+        .get(instance_id)
+        .and_then(|manager| manager.spiffs.read_file(path).ok())
+    else {
+        return ptr::null_mut();
+    };
+    copy_for_caller(&data, out_len)
+}
+
+/// Writes a complete SPIFFS file.
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings. `data` must reference
+/// `len` readable bytes, or may be null when `len` is zero.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_spiffs_write(
+    instance_id: *const c_char,
+    path: *const c_char,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return false;
+    };
+    if data.is_null() && len != 0 {
+        return false;
+    }
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    lock(&STORAGE)
+        .get(instance_id)
+        .is_some_and(|manager| manager.spiffs.write_file(path, bytes).is_ok())
+}
+
+/// Mounts the virtual SD card for an emulator instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_init(instance_id: *const c_char) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    let mut storage = lock(&STORAGE);
+    storage
+        .entry(instance_id.to_owned())
+        .or_insert_with(|| StorageManager::new(instance_id))
+        .sdcard
+        .mount()
+        .is_ok()
+}
+
+/// Reads an SD card file into a caller-owned allocation.
+///
+/// The returned buffer must be released with [`meshemu_storage_data_free`].
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings. `out_len` must be null
+/// or point to writable memory for one `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_read(
+    instance_id: *const c_char,
+    path: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if !out_len.is_null() {
+        unsafe { *out_len = 0 };
+    }
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return ptr::null_mut();
+    };
+    let storage = lock(&STORAGE);
+    let Some(data) = storage
+        .get(instance_id)
+        .and_then(|manager| manager.sdcard.read_file(path).ok())
+    else {
+        return ptr::null_mut();
+    };
+    copy_for_caller(&data, out_len)
+}
+
+/// Writes a complete SD card file.
+///
+/// # Safety
+///
+/// String pointers must be valid NUL-terminated strings. `data` must reference
+/// `len` readable bytes, or may be null when `len` is zero.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_sdcard_write(
+    instance_id: *const c_char,
+    path: *const c_char,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
+        return false;
+    };
+    if data.is_null() && len != 0 {
+        return false;
+    }
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    lock(&STORAGE)
+        .get(instance_id)
+        .is_some_and(|manager| manager.sdcard.write_file(path, bytes).is_ok())
+}
+
+/// Releases a buffer returned by a storage read function.
+///
+/// # Safety
+///
+/// `data` must be null or a pointer returned by a storage read function.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_storage_data_free(data: *mut u8) {
+    unsafe { libc::free(data.cast()) };
 }
 
 /// Creates an independently owned virtual GPS.

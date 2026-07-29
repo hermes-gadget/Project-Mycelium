@@ -13,5 +13,6 @@ mycelium-board = { path = "../board" }
 mycelium-display = { path = "../display" }
 mycelium-gps = { path = "../gps" }
 mycelium-input = { path = "../input" }
+mycelium-storage = { path = "../storage" }
 radio_bus = { path = "../radio_bus" }
 sdl2 = { version = "0.38", features = ["bundled"] }
