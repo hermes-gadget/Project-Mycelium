@@ -163,6 +163,24 @@ pub extern "C" fn meshemu_radio_recv_raw(radio: *mut c_void, buffer: *mut u8, ma
 }
 
 #[no_mangle]
+pub extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: i32) -> u32 {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return 0;
+    };
+    if len < 0 {
+        return 0;
+    }
+    propagation::airtime_ms(
+        len as usize,
+        handle.channel.spreading_factor,
+        handle.channel.bandwidth_khz,
+        handle.channel.coding_rate,
+        8,
+        true,
+    )
+}
+
+#[no_mangle]
 pub extern "C" fn meshemu_radio_get_rssi(radio: *mut c_void) -> f32 {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0.0;
