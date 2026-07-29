@@ -84,7 +84,7 @@ impl FirmwareInstance {
     }
 
     pub fn has_display(&self) -> bool {
-        self.get_display.is_some()
+        self.display().is_some_and(|display| !display.is_null())
     }
 
     pub fn display(&self) -> Option<*mut c_void> {

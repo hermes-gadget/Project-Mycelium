@@ -5,4 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+anyhow = "1"
+libloading = "0.8"
+png = "0.17"
 sdl2 = { version = "0.38", features = ["bundled"] }

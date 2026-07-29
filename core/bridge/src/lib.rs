@@ -3,9 +3,11 @@
 mod ffi;
 
 pub use ffi::{
-    meshemu_bus_tick, meshemu_radio_create, meshemu_radio_destroy, meshemu_radio_get_est_airtime,
-    meshemu_radio_get_rssi, meshemu_radio_get_snr, meshemu_radio_is_send_complete,
-    meshemu_radio_recv_raw, meshemu_radio_set_position, meshemu_radio_start_send,
+    meshemu_bus_tick, meshemu_display_capture, meshemu_display_capture_free,
+    meshemu_display_create, meshemu_radio_create, meshemu_radio_destroy,
+    meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
+    meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
+    meshemu_radio_start_send,
 };
 
 #[cfg(test)]
@@ -124,5 +126,19 @@ mod tests {
             0
         );
         destroy(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn display_ffi_rejects_null_and_invalid_arguments() {
+        let id = CString::new("node1").unwrap();
+        assert!(unsafe { meshemu_display_create(std::ptr::null(), 320, 240) }.is_null());
+        assert!(unsafe { meshemu_display_create(id.as_ptr(), 0, 240) }.is_null());
+
+        let mut size = usize::MAX;
+        assert!(unsafe { meshemu_display_capture(std::ptr::null_mut(), &mut size) }.is_null());
+        assert_eq!(size, 0);
+        unsafe {
+            meshemu_display_capture_free(std::ptr::null_mut(), 0);
+        }
     }
 }

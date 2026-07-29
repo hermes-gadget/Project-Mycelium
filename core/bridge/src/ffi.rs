@@ -41,6 +41,74 @@ unsafe fn handle_ref<'a>(radio: *mut c_void) -> Option<&'a RadioHandle> {
     (radio as *const RadioHandle).as_ref()
 }
 
+/// Creates an LVGL v9 SDL display for a firmware instance.
+///
+/// Returns null for invalid arguments or when the loaded firmware does not
+/// export the LVGL v9 SDL driver API.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_display_create(
+    instance_id: *const c_char,
+    width: i32,
+    height: i32,
+) -> *mut c_void {
+    if instance_id.is_null() || width <= 0 || height <= 0 {
+        return ptr::null_mut();
+    }
+    let instance_id = unsafe { CStr::from_ptr(instance_id) }.to_string_lossy();
+    mycelium_display::lvgl_v9::lvgl_v9_init_sdl(&instance_id, width, height)
+}
+
+/// Captures an LVGL SDL display as a newly allocated packed RGB565 buffer.
+///
+/// The caller owns the returned allocation and must release it with
+/// [`meshemu_display_capture_free`], passing the value written to `size_out`.
+///
+/// # Safety
+///
+/// `display` must be null or a live LVGL SDL display. `size_out` must be null
+/// or point to writable memory for one `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_display_capture(
+    display: *mut c_void,
+    size_out: *mut usize,
+) -> *mut u8 {
+    if !size_out.is_null() {
+        unsafe { *size_out = 0 };
+    }
+    if display.is_null() || size_out.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(pixels) = (unsafe { mycelium_display::lvgl_v9::capture_lvgl_rgb565(display) }) else {
+        return ptr::null_mut();
+    };
+    let mut pixels = pixels.into_boxed_slice();
+    let len = pixels.len();
+    let data = pixels.as_mut_ptr();
+    std::mem::forget(pixels);
+    unsafe { *size_out = len };
+    data
+}
+
+/// Releases a buffer returned by [`meshemu_display_capture`].
+///
+/// # Safety
+///
+/// `data` must be null or a pointer returned by `meshemu_display_capture` with
+/// the exact corresponding `size`.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_display_capture_free(data: *mut u8, size: usize) {
+    if data.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(data, size)));
+    }
+}
+
 /// Creates a radio and registers its node with the process-wide radio bus.
 ///
 /// Returns null when the identifier or radio configuration is invalid, or when
