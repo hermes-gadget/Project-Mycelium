@@ -88,7 +88,7 @@ struct InstancePeripherals {
 }
 
 fn create_peripherals(id: &str, config: &InstanceConfig) -> Result<InstancePeripherals> {
-    let storage = StorageManager::new(id);
+    let mut storage = StorageManager::new(id);
     storage.init_all()?;
     let gps = GpsManager::new(config.gps.latitude, config.gps.longitude);
     let board = VirtualBoard::new(
@@ -295,7 +295,8 @@ mod tests {
         let id = format!("peripheral-test-{}", std::process::id());
         let peripherals = create_peripherals(&id, &config).unwrap();
 
-        assert!(peripherals.storage.spiffs_path().is_dir());
+        assert!(peripherals.storage.spiffs.is_mounted());
+        assert!(peripherals.storage.sdcard.is_mounted());
         assert_eq!(
             (
                 peripherals.gps.state().latitude,
