@@ -20,13 +20,16 @@ git submodule update --init ../../lib/meshcore
 make
 ```
 
-The submodule command is only needed once per checkout. The build produces
-`firmware.so`. The equivalent CMake build is:
+The submodule command is only needed once per checkout. `make` builds the Rust
+RadioBus bridge and the small set of MeshCore sources used by the example, then
+produces `firmware.so`. The equivalent CMake build is:
 
 ```sh
 cmake -S . -B build
 cmake --build build
 ```
+
+The CMake build writes `build/firmware.so`.
 
 ## Run
 
