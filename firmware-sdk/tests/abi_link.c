@@ -42,7 +42,7 @@ int main(void)
     (void)meshemu_input_poll_touch(id);
     (void)meshemu_input_poll_key(id);
     void* keyboard = meshemu_i2c_keyboard_create();
-    meshemu_i2c_keyboard_inject_key_byte(keyboard, b'q');
+    meshemu_i2c_keyboard_inject_key_byte(keyboard, 'q');
     void* wire = meshemu_wire_shim_create();
     meshemu_wire_shim_set_keyboard(wire, keyboard);
     meshemu_wire_begin_transmission(wire, 0x55);
