@@ -16,10 +16,12 @@ receives it.
 From this directory:
 
 ```sh
+git submodule update --init ../../lib/meshcore
 make
 ```
 
-The build produces `firmware.so`. The equivalent CMake build is:
+The submodule command is only needed once per checkout. The build produces
+`firmware.so`. The equivalent CMake build is:
 
 ```sh
 cmake -S . -B build
