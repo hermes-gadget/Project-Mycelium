@@ -27,7 +27,10 @@ pub const BATTERY_ADC_GPIO: u8 = 4;
 pub const PERIPH_PWR_EN_GPIO: u8 = 10;
 pub const BUZZER_GPIO: u8 = 46;
 pub const ADC_MAX_COUNT: u16 = 4_095;
-pub const BATTERY_MV_PER_ADC_COUNT: f64 = 1.61;
+pub const ADC_REFERENCE_MV: f64 = 3_300.0;
+pub const BATTERY_DIVIDER_RATIO: f64 = 2.0;
+pub const BATTERY_MV_PER_ADC_COUNT: f64 =
+    ADC_REFERENCE_MV * BATTERY_DIVIDER_RATIO / (ADC_MAX_COUNT as f64 + 1.0);
 pub const TP4054_FULL_MV: u16 = 4_200;
 pub const DEFAULT_PSRAM_SIZE_BYTES: u32 = 8_388_608;
 pub const SLEEP_WAKE_CAUSE_UNKNOWN: u8 = 0;
@@ -36,6 +39,13 @@ pub const SLEEP_WAKE_CAUSE_EXT1: u8 = 2;
 pub const SLEEP_WAKE_CAUSE_TIMER_EXT1: u8 = 3;
 
 static LAST_BOOT_PHASE: AtomicU8 = AtomicU8::new(0);
+
+// Representative ESP32-S3 ADC1 11 dB eFuse calibration point. Combined with
+// Espressif's curve-fit coefficients below, a 2.1 V GPIO4 divider input
+// produces about 2345 raw counts and reproduces the documented 4.2 V → 3.78 V
+// failure of the naive 3.3 V / 4096 conversion.
+const ADC_EFUSE_CAL_VOLTAGE_MV: f64 = 850.0;
+const ADC_EFUSE_CAL_RAW_COUNT: f64 = 929.0;
 
 static PERIPHERAL_POWER: LazyLock<Mutex<HashMap<String, bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -85,6 +95,7 @@ pub struct VirtualBoard {
     pub startup_reason: u8,
     pub external_powered: bool,
     pub periph_pwr_enabled: bool,
+    pub adc_calibrated: bool,
     pub instance_id: String,
     psram_used_bytes: u32,
     psram_region: Vec<u8>,
@@ -103,6 +114,7 @@ impl VirtualBoard {
             startup_reason: config.startup_reason,
             external_powered: config.external_powered,
             periph_pwr_enabled: config.periph_pwr_enabled,
+            adc_calibrated: config.adc_calibrated,
             instance_id: instance_id.to_owned(),
             psram_used_bytes: 0,
             psram_region: Vec::new(),
@@ -115,12 +127,26 @@ impl VirtualBoard {
         self.battery_mv
     }
 
-    /// Reads the 12-bit ADC wired to the battery divider on GPIO4.
+    /// Reads a 12-bit ADC count from the battery divider on GPIO4.
+    ///
+    /// Uncalibrated mode exposes the nonlinear ESP32-S3 raw count. Calibrated
+    /// mode applies the same ADC1/11 dB curve fitting used by
+    /// `analogReadMilliVolts()` and returns the equivalent linearized count.
     pub fn get_adc(&self, gpio: u8) -> u16 {
         if gpio != BATTERY_ADC_GPIO {
             return 0;
         }
-        (f64::from(self.battery_mv) / BATTERY_MV_PER_ADC_COUNT)
+        let pin_mv = f64::from(self.battery_mv) / BATTERY_DIVIDER_RATIO;
+        let raw_count = s3_raw_count_for_pin_mv(pin_mv);
+        if !self.adc_calibrated {
+            return raw_count;
+        }
+        if raw_count == ADC_MAX_COUNT && pin_mv >= s3_calibrated_pin_mv(ADC_MAX_COUNT) {
+            return ADC_MAX_COUNT;
+        }
+
+        let corrected_battery_mv = s3_calibrated_pin_mv(raw_count) * BATTERY_DIVIDER_RATIO;
+        (corrected_battery_mv / BATTERY_MV_PER_ADC_COUNT)
             .round()
             .clamp(0.0, f64::from(ADC_MAX_COUNT)) as u16
     }
@@ -196,6 +222,10 @@ impl VirtualBoard {
 
     pub fn rtc_gpio_hold_level(&self, gpio: u8) -> Option<bool> {
         self.rtc_gpio_holds.get(&gpio).copied()
+    }
+
+    pub fn set_adc_calibration(&mut self, calibrated: bool) {
+        self.adc_calibrated = calibrated;
     }
 
     pub fn set_external_power(&mut self, powered: bool) {
@@ -297,6 +327,7 @@ pub struct BoardConfig {
     pub startup_reason: u8,
     pub external_powered: bool,
     pub periph_pwr_enabled: bool,
+    pub adc_calibrated: bool,
 }
 
 impl Default for BoardConfig {
@@ -308,7 +339,51 @@ impl Default for BoardConfig {
             startup_reason: BD_STARTUP_NORMAL,
             external_powered: false,
             periph_pwr_enabled: true,
+            adc_calibrated: true,
         }
+    }
+}
+
+/// Espressif's ESP32-S3 ADC1/11 dB curve-fit error polynomial.
+fn s3_adc_error_mv(first_step_mv: f64) -> f64 {
+    let x = first_step_mv;
+    -0.644_403_418_269_478 - 0.064_433_488_864_753_6 * x + 0.000_129_789_144_761_1 * x.powi(2)
+        - 0.000_000_070_769_718 * x.powi(3)
+        + 0.000_000_000_013_515 * x.powi(4)
+}
+
+fn s3_calibrated_pin_mv(raw_count: u16) -> f64 {
+    if raw_count == 0 {
+        return 0.0;
+    }
+    let first_step_mv = f64::from(raw_count) * ADC_EFUSE_CAL_VOLTAGE_MV / ADC_EFUSE_CAL_RAW_COUNT;
+    first_step_mv - s3_adc_error_mv(first_step_mv)
+}
+
+fn s3_raw_count_for_pin_mv(pin_mv: f64) -> u16 {
+    if !pin_mv.is_finite() || pin_mv <= 0.0 {
+        return 0;
+    }
+    if pin_mv >= s3_calibrated_pin_mv(ADC_MAX_COUNT) {
+        return ADC_MAX_COUNT;
+    }
+
+    let mut low = 0_u16;
+    let mut high = ADC_MAX_COUNT;
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if s3_calibrated_pin_mv(middle) < pin_mv {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    let low_error = (s3_calibrated_pin_mv(low) - pin_mv).abs();
+    let high_error = (s3_calibrated_pin_mv(high) - pin_mv).abs();
+    if low_error <= high_error {
+        low
+    } else {
+        high
     }
 }
 
@@ -324,7 +399,7 @@ mod tests {
         board.set_battery(3_750);
 
         assert_eq!(board.get_battery_mv(), 3_750);
-        assert_eq!(board.get_adc(BATTERY_ADC_GPIO), 2_329);
+        assert_eq!(board.get_adc(BATTERY_ADC_GPIO), 2_327);
         assert_eq!(board.get_adc(5), 0);
         assert_eq!(board.get_temperature(), 35.0);
     }
@@ -393,10 +468,30 @@ mod tests {
     #[test]
     fn battery_adc_quantizes_and_saturates_at_twelve_bits() {
         let mut board = VirtualBoard::new("adc-node", BoardConfig::default());
-        assert_eq!(board.get_adc(BATTERY_ADC_GPIO), 2_422);
+        assert!(board.adc_calibrated);
+        assert_eq!(board.get_adc(BATTERY_ADC_GPIO), 2_420);
 
         board.set_battery(u16::MAX);
         assert_eq!(board.get_adc(BATTERY_ADC_GPIO), ADC_MAX_COUNT);
+    }
+
+    #[test]
+    fn adc_curve_reproduces_uncalibrated_full_cell_under_read() {
+        let mut board = VirtualBoard::new(
+            "adc-curve-node",
+            BoardConfig {
+                battery_mv: TP4054_FULL_MV,
+                ..BoardConfig::default()
+            },
+        );
+
+        board.set_adc_calibration(false);
+        let uncalibrated_mv = f64::from(board.get_adc(BATTERY_ADC_GPIO)) * BATTERY_MV_PER_ADC_COUNT;
+        assert!((uncalibrated_mv - 3_780.0).abs() < 5.0);
+
+        board.set_adc_calibration(true);
+        let calibrated_mv = f64::from(board.get_adc(BATTERY_ADC_GPIO)) * BATTERY_MV_PER_ADC_COUNT;
+        assert!((calibrated_mv - 4_200.0).abs() < 5.0);
     }
 
     #[test]

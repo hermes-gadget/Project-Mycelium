@@ -111,6 +111,14 @@ Keep `firmware_loop()` non-blocking so Mycelium can advance every virtual node
 and process UI, radio, and input events each frame. A headless firmware should
 return `NULL` from `firmware_get_display()`.
 
+### T-Deck DIO2 RF switch
+
+Radio handles default DIO2 RF-switch control to `false`, matching upstream
+SX1262 libraries. T-Deck firmware must call
+`meshemu_radio_set_dio2_config(radio, true)` during radio setup to match
+Wadamesh/Meshtastic hardware configuration. Leaving it disabled models the
+real antenna-path penalty: 16 dB TX loss and 3 dB RX loss.
+
 ## Display memory and fidelity
 
 Display capture returns packed RGB565 in host-native `uint16_t` byte order,

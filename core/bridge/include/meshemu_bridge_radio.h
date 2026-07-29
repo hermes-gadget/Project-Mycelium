@@ -21,6 +21,11 @@ uint32_t meshemu_radio_get_est_airtime(void* radio, int32_t len);
 float meshemu_radio_get_rssi(void* radio);
 float meshemu_radio_get_snr(void* radio);
 bool meshemu_radio_is_send_complete(void* radio);
+// Upstream SX1262 libraries default DIO2 RF-switch control off. T-Deck
+// firmware must enable it to match Wadamesh/Meshtastic and avoid 16 dB TX /
+// 3 dB RX antenna-path loss.
+void meshemu_radio_set_dio2_config(void* radio, bool as_rf_switch);
+bool meshemu_radio_get_dio2_config(void* radio);
 void meshemu_radio_set_position(void* radio, double lat, double lon);
 void meshemu_radio_destroy(void* radio);
 void meshemu_bus_tick(uint64_t now_ms);

@@ -11,6 +11,18 @@ pub const TDECK_SDCARD_CS_PIN: u8 = 39;
 pub const SDHC_MAX_CAPACITY: u64 = 32 * 1_024 * 1_024 * 1_024;
 pub const FAT32_MAX_VOLUME_SIZE: u64 = 32 * 1_024 * 1_024 * 1_024;
 pub const FAT32_MAX_FILE_SIZE: u64 = (4 * 1_024 * 1_024 * 1_024) - 1;
+pub const SD_FAST_INIT_HZ: u32 = 4_000_000;
+pub const SD_SLOW_INIT_HZ: u32 = 400_000;
+/// Wadamesh's cold-card mount ladder: `(settling delay, SPI clock)`.
+pub const SD_INIT_LADDER: [(u32, u32); 7] = [
+    (40, SD_FAST_INIT_HZ),
+    (120, SD_FAST_INIT_HZ),
+    (200, SD_FAST_INIT_HZ),
+    (300, 1_000_000),
+    (450, 1_000_000),
+    (650, SD_SLOW_INIT_HZ),
+    (900, SD_SLOW_INIT_HZ),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SdPartitionTable {
@@ -38,6 +50,10 @@ pub struct VirtualSdCard {
     mounted: bool,
     capacity: u64,
     lora_cs_high: bool,
+    pub requires_slow_init: bool,
+    pub wake_delay_ms: u32,
+    last_init_elapsed_ms: u32,
+    last_init_frequency_hz: Option<u32>,
 }
 
 impl VirtualSdCard {
@@ -72,6 +88,10 @@ impl VirtualSdCard {
             capacity,
             // The LoRa device is deselected while the bus is idle.
             lora_cs_high: true,
+            requires_slow_init: false,
+            wake_delay_ms: 0,
+            last_init_elapsed_ms: 0,
+            last_init_frequency_hz: None,
         }
     }
 
@@ -103,13 +123,65 @@ impl VirtualSdCard {
         self.lora_cs_high
     }
 
-    /// Mounts an SDHC/FAT32 volume when LoRa has released the shared SPI bus.
+    /// Configures whether this card needs the slow-clock wake-up ladder.
+    pub fn set_behavior(&mut self, requires_slow_init: bool, wake_delay_ms: u32) {
+        if self.requires_slow_init != requires_slow_init || self.wake_delay_ms != wake_delay_ms {
+            self.mounted = false;
+        }
+        self.requires_slow_init = requires_slow_init;
+        self.wake_delay_ms = wake_delay_ms;
+    }
+
+    pub fn last_init_elapsed_ms(&self) -> u32 {
+        self.last_init_elapsed_ms
+    }
+
+    pub fn last_init_frequency_hz(&self) -> Option<u32> {
+        self.last_init_frequency_hz
+    }
+
+    /// Attempts a fast 4 MHz mount without a retry delay.
     pub fn mount(&mut self) -> Result<bool, io::Error> {
+        self.mount_at_frequency(SD_FAST_INIT_HZ, 0)
+    }
+
+    /// Simulates one `SD.begin()` attempt after the supplied settling time.
+    pub fn mount_at_frequency(
+        &mut self,
+        clock_hz: u32,
+        elapsed_wake_ms: u32,
+    ) -> Result<bool, io::Error> {
         self.ensure_bus_available()?;
         self.validate_capacity()?;
+        if clock_hz == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD initialization clock must be nonzero",
+            ));
+        }
+        self.last_init_elapsed_ms = elapsed_wake_ms;
+        self.last_init_frequency_hz = Some(clock_hz);
+        if self.requires_slow_init
+            && (clock_hz > SD_SLOW_INIT_HZ || elapsed_wake_ms < self.wake_delay_ms)
+        {
+            self.mounted = false;
+            return Ok(false);
+        }
         fs::create_dir_all(&self.base_path)?;
         self.mounted = true;
         Ok(true)
+    }
+
+    /// Runs the same 4 MHz → 1 MHz → 400 kHz retry ladder as Wadamesh.
+    pub fn mount_with_retry_ladder(&mut self) -> Result<bool, io::Error> {
+        let mut elapsed_wake_ms = 0_u32;
+        for (settle_ms, clock_hz) in SD_INIT_LADDER {
+            elapsed_wake_ms = elapsed_wake_ms.saturating_add(settle_ms);
+            if self.mount_at_frequency(clock_hz, elapsed_wake_ms)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn unmount(&mut self) {

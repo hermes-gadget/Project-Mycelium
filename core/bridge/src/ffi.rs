@@ -1,14 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use mycelium_board::partition::{
-    active_partition_table, get_partition_table, register_partition_table,
-};
 use mycelium_board::{
-    get_nvs, peripherals_powered, register_nvs, remove_nvs, BoardConfig, Tp4054State, VirtualBoard,
-    LAUNCHER_NVS_SIZE, STANDALONE_NVS_SIZE,
+    peripherals_powered, BoardConfig, Tp4054State, VirtualBoard, SLEEP_WAKE_CAUSE_EXT1,
+    SLEEP_WAKE_CAUSE_TIMER, SLEEP_WAKE_CAUSE_UNKNOWN,
 };
 use mycelium_gps::GpsManager;
 use mycelium_input::i2c_keyboard::I2cKeyboardBus;
@@ -22,6 +20,8 @@ struct BusState {
     bus: RadioBus,
     node_ids: HashSet<String>,
     now_ms: u64,
+    sleep_requests: HashMap<String, (u64, u64, u32, u64, bool)>,
+    last_wake_cause: u8,
 }
 
 impl BusState {
@@ -30,13 +30,15 @@ impl BusState {
             bus: RadioBus::new(),
             node_ids: HashSet::new(),
             now_ms: 0,
+            sleep_requests: HashMap::new(),
+            last_wake_cause: SLEEP_WAKE_CAUSE_UNKNOWN,
         }
     }
 }
 
 struct RadioHandle {
     node_id: String,
-    radio: Sx1262State,
+    radio: Mutex<Sx1262State>,
     pending: Mutex<VecDeque<RxPacket>>,
     last_rx: Mutex<Option<(f32, f32)>>,
 }
@@ -49,6 +51,8 @@ struct GpsHandle {
 static BUS: LazyLock<Mutex<BusState>> = LazyLock::new(|| Mutex::new(BusState::new()));
 static STORAGE: LazyLock<Mutex<HashMap<String, StorageManager>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static SDCARD_REQUIRES_SLOW_INIT: AtomicBool = AtomicBool::new(false);
+static SDCARD_WAKE_DELAY_MS: AtomicU32 = AtomicU32::new(0);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -83,18 +87,6 @@ unsafe fn storage_file_args<'a>(
     Some((unsafe { ffi_string(instance_id) }?, unsafe {
         ffi_string(path)
     }?))
-}
-
-unsafe fn nvs_args<'a>(
-    instance_id: *const c_char,
-    namespace: *const c_char,
-    key: *const c_char,
-) -> Option<(&'a str, &'a str, &'a str)> {
-    Some((
-        unsafe { ffi_string(instance_id) }?,
-        unsafe { ffi_string(namespace) }?,
-        unsafe { ffi_string(key) }?,
-    ))
 }
 
 fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
@@ -153,342 +145,6 @@ fn sx1262_state(
     // arithmetic across the FFI boundary.
     let channel = RadioChannel::new(freq_mhz, bandwidth_khz, spreading_factor, coding_rate)?;
     Sx1262State::new(channel, tx_power_dbm)
-}
-
-/// Opens or reconfigures persistent NVS for one emulator instance.
-///
-/// # Safety
-///
-/// `instance_id` must point to a valid NUL-terminated string for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_init(instance_id: *const c_char, size_bytes: u32) -> bool {
-    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
-        return false;
-    };
-    register_nvs(instance_id, size_bytes).is_ok()
-}
-
-/// Reports whether a key exists in an NVS namespace.
-///
-/// # Safety
-///
-/// All string pointers must be valid NUL-terminated strings for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_exists(
-    instance_id: *const c_char,
-    namespace: *const c_char,
-    key: *const c_char,
-) -> bool {
-    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
-    else {
-        return false;
-    };
-    let Some(nvs) = get_nvs(instance_id) else {
-        return false;
-    };
-    let mut nvs = lock(&nvs);
-    let found = nvs.begin(namespace, true) && nvs.exists(key);
-    nvs.end();
-    found
-}
-
-/// Reads a bool, returning `default_value` for a missing key or type mismatch.
-///
-/// # Safety
-///
-/// All string pointers must be valid NUL-terminated strings for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_get_bool(
-    instance_id: *const c_char,
-    namespace: *const c_char,
-    key: *const c_char,
-    default_value: bool,
-) -> bool {
-    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
-    else {
-        return default_value;
-    };
-    let Some(nvs) = get_nvs(instance_id) else {
-        return default_value;
-    };
-    let mut nvs = lock(&nvs);
-    let value = if nvs.begin(namespace, true) {
-        nvs.get_bool(key, default_value)
-    } else {
-        default_value
-    };
-    nvs.end();
-    value
-}
-
-/// Writes a bool to a namespace, creating that namespace when needed.
-///
-/// # Safety
-///
-/// All string pointers must be valid NUL-terminated strings for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_put_bool(
-    instance_id: *const c_char,
-    namespace: *const c_char,
-    key: *const c_char,
-    value: bool,
-) -> bool {
-    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
-    else {
-        return false;
-    };
-    let Some(nvs) = get_nvs(instance_id) else {
-        return false;
-    };
-    let mut nvs = lock(&nvs);
-    let written = nvs.begin(namespace, false) && nvs.try_put_bool(key, value);
-    nvs.end();
-    written
-}
-
-/// Copies a string value into `buffer` and returns its full byte length.
-///
-/// The output is always NUL-terminated when `buffer_len` is nonzero. A small
-/// buffer receives a truncated string while the return value still reports the
-/// full size required (excluding the terminator).
-///
-/// # Safety
-///
-/// Input strings must be valid and NUL-terminated. `buffer` must reference
-/// `buffer_len` writable bytes, or may be null when `buffer_len` is zero.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_get_string(
-    instance_id: *const c_char,
-    namespace: *const c_char,
-    key: *const c_char,
-    default_value: *const c_char,
-    buffer: *mut c_char,
-    buffer_len: usize,
-) -> usize {
-    if !buffer.is_null() && buffer_len != 0 {
-        unsafe { *buffer = 0 };
-    }
-    if buffer.is_null() && buffer_len != 0 {
-        return 0;
-    }
-    let default_value = if default_value.is_null() {
-        ""
-    } else {
-        let Ok(value) = (unsafe { CStr::from_ptr(default_value) }).to_str() else {
-            return 0;
-        };
-        value
-    };
-    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
-    else {
-        return 0;
-    };
-    let value = get_nvs(instance_id)
-        .map(|nvs| {
-            let mut nvs = lock(&nvs);
-            let value = if nvs.begin(namespace, true) {
-                nvs.get_string(key, default_value)
-            } else {
-                default_value.to_owned()
-            };
-            nvs.end();
-            value
-        })
-        .unwrap_or_else(|| default_value.to_owned());
-    if !buffer.is_null() && buffer_len != 0 {
-        let copied = value.len().min(buffer_len - 1);
-        unsafe {
-            ptr::copy_nonoverlapping(value.as_ptr(), buffer.cast::<u8>(), copied);
-            *buffer.add(copied) = 0;
-        }
-    }
-    value.len()
-}
-
-/// Writes a UTF-8 string to a namespace.
-///
-/// # Safety
-///
-/// All string pointers must be valid NUL-terminated strings for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_put_string(
-    instance_id: *const c_char,
-    namespace: *const c_char,
-    key: *const c_char,
-    value: *const c_char,
-) -> bool {
-    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
-    else {
-        return false;
-    };
-    let Some(value) = (unsafe { ffi_string_allow_empty(value) }) else {
-        return false;
-    };
-    let Some(nvs) = get_nvs(instance_id) else {
-        return false;
-    };
-    let mut nvs = lock(&nvs);
-    let written = nvs.begin(namespace, false) && nvs.try_put_string(key, value);
-    nvs.end();
-    written
-}
-
-/// Removes one key from an NVS namespace.
-///
-/// # Safety
-///
-/// All string pointers must be valid NUL-terminated strings for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_remove(
-    instance_id: *const c_char,
-    namespace: *const c_char,
-    key: *const c_char,
-) -> bool {
-    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
-    else {
-        return false;
-    };
-    let Some(nvs) = get_nvs(instance_id) else {
-        return false;
-    };
-    let mut nvs = lock(&nvs);
-    let removed = nvs.begin(namespace, false) && nvs.remove(key);
-    nvs.end();
-    removed
-}
-
-/// Drops the live NVS handle while preserving its crash-durable JSON image.
-///
-/// # Safety
-///
-/// `instance_id` must point to a valid NUL-terminated string for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_nvs_destroy(instance_id: *const c_char) -> bool {
-    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
-        return false;
-    };
-    remove_nvs(instance_id).is_some()
-}
-
-/// Switches one instance between standalone and Launcher flash geometry.
-///
-/// # Safety
-///
-/// `instance_id` must point to a valid NUL-terminated string for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_partition_set_launcher_mode(
-    instance_id: *const c_char,
-    enabled: bool,
-) -> bool {
-    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
-        return false;
-    };
-    let nvs_size = if enabled {
-        LAUNCHER_NVS_SIZE
-    } else {
-        STANDALONE_NVS_SIZE
-    };
-    if register_nvs(instance_id, nvs_size).is_err() {
-        return false;
-    }
-    register_partition_table(instance_id, enabled);
-    true
-}
-
-/// Finds the first matching entry in the currently active firmware table.
-///
-/// # Safety
-///
-/// Both output pointers must point to writable `u32` values.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_partition_find_first(
-    partition_type: u8,
-    subtype: u8,
-    address_out: *mut u32,
-    size_out: *mut u32,
-) -> bool {
-    unsafe {
-        write_partition_result(
-            active_partition_table(),
-            partition_type,
-            subtype,
-            address_out,
-            size_out,
-        )
-    }
-}
-
-/// Finds a partition for a specific virtual node without changing activation.
-///
-/// # Safety
-///
-/// `instance_id` and both output pointers must be valid for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_partition_find_first_for_instance(
-    instance_id: *const c_char,
-    partition_type: u8,
-    subtype: u8,
-    address_out: *mut u32,
-    size_out: *mut u32,
-) -> bool {
-    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
-        return false;
-    };
-    let Some(table) = get_partition_table(instance_id) else {
-        return false;
-    };
-    let table = lock(&table).clone();
-    unsafe { write_partition_result(table, partition_type, subtype, address_out, size_out) }
-}
-
-/// Returns the otadata address in the currently active firmware table.
-#[no_mangle]
-pub extern "C" fn meshemu_get_otadata_address() -> u32 {
-    active_partition_table().otadata_address().unwrap_or(0)
-}
-
-/// Applies the same dual-signal Launcher detection used by real firmware.
-///
-/// # Safety
-///
-/// `instance_id` must point to a valid NUL-terminated string for this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_is_under_launcher(instance_id: *const c_char) -> bool {
-    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
-        return false;
-    };
-    get_partition_table(instance_id).is_some_and(|table| lock(&table).is_under_launcher())
-}
-
-unsafe fn ffi_string_allow_empty<'a>(value: *const c_char) -> Option<&'a str> {
-    if value.is_null() {
-        return None;
-    }
-    unsafe { CStr::from_ptr(value) }.to_str().ok()
-}
-
-unsafe fn write_partition_result(
-    table: mycelium_board::VirtualPartitionTable,
-    partition_type: u8,
-    subtype: u8,
-    address_out: *mut u32,
-    size_out: *mut u32,
-) -> bool {
-    if address_out.is_null() || size_out.is_null() {
-        return false;
-    }
-    unsafe {
-        *address_out = 0;
-        *size_out = 0;
-    }
-    let Some(partition) = table.find_first(partition_type, subtype) else {
-        return false;
-    };
-    unsafe {
-        *address_out = partition.address;
-        *size_out = partition.size;
-    }
-    true
 }
 
 /// Mounts the virtual SPIFFS partition for an emulator instance.
@@ -582,13 +238,28 @@ pub unsafe extern "C" fn meshemu_sdcard_init(instance_id: *const c_char) -> bool
     if !peripherals_powered(instance_id) {
         return false;
     }
+    let requires_slow_init = SDCARD_REQUIRES_SLOW_INIT.load(Ordering::Relaxed);
+    let wake_delay_ms = SDCARD_WAKE_DELAY_MS.load(Ordering::Relaxed);
     let mut storage = lock(&STORAGE);
-    storage
+    let sdcard = &mut storage
         .entry(instance_id.to_owned())
         .or_insert_with(|| StorageManager::new(instance_id))
-        .sdcard
-        .mount()
-        .is_ok()
+        .sdcard;
+    sdcard.set_behavior(requires_slow_init, wake_delay_ms);
+    sdcard.mount_with_retry_ladder().unwrap_or(false)
+}
+
+/// Configures the process-wide virtual SD-card personality.
+///
+/// Slow cards reject 4 MHz and 1 MHz initialization and only mount on a
+/// 400 kHz ladder step after at least `wake_delay_ms` of cumulative settling.
+#[no_mangle]
+pub extern "C" fn meshemu_sdcard_set_behavior(slow_init: bool, wake_delay_ms: u32) {
+    SDCARD_REQUIRES_SLOW_INIT.store(slow_init, Ordering::Relaxed);
+    SDCARD_WAKE_DELAY_MS.store(wake_delay_ms, Ordering::Relaxed);
+    for manager in lock(&STORAGE).values_mut() {
+        manager.sdcard.set_behavior(slow_init, wake_delay_ms);
+    }
 }
 
 /// Reads an SD card file into a caller-owned allocation.
@@ -752,7 +423,9 @@ pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_le
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
     if let Some(gps) = unsafe { gps_mut(gps) } {
-        gps.manager.tick(delta_ms);
+        if peripherals_powered(&gps.instance_id) {
+            gps.manager.tick(delta_ms);
+        }
     }
 }
 
@@ -837,6 +510,60 @@ pub unsafe extern "C" fn meshemu_board_get_temp(board: *mut c_void) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Reports whether external PSRAM is installed.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_found(board: *mut c_void) -> bool {
+    unsafe { board_ref(board) }.is_some_and(VirtualBoard::psram_found)
+}
+
+/// Returns bytes still allocatable from the simulated external PSRAM heap.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_psram_free(board: *mut c_void) -> u32 {
+    unsafe { board_ref(board) }
+        .map(VirtualBoard::psram_free_bytes)
+        .unwrap_or(0)
+}
+
+/// Writes and verifies a deterministic pattern in simulated PSRAM.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_readback_test(board: *mut c_void) -> bool {
+    unsafe { board_mut(board) }.is_some_and(VirtualBoard::psram_readback_test)
+}
+
+/// Reserves simulated PSRAM for a firmware allocation.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_reserve(board: *mut c_void, bytes: u32) -> bool {
+    unsafe { board_mut(board) }.is_some_and(|board| board.reserve_psram(bytes))
+}
+
+/// Releases a previous simulated PSRAM reservation.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_release(board: *mut c_void, bytes: u32) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.release_psram(bytes);
+    }
+}
+
 /// # Safety
 ///
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
@@ -844,6 +571,18 @@ pub unsafe extern "C" fn meshemu_board_get_temp(board: *mut c_void) -> f32 {
 pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) {
     if let Some(board) = unsafe { board_mut(board) } {
         board.set_battery(mv);
+    }
+}
+
+/// Selects calibrated `analogReadMilliVolts()`-equivalent ADC behavior.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_adc_calibration(board: *mut c_void, calibrated: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.set_adc_calibration(calibrated);
     }
 }
 
@@ -856,6 +595,18 @@ pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) 
 pub unsafe extern "C" fn meshemu_board_digital_write(board: *mut c_void, gpio: u8, high: bool) {
     if let Some(board) = unsafe { board_mut(board) } {
         board.digital_write(gpio, high);
+    }
+}
+
+/// Drives GPIO10, the active-HIGH T-Deck peripheral power rail.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_periph_power(board: *mut c_void, enabled: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.digital_write(mycelium_board::PERIPH_PWR_EN_GPIO, enabled);
     }
 }
 
@@ -911,6 +662,84 @@ pub unsafe extern "C" fn meshemu_board_get_charger_state(board: *mut c_void) -> 
         .unwrap_or(Tp4054State::NoBattery as u8)
 }
 
+/// Holds one RTC-capable GPIO at `level` across deep sleep.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_rtc_gpio_hold(board: *mut c_void, gpio: u8, level: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.rtc_gpio_hold(gpio, level);
+    }
+}
+
+/// Enters and completes one synchronous virtual deep-sleep interval.
+///
+/// Bus time advances by `sleep_secs`; the instance radio drops packets that
+/// finish during that interval. A nonzero wake mask models an EXT1 wake
+/// source, so the reported wake cause is a bitwise combination of timer and
+/// EXT1 flags.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_deep_sleep(
+    instance_id: *const c_char,
+    sleep_secs: u32,
+    wake_pin_mask: u64,
+) -> u64 {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return lock(&BUS).now_ms;
+    };
+
+    let wake_cause = if sleep_secs > 0 {
+        SLEEP_WAKE_CAUSE_TIMER
+    } else {
+        SLEEP_WAKE_CAUSE_UNKNOWN
+    } | if wake_pin_mask != 0 {
+        SLEEP_WAKE_CAUSE_EXT1
+    } else {
+        SLEEP_WAKE_CAUSE_UNKNOWN
+    };
+
+    let mut state = lock(&BUS);
+    let requested_at_ms = state.now_ms;
+    let wake_at_ms = requested_at_ms.saturating_add(u64::from(sleep_secs).saturating_mul(1_000));
+    state.sleep_requests.insert(
+        instance_id.to_owned(),
+        (requested_at_ms, wake_at_ms, sleep_secs, wake_pin_mask, true),
+    );
+    state.bus.set_receive_enabled(instance_id, false);
+    state.bus.tick(wake_at_ms);
+    state.now_ms = wake_at_ms;
+    state.bus.set_receive_enabled(instance_id, true);
+    if let Some(request) = state.sleep_requests.get_mut(instance_id) {
+        request.4 = false;
+    }
+    state.last_wake_cause = wake_cause;
+    wake_at_ms
+}
+
+/// Returns the wake-cause flags from the most recently completed sleep.
+#[no_mangle]
+pub extern "C" fn meshemu_board_get_sleep_wake_cause() -> u8 {
+    lock(&BUS).last_wake_cause
+}
+
+/// Persists the latest boot checkpoint across board-handle restarts.
+#[no_mangle]
+pub extern "C" fn meshemu_board_set_boot_phase(phase: u8) {
+    mycelium_board::set_boot_phase(phase);
+}
+
+/// Returns the latest persistent boot checkpoint.
+#[no_mangle]
+pub extern "C" fn meshemu_board_get_last_boot_phase() -> u8 {
+    mycelium_board::last_boot_phase()
+}
+
 /// Destroys a board handle.
 ///
 /// # Safety
@@ -942,6 +771,23 @@ pub unsafe extern "C" fn meshemu_i2c_keyboard_inject_key_byte(keyboard: *mut c_v
         return;
     };
     lock(keyboard).inject_key_byte(key_byte);
+}
+
+/// Configure whether the emulated C3 retains its backlight across host resets.
+///
+/// # Safety
+///
+/// `keyboard` must be null or a live keyboard handle returned by
+/// [`meshemu_i2c_keyboard_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_i2c_keyboard_set_cross_reset(
+    keyboard: *mut c_void,
+    persist: bool,
+) {
+    let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
+        return;
+    };
+    lock(keyboard).set_cross_reset_persist(persist);
 }
 
 /// Destroys a keyboard handle.
@@ -977,10 +823,13 @@ pub unsafe extern "C" fn meshemu_wire_shim_create_for_instance(
     let Some(manager) = (unsafe { input_manager(instance_id, true) }) else {
         return ptr::null_mut();
     };
-    let wire = manager
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .wire_shim();
+    let (mut wire, instance_id) = {
+        let manager = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (manager.wire_shim(), manager.instance_id().to_owned())
+    };
+    wire.set_peripheral_power_check(move || peripherals_powered(&instance_id));
     Box::into_raw(Box::new(wire)).cast()
 }
 
@@ -1021,6 +870,48 @@ pub unsafe extern "C" fn meshemu_wire_begin(wire: *mut c_void) -> bool {
 pub unsafe extern "C" fn meshemu_wire_set_clock(wire: *mut c_void, clock_hz: u32) {
     if let Some(wire) = unsafe { wire_mut(wire) } {
         wire.set_clock(clock_hz);
+    }
+}
+
+/// Return whether a device ACKs an address-only I2C probe.
+///
+/// # Safety
+///
+/// `wire` must be a live Wire shim handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_probe_address(wire: *mut c_void, address: u8) -> bool {
+    unsafe { wire_mut(wire) }.is_some_and(|wire| wire.probe_address(address))
+}
+
+/// Read the externally pulled-up idle levels of SDA and SCL.
+///
+/// Invalid handles report LOW to non-null outputs.
+///
+/// # Safety
+///
+/// `wire` must be null or a live Wire shim handle. Output pointers may be null,
+/// otherwise each must be valid for one `u8` write.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_wire_read_idle_levels(
+    wire: *mut c_void,
+    sda: *mut u8,
+    scl: *mut u8,
+) {
+    if !sda.is_null() {
+        unsafe { *sda = 0 };
+    }
+    if !scl.is_null() {
+        unsafe { *scl = 0 };
+    }
+    let Some(wire) = (unsafe { wire_mut(wire) }) else {
+        return;
+    };
+    let (sda_level, scl_level) = wire.idle_levels();
+    if !sda.is_null() {
+        unsafe { *sda = sda_level };
+    }
+    if !scl.is_null() {
+        unsafe { *scl = scl_level };
     }
 }
 
@@ -1186,6 +1077,84 @@ pub unsafe extern "C" fn meshemu_input_poll_touch(instance_id: *const c_char) ->
         return 0;
     };
     u64::from(event.x) | (u64::from(event.y) << 16) | (u64::from(event.pressure) << 32)
+}
+
+/// Return the latest touch coordinate before the historical portrait mapping.
+///
+/// Missing instances or touches report `(0, 0)`.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+/// Output pointers may be null, otherwise each must be valid for one `u16`
+/// write.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_get_touch_raw(
+    instance_id: *const c_char,
+    x: *mut u16,
+    y: *mut u16,
+) {
+    unsafe { write_touch_position(instance_id, x, y, false) };
+}
+
+/// Return the latest touch coordinate after the historical portrait mapping.
+///
+/// This is the same coordinate space returned by `meshemu_input_poll_touch`.
+/// Missing instances or touches report `(0, 0)`.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+/// Output pointers may be null, otherwise each must be valid for one `u16`
+/// write.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_get_touch_mapped(
+    instance_id: *const c_char,
+    x: *mut u16,
+    y: *mut u16,
+) {
+    unsafe { write_touch_position(instance_id, x, y, true) };
+}
+
+unsafe fn write_touch_position(instance_id: *const c_char, x: *mut u16, y: *mut u16, mapped: bool) {
+    if !x.is_null() {
+        unsafe { *x = 0 };
+    }
+    if !y.is_null() {
+        unsafe { *y = 0 };
+    }
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return;
+    };
+    let manager = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let position = if mapped {
+        manager.touch_mapped_position()
+    } else {
+        manager.touch_raw_position()
+    };
+    let Some((touch_x, touch_y)) = position else {
+        return;
+    };
+    if !x.is_null() {
+        unsafe { *x = touch_x };
+    }
+    if !y.is_null() {
+        unsafe { *y = touch_y };
+    }
+}
+
+/// Configure a GT911 failure mode for all live and future controllers.
+#[no_mangle]
+pub extern "C" fn meshemu_input_gt911_set_failure_mode(mode: u8, value: u32) {
+    mycelium_input::set_global_failure_mode(mode, value);
+}
+
+/// Return sticky watchdog-fired flags across live GT911 controllers.
+#[no_mangle]
+pub extern "C" fn meshemu_input_gt911_get_status() -> u64 {
+    mycelium_input::global_watchdog_status()
 }
 
 /// Polls one keyboard event, packed as row[0..7], col[8..15], pressed[16].
@@ -1420,7 +1389,7 @@ pub unsafe extern "C" fn meshemu_radio_create(
 
     Box::into_raw(Box::new(RadioHandle {
         node_id,
-        radio: radio_state,
+        radio: Mutex::new(radio_state),
         pending: Mutex::new(VecDeque::new()),
         last_rx: Mutex::new(None),
     })) as *mut c_void
@@ -1450,11 +1419,12 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     } else {
         unsafe { std::slice::from_raw_parts(data, len as usize) }
     };
+    let radio = lock(&handle.radio);
     let airtime_ms = propagation::airtime_ms(
         bytes.len(),
-        handle.radio.channel.spreading_factor,
-        handle.radio.channel.bandwidth_khz,
-        handle.radio.channel.coding_rate,
+        radio.channel.spreading_factor,
+        radio.channel.bandwidth_khz,
+        radio.channel.coding_rate,
         8,
         true,
     );
@@ -1462,9 +1432,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     let timestamp_ms = state.now_ms;
     state.bus.broadcast(TxEvent {
         node_id: handle.node_id.clone(),
-        channel: handle.radio.channel.clone(),
+        channel: radio.channel.clone(),
         data: bytes.to_vec(),
-        tx_power_dbm: handle.radio.tx_power_dbm,
+        tx_power_dbm: radio.tx_power_dbm,
         airtime_ms,
         position: (0.0, 0.0),
         timestamp_ms,
@@ -1532,11 +1502,12 @@ pub unsafe extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: 
     if len < 0 {
         return 0;
     }
+    let radio = lock(&handle.radio);
     propagation::airtime_ms(
         len as usize,
-        handle.radio.channel.spreading_factor,
-        handle.radio.channel.bandwidth_khz,
-        handle.radio.channel.coding_rate,
+        radio.channel.spreading_factor,
+        radio.channel.bandwidth_khz,
+        radio.channel.coding_rate,
         8,
         true,
     )
@@ -1589,6 +1560,39 @@ pub unsafe extern "C" fn meshemu_radio_set_position(radio: *mut c_void, lat: f64
     }
 }
 
+/// Configures whether DIO2 drives the T-Deck's external SX1262 RF switch.
+///
+/// Upstream-compatible radio handles start with this disabled. Wadamesh,
+/// Meshtastic, and other T-Deck firmware must set it to `true` for the normal
+/// antenna path; leaving it off applies 16 dB TX and 3 dB RX loss.
+///
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_radio_set_dio2_config(radio: *mut c_void, as_rf_switch: bool) {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return;
+    };
+    lock(&handle.radio).dio2_rf_switch_enabled = as_rf_switch;
+    lock(&BUS)
+        .bus
+        .set_dio2_as_rf_switch(&handle.node_id, as_rf_switch);
+}
+
+/// Returns whether DIO2 currently drives the external RF switch.
+///
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_radio_get_dio2_config(radio: *mut c_void) -> bool {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return false;
+    };
+    lock(&handle.radio).dio2_rf_switch_enabled
+}
+
 /// Destroys a radio handle. The caller must pass each non-null handle once.
 ///
 /// # Safety
@@ -1610,9 +1614,8 @@ pub unsafe extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
 /// Advances virtual radio time and expires completed transmissions.
 #[no_mangle]
 pub extern "C" fn meshemu_bus_tick(now_ms: u64) {
+    mycelium_input::tick_all_gt911(now_ms);
     let mut state = lock(&BUS);
-    // Host clocks can be reset or sampled out of order. Radio airtime and
-    // overlap decisions use a monotonic timeline, so clamp backward jumps.
     let monotonic_now_ms = state.now_ms.max(now_ms);
     state.now_ms = monotonic_now_ms;
     state.bus.tick(monotonic_now_ms);
@@ -1625,5 +1628,41 @@ pub(crate) fn reset_bus() {
 
 #[cfg(test)]
 pub(crate) unsafe fn radio_state(radio: *mut c_void) -> Option<Sx1262State> {
-    Some((unsafe { handle_ref(radio) })?.radio.clone())
+    Some(lock(&(unsafe { handle_ref(radio) })?.radio).clone())
+}
+
+#[cfg(test)]
+pub(crate) fn sleep_request(instance_id: &str) -> Option<(u64, u64, u32, u64, bool)> {
+    lock(&BUS).sleep_requests.get(instance_id).copied()
+}
+
+#[cfg(test)]
+mod input_ffi_tests {
+    use super::*;
+    use mycelium_input::KEYBOARD_BRIGHTNESS_COMMAND;
+
+    #[test]
+    fn c3_backlight_survives_keyboard_handle_recreation() {
+        let keyboard = meshemu_i2c_keyboard_create();
+        let wire = meshemu_wire_shim_create();
+        unsafe {
+            meshemu_wire_shim_set_keyboard(wire, keyboard);
+            assert!(meshemu_wire_begin(wire));
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_write(wire, KEYBOARD_BRIGHTNESS_COMMAND), 1);
+            assert_eq!(meshemu_wire_write(wire, 128), 1);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+            meshemu_wire_shim_destroy(wire);
+            meshemu_i2c_keyboard_destroy(keyboard);
+        }
+
+        let fresh = meshemu_i2c_keyboard_create();
+        let fresh_keyboard = unsafe { keyboard_ref(fresh) }.unwrap();
+        assert!(lock(fresh_keyboard).cross_reset_persist);
+        assert_eq!(lock(fresh_keyboard).backlight(), 128);
+        unsafe {
+            meshemu_i2c_keyboard_set_cross_reset(fresh, false);
+            meshemu_i2c_keyboard_destroy(fresh);
+        }
+    }
 }

@@ -6,6 +6,8 @@ pub const SX1262_DEFAULT_SPREADING_FACTOR: u8 = 9;
 pub const SX1262_DEFAULT_CODING_RATE: u8 = 5;
 pub const SX1262_DEFAULT_TX_POWER_DBM: f64 = 14.0;
 pub const SX1262_DEFAULT_TCXO_VOLTAGE_V: f32 = 1.8;
+pub const SX1262_DIO2_TX_LOSS_DB: f64 = 16.0;
+pub const SX1262_DIO2_RX_LOSS_DB: f64 = 3.0;
 
 /// Radio channel parameters (matches LoRa modulation settings).
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +61,9 @@ pub struct Sx1262State {
     pub channel: RadioChannel,
     pub tx_power_dbm: f64,
     /// DIO2 controls the external RF switch on the T-Deck radio board.
+    ///
+    /// This defaults to `false`, matching upstream SX1262 libraries. T-Deck
+    /// firmware must explicitly enable it to match Wadamesh and Meshtastic.
     pub dio2_rf_switch_enabled: bool,
     /// DIO3 supplies the TCXO at the configured voltage.
     pub dio3_tcxo_voltage_v: Option<f32>,
@@ -69,7 +74,7 @@ impl Sx1262State {
         (tx_power_dbm.is_finite() && (-17.0..=22.0).contains(&tx_power_dbm)).then_some(Self {
             channel,
             tx_power_dbm,
-            dio2_rf_switch_enabled: true,
+            dio2_rf_switch_enabled: false,
             dio3_tcxo_voltage_v: Some(SX1262_DEFAULT_TCXO_VOLTAGE_V),
         })
     }
@@ -80,7 +85,7 @@ impl Default for Sx1262State {
         Self {
             channel: RadioChannel::default(),
             tx_power_dbm: SX1262_DEFAULT_TX_POWER_DBM,
-            dio2_rf_switch_enabled: true,
+            dio2_rf_switch_enabled: false,
             dio3_tcxo_voltage_v: Some(SX1262_DEFAULT_TCXO_VOLTAGE_V),
         }
     }
@@ -154,7 +159,7 @@ mod tests {
         assert_eq!(state.channel.spreading_factor, 9);
         assert_eq!(state.channel.coding_rate, 5);
         assert_eq!(state.tx_power_dbm, 14.0);
-        assert!(state.dio2_rf_switch_enabled);
+        assert!(!state.dio2_rf_switch_enabled);
         assert_eq!(state.dio3_tcxo_voltage_v, Some(1.8));
     }
 
