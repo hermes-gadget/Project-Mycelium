@@ -1,6 +1,8 @@
 //! Board-level power, telemetry, and buzzer emulation.
 
 mod buzzer;
+pub mod nvs;
+pub mod partition;
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -8,6 +10,15 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 pub use buzzer::{
     get_buzzer, meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop,
     register_buzzer, remove_buzzer, SharedVirtualBuzzer, VirtualBuzzer,
+};
+pub use nvs::{
+    get_nvs, register_nvs, remove_nvs, SharedVirtualNvs, VirtualNvs, LAUNCHER_NVS_SIZE,
+    NVS_NAME_MAX_BYTES, STANDALONE_NVS_SIZE,
+};
+pub use partition::{
+    activate_partition_table, active_partition_table, get_partition_table,
+    register_partition_table, remove_partition_table, SharedVirtualPartitionTable,
+    VirtualPartition, VirtualPartitionTable,
 };
 
 pub const BD_STARTUP_NORMAL: u8 = 0;
