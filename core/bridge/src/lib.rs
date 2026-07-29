@@ -3,9 +3,11 @@
 mod ffi;
 
 pub use ffi::{
-    meshemu_board_create, meshemu_board_destroy, meshemu_board_get_battery, meshemu_board_get_temp,
-    meshemu_board_set_battery, meshemu_bus_tick, meshemu_display_capture,
-    meshemu_display_capture_free, meshemu_display_create, meshemu_display_create_ex,
+    meshemu_board_create, meshemu_board_destroy, meshemu_board_digital_write,
+    meshemu_board_get_adc, meshemu_board_get_battery, meshemu_board_get_charger_state,
+    meshemu_board_get_temp, meshemu_board_ledc_attach, meshemu_board_ledc_write,
+    meshemu_board_set_battery, meshemu_board_set_external_power, meshemu_bus_tick,
+    meshemu_display_capture, meshemu_display_capture_free, meshemu_display_create,
     meshemu_display_create_v, meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy,
     meshemu_gps_read, meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_tick,
     meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
@@ -16,11 +18,10 @@ pub use ffi::{
     meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
     meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_write,
     meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free,
-    meshemu_storage_destroy, meshemu_wire_available, meshemu_wire_begin,
-    meshemu_wire_begin_transmission, meshemu_wire_end_transmission, meshemu_wire_read,
-    meshemu_wire_request_from, meshemu_wire_set_clock, meshemu_wire_shim_create,
-    meshemu_wire_shim_create_for_instance, meshemu_wire_shim_destroy,
-    meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+    meshemu_wire_available, meshemu_wire_begin, meshemu_wire_begin_transmission,
+    meshemu_wire_end_transmission, meshemu_wire_read, meshemu_wire_request_from,
+    meshemu_wire_set_clock, meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance,
+    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 pub use mycelium_board::{meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop};
 
@@ -404,8 +405,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let id = CString::new(format!("ffi-storage-{}-{nonce}", std::process::id())).unwrap();
-        let spiffs_path = CString::new("/data.bin").unwrap();
-        let sdcard_path = CString::new("/nested/data.bin").unwrap();
+        let path = CString::new("/nested/data.bin").unwrap();
         let spiffs_data = b"spiffs";
         let sdcard_data = b"sdcard";
 
@@ -413,12 +413,12 @@ mod tests {
             assert!(meshemu_spiffs_init(id.as_ptr()));
             assert!(meshemu_spiffs_write(
                 id.as_ptr(),
-                spiffs_path.as_ptr(),
+                path.as_ptr(),
                 spiffs_data.as_ptr(),
                 spiffs_data.len()
             ));
             let mut len = usize::MAX;
-            let data = meshemu_spiffs_read(id.as_ptr(), spiffs_path.as_ptr(), &mut len);
+            let data = meshemu_spiffs_read(id.as_ptr(), path.as_ptr(), &mut len);
             assert!(!data.is_null());
             assert_eq!(std::slice::from_raw_parts(data, len), spiffs_data);
             meshemu_storage_data_free(data);
@@ -426,22 +426,14 @@ mod tests {
             assert!(meshemu_sdcard_init(id.as_ptr()));
             assert!(meshemu_sdcard_write(
                 id.as_ptr(),
-                sdcard_path.as_ptr(),
+                path.as_ptr(),
                 sdcard_data.as_ptr(),
                 sdcard_data.len()
             ));
-            let data = meshemu_sdcard_read(id.as_ptr(), sdcard_path.as_ptr(), &mut len);
+            let data = meshemu_sdcard_read(id.as_ptr(), path.as_ptr(), &mut len);
             assert!(!data.is_null());
             assert_eq!(std::slice::from_raw_parts(data, len), sdcard_data);
             meshemu_storage_data_free(data);
-            assert!(meshemu_storage_destroy(id.as_ptr()));
-            assert!(!meshemu_spiffs_write(
-                id.as_ptr(),
-                spiffs_path.as_ptr(),
-                spiffs_data.as_ptr(),
-                spiffs_data.len()
-            ));
-            assert!(!meshemu_storage_destroy(id.as_ptr()));
         }
     }
 
@@ -458,7 +450,6 @@ mod tests {
                 std::ptr::null(),
                 1
             ));
-            assert!(!meshemu_storage_destroy(std::ptr::null()));
             meshemu_storage_data_free(std::ptr::null_mut());
         }
     }
@@ -519,9 +510,114 @@ mod tests {
 
         unsafe {
             assert_eq!(meshemu_board_get_battery(board), 3_850);
+            assert_eq!(meshemu_board_get_adc(board, 4), 2_391);
+            assert_eq!(meshemu_board_get_adc(board, 5), 0);
             assert_eq!(meshemu_board_get_temp(board), 37.5);
             meshemu_board_set_battery(board, 3_700);
             assert_eq!(meshemu_board_get_battery(board), 3_700);
+            assert_eq!(meshemu_board_get_adc(board, 4), 2_298);
+            meshemu_board_set_battery(board, u16::MAX);
+            assert_eq!(meshemu_board_get_adc(board, 4), 4_095);
+            meshemu_board_destroy(board);
+        }
+    }
+
+    #[test]
+    fn board_power_gpio_gates_gps_sd_and_gpio46_pwm_buzzer() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let instance = format!("ffi-power-node-{}-{nonce}", std::process::id());
+        let id = CString::new(instance.clone()).unwrap();
+        let path = CString::new("/power-test.bin").unwrap();
+        let data = b"powered";
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+        let gps = unsafe { meshemu_gps_create(id.as_ptr(), 51.5, -0.1) };
+        let buzzer = mycelium_board::register_buzzer(&instance);
+        let mut gps_buffer = [0_u8; 256];
+
+        unsafe {
+            meshemu_board_ledc_attach(board, 3, mycelium_board::BUZZER_GPIO);
+            assert!(meshemu_board_ledc_write(board, 3, 500, 125));
+            {
+                let buzzer = buzzer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(buzzer.is_playing());
+                assert_eq!(buzzer.frequency_hz(), 2_000);
+                assert_eq!(buzzer.duty_cycle(), 0.25);
+            }
+            assert_eq!(meshemu_input_take_falling_edges(id.as_ptr(), 46), 0);
+
+            meshemu_board_digital_write(board, mycelium_board::PERIPH_PWR_EN_GPIO, false);
+            assert!(!buzzer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_playing());
+            assert_eq!(
+                meshemu_gps_read(
+                    gps,
+                    gps_buffer.as_mut_ptr(),
+                    gps_buffer.len().try_into().unwrap()
+                ),
+                0
+            );
+            assert!(!meshemu_sdcard_init(id.as_ptr()));
+            assert!(!meshemu_sdcard_write(
+                id.as_ptr(),
+                path.as_ptr(),
+                data.as_ptr(),
+                data.len()
+            ));
+
+            meshemu_board_digital_write(board, mycelium_board::PERIPH_PWR_EN_GPIO, true);
+            assert!(
+                meshemu_gps_read(
+                    gps,
+                    gps_buffer.as_mut_ptr(),
+                    gps_buffer.len().try_into().unwrap()
+                ) > 0
+            );
+            assert!(meshemu_sdcard_init(id.as_ptr()));
+            assert!(meshemu_sdcard_write(
+                id.as_ptr(),
+                path.as_ptr(),
+                data.as_ptr(),
+                data.len()
+            ));
+            assert!(meshemu_board_ledc_write(board, 3, 1_000, 500));
+            assert!(buzzer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_playing());
+
+            meshemu_gps_destroy(gps);
+            meshemu_board_destroy(board);
+        }
+        mycelium_board::remove_buzzer(&instance);
+    }
+
+    #[test]
+    fn board_ffi_models_external_power_and_tp4054_state() {
+        let id = CString::new("ffi-charger-node").unwrap();
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+
+        unsafe {
+            assert_eq!(
+                meshemu_board_get_charger_state(board),
+                mycelium_board::Tp4054State::Charged as u8
+            );
+            meshemu_board_set_external_power(board, true);
+            assert_eq!(
+                meshemu_board_get_charger_state(board),
+                mycelium_board::Tp4054State::Charging as u8
+            );
+            meshemu_board_set_battery(board, 0);
+            assert_eq!(
+                meshemu_board_get_charger_state(board),
+                mycelium_board::Tp4054State::NoBattery as u8
+            );
             meshemu_board_destroy(board);
         }
     }
@@ -539,7 +635,18 @@ mod tests {
             assert!(meshemu_board_create(std::ptr::null(), 3_900, 35.0).is_null());
             assert!(meshemu_board_create(id.as_ptr(), 3_900, f32::NAN).is_null());
             assert_eq!(meshemu_board_get_battery(std::ptr::null_mut()), 0);
+            assert_eq!(meshemu_board_get_adc(std::ptr::null_mut(), 4), 0);
             assert_eq!(meshemu_board_get_temp(std::ptr::null_mut()), 0.0);
+            assert_eq!(
+                meshemu_board_get_charger_state(std::ptr::null_mut()),
+                mycelium_board::Tp4054State::NoBattery as u8
+            );
+            assert!(!meshemu_board_ledc_write(
+                std::ptr::null_mut(),
+                0,
+                1_000,
+                500
+            ));
             meshemu_gps_destroy(std::ptr::null_mut());
             meshemu_board_destroy(std::ptr::null_mut());
         }

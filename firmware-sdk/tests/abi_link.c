@@ -18,7 +18,13 @@ int main(void)
     void* board = meshemu_board_create(id, 3700, 25.0f);
     meshemu_board_set_battery(board, 3600);
     (void)meshemu_board_get_battery(board);
+    (void)meshemu_board_get_adc(board, 4);
     (void)meshemu_board_get_temp(board);
+    meshemu_board_digital_write(board, 10, true);
+    meshemu_board_ledc_attach(board, 0, 46);
+    (void)meshemu_board_ledc_write(board, 0, 1000, 500);
+    meshemu_board_set_external_power(board, true);
+    (void)meshemu_board_get_charger_state(board);
     meshemu_board_destroy(board);
 
     meshemu_buzzer_beep(id, 440, 10);
