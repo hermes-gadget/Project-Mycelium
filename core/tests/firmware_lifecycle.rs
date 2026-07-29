@@ -43,13 +43,9 @@ fn manager_loads_starts_ticks_and_kills_firmware() {
             inspector.get(b"test_setup_calls\0").expect("setup counter");
         let loop_calls: Symbol<CounterFn> =
             inspector.get(b"test_loop_calls\0").expect("loop counter");
-        let bus_tick_calls: Symbol<CounterFn> = inspector
-            .get(b"test_bus_tick_calls\0")
-            .expect("bus tick counter");
 
         assert_eq!(setup_calls(), 1);
         assert_eq!(loop_calls(), 1);
-        assert_eq!(bus_tick_calls(), 1);
     }
 
     manager.kill(&id).expect("kill firmware");

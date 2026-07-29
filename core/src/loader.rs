@@ -7,7 +7,6 @@ use libloading::Library;
 type FirmwareSetupFn = unsafe extern "C" fn();
 type FirmwareLoopFn = unsafe extern "C" fn();
 type FirmwareGetDisplayFn = unsafe extern "C" fn() -> *mut c_void;
-type FirmwareBusTickFn = unsafe extern "C" fn();
 
 /// A loaded firmware shared object and its lifecycle entry points.
 ///
@@ -18,7 +17,6 @@ pub struct FirmwareInstance {
     setup: FirmwareSetupFn,
     loop_fn: FirmwareLoopFn,
     get_display: Option<FirmwareGetDisplayFn>,
-    bus_tick: Option<FirmwareBusTickFn>,
     running: bool,
     _lib: Library,
 }
@@ -42,17 +40,12 @@ impl FirmwareInstance {
                 .get::<FirmwareGetDisplayFn>(b"firmware_get_display\0")
                 .ok()
                 .map(|symbol| *symbol);
-            let bus_tick = lib
-                .get::<FirmwareBusTickFn>(b"meshemu_bus_tick\0")
-                .ok()
-                .map(|symbol| *symbol);
 
             Ok(Self {
                 name: name.to_owned(),
                 setup,
                 loop_fn,
                 get_display,
-                bus_tick,
                 running: false,
                 _lib: lib,
             })
@@ -71,20 +64,15 @@ impl FirmwareInstance {
         self.running = true;
     }
 
-    /// Advances the firmware by one frame and then advances its host bus hook.
+    /// Advances the firmware by one frame.
     pub fn tick(&mut self) {
         if !self.running {
             return;
         }
 
-        // SAFETY: These symbols were resolved with their declared ABI and the
-        // owning library remains loaded.
-        unsafe {
-            (self.loop_fn)();
-            if let Some(bus_tick) = self.bus_tick {
-                bus_tick();
-            }
-        }
+        // SAFETY: The symbol was resolved with this signature and the owning
+        // library remains loaded.
+        unsafe { (self.loop_fn)() };
     }
 
     pub fn name(&self) -> &str {
