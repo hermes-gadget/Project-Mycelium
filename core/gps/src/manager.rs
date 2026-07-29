@@ -1,9 +1,31 @@
+use std::collections::VecDeque;
 use std::f64::consts::PI;
+
+use chrono::Utc;
 
 use crate::nmea::GpsState;
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const MPS_TO_KNOTS: f64 = 1.943_844_492_440_6;
+const EPOCH_MS: u64 = 1_000;
+
+/// L76K UART baud rate.
+pub const GPS_BAUD_RATE: u32 = 9_600;
+/// L76K UART TX pin on the emulated board.
+pub const GPS_TX_PIN: u8 = 43;
+/// L76K UART RX pin on the emulated board.
+pub const GPS_RX_PIN: u8 = 44;
+/// 9600 baud with 8N1 framing transfers approximately 960 bytes per second.
+pub const UART_BYTES_PER_SECOND: usize = GPS_BAUD_RATE as usize / 10;
+
+/// A GPX track sample with an optional source timestamp.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpxTrackPoint {
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Milliseconds on the source track's timeline.
+    pub timestamp_ms: Option<i64>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MovementModel {
@@ -22,14 +44,21 @@ pub enum MovementModel {
         speed_multiplier: f64,
         current_idx: usize,
     },
+    GpxReplayWithTimestamps {
+        points: Vec<GpxTrackPoint>,
+        speed_multiplier: f64,
+        current_idx: usize,
+    },
 }
 
 pub struct GpsManager {
     state: GpsState,
     movement: MovementModel,
-    sentence_buffer: Vec<u8>,
-    next_sentence: usize,
+    sentence_buffer: VecDeque<u8>,
     replay_progress: f64,
+    epoch_elapsed_ms: u64,
+    uart_bytes_remaining: usize,
+    output_enabled: bool,
 }
 
 impl GpsManager {
@@ -37,9 +66,11 @@ impl GpsManager {
         Self {
             state: GpsState::new(lat, lon),
             movement: MovementModel::Static,
-            sentence_buffer: Vec::new(),
-            next_sentence: 0,
+            sentence_buffer: VecDeque::new(),
             replay_progress: 0.0,
+            epoch_elapsed_ms: 0,
+            uart_bytes_remaining: 0,
+            output_enabled: true,
         }
     }
 
@@ -58,9 +89,54 @@ impl GpsManager {
     pub fn set_movement(&mut self, movement: MovementModel) {
         self.movement = movement;
         self.replay_progress = 0.0;
+        match &mut self.movement {
+            MovementModel::GpxReplay {
+                points,
+                speed_multiplier,
+                current_idx,
+            } => {
+                if points.is_empty() {
+                    self.state.speed_knots = 0.0;
+                    return;
+                }
+                *current_idx = (*current_idx).min(points.len() - 1);
+                let point = points[*current_idx];
+                self.state.latitude = point.0;
+                self.state.longitude = point.1;
+                update_replay_telemetry(&mut self.state, points, *current_idx, *speed_multiplier);
+            }
+            MovementModel::GpxReplayWithTimestamps {
+                points,
+                current_idx,
+                ..
+            } => {
+                if points.is_empty() {
+                    self.state.speed_knots = 0.0;
+                    return;
+                }
+                *current_idx = (*current_idx).min(points.len() - 1);
+                let point = &points[*current_idx];
+                self.state.latitude = point.latitude;
+                self.state.longitude = point.longitude;
+                self.state.speed_knots = 0.0;
+            }
+            _ => {}
+        }
     }
 
-    /// Update position based on the movement model and elapsed time.
+    /// Enable or disable NMEA output.
+    ///
+    /// Changing state discards partial output and starts a fresh one-second
+    /// epoch, matching a receiver restart at a sentence boundary.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.state.enabled != enabled {
+            self.state.enabled = enabled;
+            self.output_enabled = enabled;
+            self.reset_output();
+        }
+    }
+
+    /// Update position and make one NMEA batch available per elapsed second.
     pub fn tick(&mut self, dt_ms: u64) {
         let dt_s = dt_ms as f64 / 1_000.0;
         match &mut self.movement {
@@ -94,49 +170,179 @@ impl GpsManager {
                 speed_multiplier,
                 current_idx,
             } => {
-                self.state.speed_knots = 0.0;
-                if points.is_empty() || !speed_multiplier.is_finite() {
-                    return;
+                if points.is_empty() || !speed_multiplier.is_finite() || *speed_multiplier <= 0.0 {
+                    self.state.speed_knots = 0.0;
+                } else {
+                    self.replay_progress += dt_s * *speed_multiplier;
+                    let requested_steps = self.replay_progress.floor() as usize;
+                    if requested_steps > 0 {
+                        self.replay_progress -= requested_steps as f64;
+                        let old_idx = (*current_idx).min(points.len() - 1);
+                        let new_idx = old_idx
+                            .saturating_add(requested_steps)
+                            .min(points.len() - 1);
+                        *current_idx = new_idx;
+                        let new = points[new_idx];
+                        self.state.latitude = new.0;
+                        self.state.longitude = new.1;
+                        update_replay_telemetry(
+                            &mut self.state,
+                            points,
+                            new_idx,
+                            *speed_multiplier,
+                        );
+                        if new_idx == old_idx {
+                            self.state.speed_knots = 0.0;
+                        }
+                    }
                 }
-                self.replay_progress += dt_s * speed_multiplier.max(0.0);
-                let steps = self.replay_progress.floor() as usize;
-                if steps == 0 {
-                    return;
-                }
-                self.replay_progress -= steps as f64;
-                let old = (self.state.latitude, self.state.longitude);
-                *current_idx = current_idx.saturating_add(steps).min(points.len() - 1);
-                let new = points[*current_idx];
-                self.state.latitude = new.0;
-                self.state.longitude = new.1;
-                self.state.course_deg = initial_bearing_deg(old, new);
             }
+            MovementModel::GpxReplayWithTimestamps {
+                points,
+                speed_multiplier,
+                current_idx,
+            } => advance_timestamped_replay(
+                &mut self.state,
+                points,
+                current_idx,
+                &mut self.replay_progress,
+                *speed_multiplier,
+                dt_ms,
+            ),
+        }
+
+        self.sync_enabled_state();
+        if !self.output_enabled {
+            return;
+        }
+
+        self.epoch_elapsed_ms = self.epoch_elapsed_ms.saturating_add(dt_ms);
+        let elapsed_epochs = self.epoch_elapsed_ms / EPOCH_MS;
+        self.epoch_elapsed_ms %= EPOCH_MS;
+        if elapsed_epochs == 0 {
+            return;
+        }
+
+        for _ in 0..elapsed_epochs {
+            self.enqueue_epoch();
+        }
+        self.uart_bytes_remaining = usize::try_from(elapsed_epochs)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(UART_BYTES_PER_SECOND);
+    }
+
+    /// Read bytes already emitted during the current NMEA epoch.
+    ///
+    /// Returns zero when output is disabled, no epoch is ready, the current
+    /// epoch has been drained, or the UART allowance has been consumed.
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        self.sync_enabled_state();
+        if !self.output_enabled || buf.is_empty() {
+            return 0;
+        }
+        let len = self
+            .sentence_buffer
+            .len()
+            .min(buf.len())
+            .min(self.uart_bytes_remaining);
+        for destination in &mut buf[..len] {
+            *destination = self
+                .sentence_buffer
+                .pop_front()
+                .expect("length was bounded by queued bytes");
+        }
+        self.uart_bytes_remaining -= len;
+        len
+    }
+
+    fn enqueue_epoch(&mut self) {
+        let now = Utc::now();
+        self.sentence_buffer
+            .extend(self.state.generate_gga_at(now).bytes());
+        self.sentence_buffer
+            .extend(self.state.generate_rmc_at(now).bytes());
+        self.sentence_buffer
+            .extend(self.state.generate_gsa().bytes());
+        for sentence in self.state.generate_gsv() {
+            self.sentence_buffer.extend(sentence.bytes());
         }
     }
 
-    /// Read bytes from the next rotating NMEA sentence.
-    ///
-    /// Returns zero when GPS output is disabled or `buf` is empty. A sentence
-    /// may be returned over multiple calls when the destination is small.
-    pub fn read(&mut self, buf: &mut [u8]) -> usize {
-        if !self.state.enabled || buf.is_empty() {
-            return 0;
+    fn sync_enabled_state(&mut self) {
+        if self.output_enabled != self.state.enabled {
+            self.output_enabled = self.state.enabled;
+            self.reset_output();
         }
-        if self.sentence_buffer.is_empty() {
-            let sentence = match self.next_sentence {
-                0 => self.state.generate_gga(),
-                1 => self.state.generate_rmc(),
-                2 => self.state.generate_gsa(),
-                _ => self.state.generate_gsv(),
-            };
-            self.next_sentence = (self.next_sentence + 1) % 4;
-            self.sentence_buffer = sentence.into_bytes();
-        }
-        let len = self.sentence_buffer.len().min(buf.len());
-        buf[..len].copy_from_slice(&self.sentence_buffer[..len]);
-        self.sentence_buffer.drain(..len);
-        len
     }
+
+    fn reset_output(&mut self) {
+        self.sentence_buffer.clear();
+        self.epoch_elapsed_ms = 0;
+        self.uart_bytes_remaining = 0;
+    }
+}
+
+fn advance_timestamped_replay(
+    state: &mut GpsState,
+    points: &[GpxTrackPoint],
+    current_idx: &mut usize,
+    replay_progress_ms: &mut f64,
+    speed_multiplier: f64,
+    dt_ms: u64,
+) {
+    if points.is_empty() || !speed_multiplier.is_finite() || speed_multiplier <= 0.0 {
+        state.speed_knots = 0.0;
+        return;
+    }
+    *current_idx = (*current_idx).min(points.len() - 1);
+    *replay_progress_ms += dt_ms as f64 * speed_multiplier;
+    let mut moved = false;
+    while *current_idx + 1 < points.len() {
+        let next_idx = *current_idx + 1;
+        let interval_ms = timestamp_interval_ms(&points[*current_idx], &points[next_idx]);
+        if *replay_progress_ms < interval_ms {
+            break;
+        }
+        *replay_progress_ms -= interval_ms;
+        let from = &points[*current_idx];
+        let to = &points[next_idx];
+        let from_position = (from.latitude, from.longitude);
+        let to_position = (to.latitude, to.longitude);
+        state.latitude = to.latitude;
+        state.longitude = to.longitude;
+        state.speed_knots = haversine_m(from_position, to_position) / (interval_ms / 1_000.0)
+            * speed_multiplier
+            * MPS_TO_KNOTS;
+        state.course_deg = initial_bearing_deg(from_position, to_position);
+        *current_idx = next_idx;
+        moved = true;
+    }
+    if !moved && *current_idx + 1 >= points.len() {
+        state.speed_knots = 0.0;
+    }
+}
+
+fn timestamp_interval_ms(from: &GpxTrackPoint, to: &GpxTrackPoint) -> f64 {
+    match (from.timestamp_ms, to.timestamp_ms) {
+        (Some(from_ms), Some(to_ms)) if to_ms > from_ms => (to_ms - from_ms) as f64,
+        _ => EPOCH_MS as f64,
+    }
+}
+
+fn update_replay_telemetry(
+    state: &mut GpsState,
+    points: &[(f64, f64)],
+    current_idx: usize,
+    samples_per_second: f64,
+) {
+    if current_idx == 0 || !samples_per_second.is_finite() || samples_per_second <= 0.0 {
+        state.speed_knots = 0.0;
+        return;
+    }
+    let from = points[current_idx - 1];
+    let to = points[current_idx];
+    state.speed_knots = haversine_m(from, to) * samples_per_second * MPS_TO_KNOTS;
+    state.course_deg = initial_bearing_deg(from, to);
 }
 
 fn advance_waypoints(
@@ -218,6 +424,18 @@ fn initial_bearing_deg(from: (f64, f64), to: (f64, f64)) -> f64 {
 mod tests {
     use super::*;
 
+    fn drain_epoch(manager: &mut GpsManager, chunk_size: usize) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut buffer = vec![0_u8; chunk_size];
+        loop {
+            let len = manager.read(&mut buffer);
+            if len == 0 {
+                return output;
+            }
+            output.extend_from_slice(&buffer[..len]);
+        }
+    }
+
     #[test]
     fn linear_model_moves_expected_distance_north() {
         let mut manager = GpsManager::new(0.0, 0.0);
@@ -266,18 +484,147 @@ mod tests {
             (manager.state().latitude, manager.state().longitude),
             (3.0, 3.0)
         );
+        let expected_speed = haversine_m((2.0, 2.0), (3.0, 3.0)) * 2.0 * MPS_TO_KNOTS;
+        assert!((manager.state().speed_knots - expected_speed).abs() < 1e-6);
+        assert!((manager.state().course_deg - 44.96).abs() < 0.1);
     }
 
     #[test]
-    fn read_rotates_sentences_and_respects_enabled_state() {
+    fn read_emits_one_complete_l76k_cycle_per_second() {
         let mut manager = GpsManager::new(51.5, -0.1);
-        let mut buffer = [0_u8; 256];
-        let len = manager.read(&mut buffer);
-        assert!(std::str::from_utf8(&buffer[..len])
-            .unwrap()
-            .starts_with("$GPGGA,"));
+        let mut byte = [0_u8; 1];
 
-        manager.state_mut().enabled = false;
+        assert_eq!(manager.read(&mut byte), 0);
+        manager.tick(999);
+        assert_eq!(manager.read(&mut byte), 0);
+        manager.tick(1);
+
+        let output = drain_epoch(&mut manager, 17);
+        let sentences: Vec<_> = std::str::from_utf8(&output).unwrap().lines().collect();
+        assert_eq!(sentences.len(), 5);
+        assert!(sentences[0].starts_with("$GPGGA,"));
+        assert!(sentences[1].starts_with("$GPRMC,"));
+        assert!(sentences[2].starts_with("$GPGSA,"));
+        assert!(sentences[3].starts_with("$GPGSV,2,1,08,"));
+        assert!(sentences[4].starts_with("$GPGSV,2,2,08,"));
+        assert_eq!(manager.read(&mut byte), 0);
+
+        manager.tick(1_000);
+        assert!(!drain_epoch(&mut manager, 256).is_empty());
+        assert_eq!(manager.read(&mut byte), 0);
+    }
+
+    #[test]
+    fn read_enforces_the_9600_baud_epoch_allowance() {
+        let mut manager = GpsManager::new(51.5, -0.1);
+        manager.state_mut().satellites = u8::MAX;
+        manager.tick(1_000);
+        let mut buffer = vec![0_u8; UART_BYTES_PER_SECOND * 2];
+
+        assert_eq!(manager.read(&mut buffer), UART_BYTES_PER_SECOND);
         assert_eq!(manager.read(&mut buffer), 0);
+    }
+
+    #[test]
+    fn disabling_discards_a_partial_sentence_and_restarts_on_a_new_epoch() {
+        let mut manager = GpsManager::new(51.5, -0.1);
+        manager.tick(1_000);
+        let mut partial = [0_u8; 7];
+        assert_eq!(manager.read(&mut partial), partial.len());
+
+        manager.set_enabled(false);
+        manager.set_enabled(true);
+        assert_eq!(manager.read(&mut partial), 0);
+        manager.tick(999);
+        assert_eq!(manager.read(&mut partial), 0);
+        manager.tick(1);
+
+        assert_eq!(manager.read(&mut partial), partial.len());
+        assert_eq!(&partial, b"$GPGGA,");
+    }
+
+    #[test]
+    fn gpx_replay_speed_and_course_are_reported_in_rmc() {
+        let mut manager = GpsManager::new(0.0, 0.0);
+        manager.set_movement(MovementModel::GpxReplay {
+            points: vec![(0.0, 0.0), (0.0, 0.001)],
+            speed_multiplier: 1.0,
+            current_idx: 0,
+        });
+
+        manager.tick(1_000);
+
+        assert!((manager.state().speed_knots - 216.15).abs() < 0.1);
+        assert!((manager.state().course_deg - 90.0).abs() < 1e-10);
+        let output = String::from_utf8(drain_epoch(&mut manager, 256)).unwrap();
+        let rmc = output
+            .lines()
+            .find(|line| line.starts_with("$GPRMC"))
+            .unwrap();
+        assert!(rmc.contains(",216.1,90.0,"));
+    }
+
+    #[test]
+    fn gpx_replay_uses_track_timestamps_for_telemetry() {
+        let mut manager = GpsManager::new(0.0, 0.0);
+        manager.set_movement(MovementModel::GpxReplayWithTimestamps {
+            points: vec![
+                GpxTrackPoint {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    timestamp_ms: Some(10_000),
+                },
+                GpxTrackPoint {
+                    latitude: 0.0,
+                    longitude: 0.001,
+                    timestamp_ms: Some(12_000),
+                },
+            ],
+            speed_multiplier: 1.0,
+            current_idx: 0,
+        });
+
+        manager.tick(1_000);
+        assert_eq!(
+            (manager.state().latitude, manager.state().longitude),
+            (0.0, 0.0)
+        );
+        manager.tick(1_000);
+
+        assert_eq!(
+            (manager.state().latitude, manager.state().longitude),
+            (0.0, 0.001)
+        );
+        assert!((manager.state().speed_knots - 108.07).abs() < 0.1);
+        assert!((manager.state().course_deg - 90.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn timestamped_gpx_replay_falls_back_to_one_second_samples() {
+        let mut manager = GpsManager::new(0.0, 0.0);
+        manager.set_movement(MovementModel::GpxReplayWithTimestamps {
+            points: vec![
+                GpxTrackPoint {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    timestamp_ms: None,
+                },
+                GpxTrackPoint {
+                    latitude: 0.0,
+                    longitude: 0.001,
+                    timestamp_ms: None,
+                },
+            ],
+            speed_multiplier: 1.0,
+            current_idx: 0,
+        });
+
+        manager.tick(1_000);
+
+        assert_eq!(
+            (manager.state().latitude, manager.state().longitude),
+            (0.0, 0.001)
+        );
+        assert!((manager.state().speed_knots - 216.15).abs() < 0.1);
     }
 }

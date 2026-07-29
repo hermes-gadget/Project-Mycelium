@@ -38,6 +38,7 @@ int main(void)
 
     void* gps = meshemu_gps_create(id, 51.5, -0.1);
     meshemu_gps_set_position(gps, 51.5, -0.1, 10.0);
+    meshemu_gps_tick(gps, 1000);
     (void)meshemu_gps_read(gps, &byte, 1);
     meshemu_gps_set_enabled(gps, false);
     meshemu_gps_destroy(gps);
