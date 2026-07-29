@@ -61,10 +61,14 @@ mod tests {
 
         let packet = [1, 2, 3, 4];
         assert!(send(sender, &packet));
+        assert!(receive(receiver).is_empty());
+        assert!(!meshemu_radio_is_send_complete(sender));
+        let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
+        meshemu_bus_tick(u64::from(airtime));
         assert_eq!(receive(receiver), packet);
         assert!(unsafe { meshemu_radio_get_rssi(receiver) } < 0.0);
         assert!(unsafe { meshemu_radio_get_snr(receiver) } > 0.0);
-        assert_eq!(unsafe { meshemu_radio_get_est_airtime(sender, 16) }, 56);
+        assert_eq!(unsafe { meshemu_radio_get_est_airtime(sender, 16) }, 52);
         assert!(meshemu_radio_is_send_complete(sender));
 
         destroy(receiver);
@@ -97,11 +101,14 @@ mod tests {
         let packet = [7, 8, 9];
 
         assert!(send(sender, &packet));
+        let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
+        meshemu_bus_tick(u64::from(airtime));
         assert!(receive(receiver).is_empty());
 
         unsafe { meshemu_radio_set_position(receiver, 0.0, 0.0001) };
         meshemu_bus_tick(1_000);
         assert!(send(sender, &packet));
+        meshemu_bus_tick(1_000 + u64::from(airtime));
         assert_eq!(receive(receiver), packet);
 
         destroy(receiver);
@@ -137,6 +144,82 @@ mod tests {
             0
         );
         destroy(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn invalid_sx1262_configs_are_rejected_without_panicking() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+
+        let invalid = [
+            (149.9, 125, 7, 5, 14.0),
+            (960.1, 125, 7, 5, 14.0),
+            (915.0, 62, 7, 5, 14.0),
+            (915.0, 125, 6, 5, 14.0),
+            (915.0, 125, 64, 5, 14.0),
+            (915.0, 125, 7, 4, 14.0),
+            (915.0, 125, 7, 9, 14.0),
+            (915.0, 125, 7, 5, 22.1),
+        ];
+        for (index, (freq, bandwidth, sf, coding_rate, power)) in invalid.into_iter().enumerate() {
+            let id = CString::new(format!("invalid-{index}")).unwrap();
+            let radio = unsafe {
+                meshemu_radio_create(
+                    id.as_ptr(),
+                    freq,
+                    bandwidth,
+                    sf,
+                    coding_rate,
+                    power,
+                    0.0,
+                    0.0,
+                )
+            };
+            assert!(radio.is_null());
+        }
+    }
+
+    #[test]
+    fn overlapping_send_is_rejected_until_airtime_elapses() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let sender = create("sender", (0.0, 0.0));
+        let packet = [1, 2, 3, 4];
+        let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
+
+        assert!(send(sender, &packet));
+        assert!(!send(sender, &packet));
+        meshemu_bus_tick(u64::from(airtime - 1));
+        assert!(!meshemu_radio_is_send_complete(sender));
+        assert!(!send(sender, &packet));
+        meshemu_bus_tick(u64::from(airtime));
+        assert!(meshemu_radio_is_send_complete(sender));
+        assert!(send(sender, &packet));
+
+        destroy(sender);
+    }
+
+    #[test]
+    fn undersized_receive_buffer_leaves_packet_queued_for_retry() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let sender = create("sender", (0.0, 0.0));
+        let receiver = create("receiver", (0.0, 0.0001));
+        let packet = [1, 2, 3, 4];
+
+        assert!(send(sender, &packet));
+        let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
+        meshemu_bus_tick(u64::from(airtime));
+
+        let mut small = [0_u8; 2];
+        assert_eq!(
+            unsafe { meshemu_radio_recv_raw(receiver, small.as_mut_ptr(), small.len() as i32) },
+            -4
+        );
+        assert_eq!(receive(receiver), packet);
+
+        destroy(receiver);
+        destroy(sender);
     }
 
     #[test]

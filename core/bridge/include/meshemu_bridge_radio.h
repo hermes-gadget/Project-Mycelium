@@ -10,6 +10,8 @@ void* meshemu_radio_create(const char* id, double freq_mhz, uint16_t bandwidth_k
                            uint8_t spreading_factor, uint8_t coding_rate,
                            double tx_power_dbm, double lat, double lon);
 bool meshemu_radio_start_send(void* radio, const uint8_t* data, uint32_t len);
+// Returns the packet length, zero if empty, or the negative required length
+// without removing the packet when max_len is too small.
 int32_t meshemu_radio_recv_raw(void* radio, uint8_t* buffer, int32_t max_len);
 uint32_t meshemu_radio_get_est_airtime(void* radio, int32_t len);
 float meshemu_radio_get_rssi(void* radio);

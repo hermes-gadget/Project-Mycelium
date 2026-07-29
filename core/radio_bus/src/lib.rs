@@ -5,6 +5,7 @@ pub mod channel;
 pub mod propagation;
 pub mod types;
 
-pub use bus::RadioBus;
+pub use bus::{RadioBus, RadioBusConfig};
 pub use channel::ChannelState;
+pub use propagation::{HataEnvironment, PropagationModel};
 pub use types::{RadioChannel, RxPacket, TxEvent, SENSITIVITY_DBM};
