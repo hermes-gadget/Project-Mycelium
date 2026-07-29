@@ -16,6 +16,8 @@
  *   include/meshemu_board.h    - virtual MainBoard
  *   include/meshemu_display.h  - SDL2/LVGL display
  *   include/meshemu_storage.h  - SPIFFS and SD card storage
+ *   include/meshemu_nvs.h      - persistent Preferences-compatible NVS
+ *   include/meshemu_partition.h - ESP32 partition table and Launcher mode
  *   include/meshemu_gps.h      - GPS and NMEA data
  *   include/meshemu_input.h    - T-Deck keyboard
  *   include/meshemu_buzzer.h   - host audio

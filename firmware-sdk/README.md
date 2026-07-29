@@ -3,7 +3,8 @@
 The Mycelium Firmware SDK is the C interface between a MeshCore-based firmware
 and Mycelium's virtual T-Deck hardware. A firmware shared library exports three
 entry points for the emulator and calls the Host Services API to create and
-control its radio, board, display, GPS, storage, input, and buzzer facilities.
+control its radio, board, display, GPS, storage, NVS, partition table, input,
+and buzzer facilities.
 
 The SDK contains declarations only. Mycelium supplies the implementations when
 it loads the firmware.
@@ -73,6 +74,8 @@ time.
 | [`meshemu_board.h`](include/meshemu_board.h) | Virtual MeshCore `MainBoard` and battery state |
 | [`meshemu_display.h`](include/meshemu_display.h) | SDL2-backed LVGL display and framebuffer capture |
 | [`meshemu_storage.h`](include/meshemu_storage.h) | Host-directory-backed SPIFFS and SD card |
+| [`meshemu_nvs.h`](include/meshemu_nvs.h) | Persistent, namespace-aware ESP32 Preferences/NVS |
+| [`meshemu_partition.h`](include/meshemu_partition.h) | Standalone/Launcher ESP32 partition layouts |
 | [`meshemu_gps.h`](include/meshemu_gps.h) | Virtual GPS position and NMEA sentence stream |
 | [`meshemu_input.h`](include/meshemu_input.h) | Virtual T-Deck I2C keyboard |
 | [`meshemu_buzzer.h`](include/meshemu_buzzer.h) | Host audio tone playback |

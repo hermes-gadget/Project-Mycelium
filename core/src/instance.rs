@@ -3,7 +3,10 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 use mycelium_board::{
-    register_buzzer, remove_buzzer, BoardConfig, SharedVirtualBuzzer, VirtualBoard,
+    activate_partition_table, register_buzzer, register_nvs, register_partition_table,
+    remove_buzzer, remove_nvs, remove_partition_table, BoardConfig, SharedVirtualBuzzer,
+    SharedVirtualNvs, SharedVirtualPartitionTable, VirtualBoard, LAUNCHER_NVS_SIZE,
+    STANDALONE_NVS_SIZE,
 };
 use mycelium_gps::GpsManager;
 use mycelium_storage::StorageManager;
@@ -33,12 +36,15 @@ impl Default for GpsConfig {
 pub struct InstanceBoardConfig {
     #[serde(default = "default_battery_mv")]
     pub battery_mv: u16,
+    #[serde(default)]
+    pub launcher_mode: bool,
 }
 
 impl Default for InstanceBoardConfig {
     fn default() -> Self {
         Self {
             battery_mv: default_battery_mv(),
+            launcher_mode: false,
         }
     }
 }
@@ -79,6 +85,8 @@ pub struct Instance {
     gps: GpsManager,
     board: VirtualBoard,
     buzzer: SharedVirtualBuzzer,
+    nvs: SharedVirtualNvs,
+    partition_table: SharedVirtualPartitionTable,
 }
 
 struct InstancePeripherals {
@@ -86,11 +94,22 @@ struct InstancePeripherals {
     gps: GpsManager,
     board: VirtualBoard,
     buzzer: SharedVirtualBuzzer,
+    nvs: SharedVirtualNvs,
+    partition_table: SharedVirtualPartitionTable,
 }
 
 fn create_peripherals(id: &str, config: &InstanceConfig) -> Result<InstancePeripherals> {
     let mut storage = StorageManager::new(id);
     storage.init_all()?;
+    let nvs = register_nvs(
+        id,
+        if config.board.launcher_mode {
+            LAUNCHER_NVS_SIZE
+        } else {
+            STANDALONE_NVS_SIZE
+        },
+    )?;
+    let partition_table = register_partition_table(id, config.board.launcher_mode);
     let gps = GpsManager::new(config.gps.latitude, config.gps.longitude);
     let board = VirtualBoard::new(
         id,
@@ -108,6 +127,8 @@ fn create_peripherals(id: &str, config: &InstanceConfig) -> Result<InstancePerip
         gps,
         board,
         buzzer,
+        nvs,
+        partition_table,
     })
 }
 
@@ -122,14 +143,18 @@ impl Instance {
             gps: peripherals.gps,
             board: peripherals.board,
             buzzer: peripherals.buzzer,
+            nvs: peripherals.nvs,
+            partition_table: peripherals.partition_table,
         })
     }
 
     fn start(&mut self) {
+        activate_partition_table(self.firmware.name());
         self.firmware.start();
     }
 
     fn tick(&mut self, delta_ms: u64) {
+        activate_partition_table(self.firmware.name());
         self.firmware.tick();
         if self.board.periph_pwr_enabled {
             self.gps.tick(delta_ms);
@@ -175,11 +200,21 @@ impl Instance {
     pub fn buzzer(&self) -> &SharedVirtualBuzzer {
         &self.buzzer
     }
+
+    pub fn nvs(&self) -> &SharedVirtualNvs {
+        &self.nvs
+    }
+
+    pub fn partition_table(&self) -> &SharedVirtualPartitionTable {
+        &self.partition_table
+    }
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
         remove_buzzer(self.firmware.name());
+        remove_nvs(self.firmware.name());
+        remove_partition_table(self.firmware.name());
     }
 }
 
@@ -273,6 +308,9 @@ impl Default for InstanceManager {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -313,6 +351,82 @@ mod tests {
         );
         assert_eq!(peripherals.board.get_battery_mv(), 3_700);
         assert!(!peripherals.buzzer.lock().unwrap().is_playing());
+        remove_buzzer(&id);
+        remove_nvs(&id);
+        remove_partition_table(&id);
+    }
+
+    #[test]
+    fn crash_breadcrumb_survives_peripheral_restart_and_skips_migration() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = format!("instance-nvs-crash-{}-{nonce}", std::process::id());
+        let config = InstanceConfig::default();
+        let first = create_peripherals(&id, &config).unwrap();
+        let backing_path = {
+            let mut nvs = first.nvs.lock().unwrap();
+            assert!(nvs.begin("touch", false));
+            assert_eq!(nvs.put_bool("sd_mig_busy", true), 1);
+            nvs.backing_path().to_owned()
+        };
+
+        // Simulate an abrupt instance loss: discard live registries but leave
+        // the durable NVS image exactly as a reset would.
+        remove_nvs(&id);
+        remove_partition_table(&id);
+        remove_buzzer(&id);
+        drop(first);
+
+        let restarted = create_peripherals(&id, &config).unwrap();
+        let mut nvs = restarted.nvs.lock().unwrap();
+        assert!(nvs.begin("touch", true));
+        let migration_should_run = !nvs.get_bool("sd_mig_busy", false);
+        assert!(
+            !migration_should_run,
+            "Wadamesh must skip migration after a crash leaves sd_mig_busy set"
+        );
+        drop(nvs);
+
+        remove_nvs(&id);
+        remove_partition_table(&id);
+        remove_buzzer(&id);
+        drop(restarted);
+        fs::remove_file(backing_path).unwrap();
+    }
+
+    #[test]
+    fn launcher_instance_uses_coherent_partition_and_nvs_geometry() {
+        let id = format!(
+            "launcher-peripherals-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let config = InstanceConfig {
+            board: InstanceBoardConfig {
+                launcher_mode: true,
+                ..InstanceBoardConfig::default()
+            },
+            ..InstanceConfig::default()
+        };
+        let peripherals = create_peripherals(&id, &config).unwrap();
+
+        assert_eq!(
+            peripherals.nvs.lock().unwrap().partition_size(),
+            LAUNCHER_NVS_SIZE
+        );
+        assert!(peripherals
+            .partition_table
+            .lock()
+            .unwrap()
+            .is_under_launcher());
+
+        remove_nvs(&id);
+        remove_partition_table(&id);
         remove_buzzer(&id);
     }
 }

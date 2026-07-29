@@ -3,13 +3,19 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use mycelium_board::{peripherals_powered, BoardConfig, Tp4054State, VirtualBoard};
+use mycelium_board::partition::{
+    active_partition_table, get_partition_table, register_partition_table,
+};
+use mycelium_board::{
+    get_nvs, peripherals_powered, register_nvs, remove_nvs, BoardConfig, Tp4054State, VirtualBoard,
+    LAUNCHER_NVS_SIZE, STANDALONE_NVS_SIZE,
+};
 use mycelium_gps::GpsManager;
 use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
 use mycelium_storage::StorageManager;
-use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
+use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, Sx1262State, TxEvent};
 use sdl2::keyboard::Keycode;
 
 struct BusState {
@@ -30,8 +36,7 @@ impl BusState {
 
 struct RadioHandle {
     node_id: String,
-    channel: RadioChannel,
-    tx_power_dbm: f64,
+    radio: Sx1262State,
     pending: Mutex<VecDeque<RxPacket>>,
     last_rx: Mutex<Option<(f32, f32)>>,
 }
@@ -80,6 +85,18 @@ unsafe fn storage_file_args<'a>(
     }?))
 }
 
+unsafe fn nvs_args<'a>(
+    instance_id: *const c_char,
+    namespace: *const c_char,
+    key: *const c_char,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    Some((
+        unsafe { ffi_string(instance_id) }?,
+        unsafe { ffi_string(namespace) }?,
+        unsafe { ffi_string(key) }?,
+    ))
+}
+
 fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
     if out_len.is_null() {
         return ptr::null_mut();
@@ -124,23 +141,354 @@ fn valid_position(lat: f64, lon: f64) -> bool {
         && (-180.0..=180.0).contains(&lon)
 }
 
-fn valid_radio_config(
+fn sx1262_state(
     freq_mhz: f64,
     bandwidth_khz: u16,
     spreading_factor: u8,
     coding_rate: u8,
     tx_power_dbm: f64,
-) -> bool {
+) -> Option<Sx1262State> {
     // SX1262 operating limits and the LoRa modulation settings supported by
     // the bridge. Reject rather than passing unchecked values into airtime
     // arithmetic across the FFI boundary.
-    freq_mhz.is_finite()
-        && (150.0..=960.0).contains(&freq_mhz)
-        && matches!(bandwidth_khz, 125 | 250 | 500)
-        && (7..=12).contains(&spreading_factor)
-        && (5..=8).contains(&coding_rate)
-        && tx_power_dbm.is_finite()
-        && (-17.0..=22.0).contains(&tx_power_dbm)
+    let channel = RadioChannel::new(freq_mhz, bandwidth_khz, spreading_factor, coding_rate)?;
+    Sx1262State::new(channel, tx_power_dbm)
+}
+
+/// Opens or reconfigures persistent NVS for one emulator instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_init(instance_id: *const c_char, size_bytes: u32) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    register_nvs(instance_id, size_bytes).is_ok()
+}
+
+/// Reports whether a key exists in an NVS namespace.
+///
+/// # Safety
+///
+/// All string pointers must be valid NUL-terminated strings for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_exists(
+    instance_id: *const c_char,
+    namespace: *const c_char,
+    key: *const c_char,
+) -> bool {
+    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
+    else {
+        return false;
+    };
+    let Some(nvs) = get_nvs(instance_id) else {
+        return false;
+    };
+    let mut nvs = lock(&nvs);
+    let found = nvs.begin(namespace, true) && nvs.exists(key);
+    nvs.end();
+    found
+}
+
+/// Reads a bool, returning `default_value` for a missing key or type mismatch.
+///
+/// # Safety
+///
+/// All string pointers must be valid NUL-terminated strings for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_get_bool(
+    instance_id: *const c_char,
+    namespace: *const c_char,
+    key: *const c_char,
+    default_value: bool,
+) -> bool {
+    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
+    else {
+        return default_value;
+    };
+    let Some(nvs) = get_nvs(instance_id) else {
+        return default_value;
+    };
+    let mut nvs = lock(&nvs);
+    let value = if nvs.begin(namespace, true) {
+        nvs.get_bool(key, default_value)
+    } else {
+        default_value
+    };
+    nvs.end();
+    value
+}
+
+/// Writes a bool to a namespace, creating that namespace when needed.
+///
+/// # Safety
+///
+/// All string pointers must be valid NUL-terminated strings for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_put_bool(
+    instance_id: *const c_char,
+    namespace: *const c_char,
+    key: *const c_char,
+    value: bool,
+) -> bool {
+    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
+    else {
+        return false;
+    };
+    let Some(nvs) = get_nvs(instance_id) else {
+        return false;
+    };
+    let mut nvs = lock(&nvs);
+    let written = nvs.begin(namespace, false) && nvs.try_put_bool(key, value);
+    nvs.end();
+    written
+}
+
+/// Copies a string value into `buffer` and returns its full byte length.
+///
+/// The output is always NUL-terminated when `buffer_len` is nonzero. A small
+/// buffer receives a truncated string while the return value still reports the
+/// full size required (excluding the terminator).
+///
+/// # Safety
+///
+/// Input strings must be valid and NUL-terminated. `buffer` must reference
+/// `buffer_len` writable bytes, or may be null when `buffer_len` is zero.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_get_string(
+    instance_id: *const c_char,
+    namespace: *const c_char,
+    key: *const c_char,
+    default_value: *const c_char,
+    buffer: *mut c_char,
+    buffer_len: usize,
+) -> usize {
+    if !buffer.is_null() && buffer_len != 0 {
+        unsafe { *buffer = 0 };
+    }
+    if buffer.is_null() && buffer_len != 0 {
+        return 0;
+    }
+    let default_value = if default_value.is_null() {
+        ""
+    } else {
+        let Ok(value) = (unsafe { CStr::from_ptr(default_value) }).to_str() else {
+            return 0;
+        };
+        value
+    };
+    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
+    else {
+        return 0;
+    };
+    let value = get_nvs(instance_id)
+        .map(|nvs| {
+            let mut nvs = lock(&nvs);
+            let value = if nvs.begin(namespace, true) {
+                nvs.get_string(key, default_value)
+            } else {
+                default_value.to_owned()
+            };
+            nvs.end();
+            value
+        })
+        .unwrap_or_else(|| default_value.to_owned());
+    if !buffer.is_null() && buffer_len != 0 {
+        let copied = value.len().min(buffer_len - 1);
+        unsafe {
+            ptr::copy_nonoverlapping(value.as_ptr(), buffer.cast::<u8>(), copied);
+            *buffer.add(copied) = 0;
+        }
+    }
+    value.len()
+}
+
+/// Writes a UTF-8 string to a namespace.
+///
+/// # Safety
+///
+/// All string pointers must be valid NUL-terminated strings for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_put_string(
+    instance_id: *const c_char,
+    namespace: *const c_char,
+    key: *const c_char,
+    value: *const c_char,
+) -> bool {
+    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
+    else {
+        return false;
+    };
+    let Some(value) = (unsafe { ffi_string_allow_empty(value) }) else {
+        return false;
+    };
+    let Some(nvs) = get_nvs(instance_id) else {
+        return false;
+    };
+    let mut nvs = lock(&nvs);
+    let written = nvs.begin(namespace, false) && nvs.try_put_string(key, value);
+    nvs.end();
+    written
+}
+
+/// Removes one key from an NVS namespace.
+///
+/// # Safety
+///
+/// All string pointers must be valid NUL-terminated strings for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_remove(
+    instance_id: *const c_char,
+    namespace: *const c_char,
+    key: *const c_char,
+) -> bool {
+    let Some((instance_id, namespace, key)) = (unsafe { nvs_args(instance_id, namespace, key) })
+    else {
+        return false;
+    };
+    let Some(nvs) = get_nvs(instance_id) else {
+        return false;
+    };
+    let mut nvs = lock(&nvs);
+    let removed = nvs.begin(namespace, false) && nvs.remove(key);
+    nvs.end();
+    removed
+}
+
+/// Drops the live NVS handle while preserving its crash-durable JSON image.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_nvs_destroy(instance_id: *const c_char) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    remove_nvs(instance_id).is_some()
+}
+
+/// Switches one instance between standalone and Launcher flash geometry.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_partition_set_launcher_mode(
+    instance_id: *const c_char,
+    enabled: bool,
+) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    let nvs_size = if enabled {
+        LAUNCHER_NVS_SIZE
+    } else {
+        STANDALONE_NVS_SIZE
+    };
+    if register_nvs(instance_id, nvs_size).is_err() {
+        return false;
+    }
+    register_partition_table(instance_id, enabled);
+    true
+}
+
+/// Finds the first matching entry in the currently active firmware table.
+///
+/// # Safety
+///
+/// Both output pointers must point to writable `u32` values.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_partition_find_first(
+    partition_type: u8,
+    subtype: u8,
+    address_out: *mut u32,
+    size_out: *mut u32,
+) -> bool {
+    unsafe {
+        write_partition_result(
+            active_partition_table(),
+            partition_type,
+            subtype,
+            address_out,
+            size_out,
+        )
+    }
+}
+
+/// Finds a partition for a specific virtual node without changing activation.
+///
+/// # Safety
+///
+/// `instance_id` and both output pointers must be valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_partition_find_first_for_instance(
+    instance_id: *const c_char,
+    partition_type: u8,
+    subtype: u8,
+    address_out: *mut u32,
+    size_out: *mut u32,
+) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    let Some(table) = get_partition_table(instance_id) else {
+        return false;
+    };
+    let table = lock(&table).clone();
+    unsafe { write_partition_result(table, partition_type, subtype, address_out, size_out) }
+}
+
+/// Returns the otadata address in the currently active firmware table.
+#[no_mangle]
+pub extern "C" fn meshemu_get_otadata_address() -> u32 {
+    active_partition_table().otadata_address().unwrap_or(0)
+}
+
+/// Applies the same dual-signal Launcher detection used by real firmware.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_is_under_launcher(instance_id: *const c_char) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    get_partition_table(instance_id).is_some_and(|table| lock(&table).is_under_launcher())
+}
+
+unsafe fn ffi_string_allow_empty<'a>(value: *const c_char) -> Option<&'a str> {
+    if value.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(value) }.to_str().ok()
+}
+
+unsafe fn write_partition_result(
+    table: mycelium_board::VirtualPartitionTable,
+    partition_type: u8,
+    subtype: u8,
+    address_out: *mut u32,
+    size_out: *mut u32,
+) -> bool {
+    if address_out.is_null() || size_out.is_null() {
+        return false;
+    }
+    unsafe {
+        *address_out = 0;
+        *size_out = 0;
+    }
+    let Some(partition) = table.find_first(partition_type, subtype) else {
+        return false;
+    };
+    unsafe {
+        *address_out = partition.address;
+        *size_out = partition.size;
+    }
+    true
 }
 
 /// Mounts the virtual SPIFFS partition for an emulator instance.
@@ -394,6 +742,18 @@ pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_le
     }
     let output = unsafe { std::slice::from_raw_parts_mut(buf, max_len as usize) };
     gps.manager.read(output).min(i32::MAX as usize) as i32
+}
+
+/// Advances the virtual GPS clock and movement model.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
+    if let Some(gps) = unsafe { gps_mut(gps) } {
+        gps.manager.tick(delta_ms);
+    }
 }
 
 /// Enables or disables NMEA output.
@@ -1026,16 +1386,16 @@ pub unsafe extern "C" fn meshemu_radio_create(
     lat: f64,
     lon: f64,
 ) -> *mut c_void {
-    if instance_id.is_null()
-        || !valid_radio_config(
-            freq_mhz,
-            bandwidth_khz,
-            spreading_factor,
-            coding_rate,
-            tx_power_dbm,
-        )
-        || !valid_position(lat, lon)
-    {
+    let Some(radio_state) = sx1262_state(
+        freq_mhz,
+        bandwidth_khz,
+        spreading_factor,
+        coding_rate,
+        tx_power_dbm,
+    ) else {
+        return ptr::null_mut();
+    };
+    if instance_id.is_null() || !valid_position(lat, lon) {
         return ptr::null_mut();
     }
 
@@ -1046,25 +1406,21 @@ pub unsafe extern "C" fn meshemu_radio_create(
         return ptr::null_mut();
     }
 
-    let channel = RadioChannel {
-        freq_mhz,
-        bandwidth_khz,
-        spreading_factor,
-        coding_rate,
-    };
     let mut state = lock(&BUS);
     if !state.node_ids.insert(node_id.clone()) {
         return ptr::null_mut();
     }
-    state
-        .bus
-        .register_node(node_id.clone(), (lat, lon), tx_power_dbm, channel.clone());
+    state.bus.register_node(
+        node_id.clone(),
+        (lat, lon),
+        radio_state.tx_power_dbm,
+        radio_state.channel.clone(),
+    );
     drop(state);
 
     Box::into_raw(Box::new(RadioHandle {
         node_id,
-        channel,
-        tx_power_dbm,
+        radio: radio_state,
         pending: Mutex::new(VecDeque::new()),
         last_rx: Mutex::new(None),
     })) as *mut c_void
@@ -1096,9 +1452,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     };
     let airtime_ms = propagation::airtime_ms(
         bytes.len(),
-        handle.channel.spreading_factor,
-        handle.channel.bandwidth_khz,
-        handle.channel.coding_rate,
+        handle.radio.channel.spreading_factor,
+        handle.radio.channel.bandwidth_khz,
+        handle.radio.channel.coding_rate,
         8,
         true,
     );
@@ -1106,9 +1462,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     let timestamp_ms = state.now_ms;
     state.bus.broadcast(TxEvent {
         node_id: handle.node_id.clone(),
-        channel: handle.channel.clone(),
+        channel: handle.radio.channel.clone(),
         data: bytes.to_vec(),
-        tx_power_dbm: handle.tx_power_dbm,
+        tx_power_dbm: handle.radio.tx_power_dbm,
         airtime_ms,
         position: (0.0, 0.0),
         timestamp_ms,
@@ -1117,19 +1473,24 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
 
 /// Copies one queued packet into `buffer`, returning zero when none is ready.
 ///
-/// If the buffer is too small, the packet remains queued and its required
-/// length is returned as a negative value.
+/// If the buffer is too small, `truncated` is set, the packet remains queued,
+/// and its required length is returned as a negative value.
 ///
 /// # Safety
 ///
 /// `radio` must be a live bridge handle, and `buffer` must reference at least
-/// `max_len` writable bytes when `max_len` is positive.
+/// `max_len` writable bytes when `max_len` is positive. When non-null,
+/// `truncated` must point to writable storage.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_radio_recv_raw(
     radio: *mut c_void,
     buffer: *mut u8,
     max_len: i32,
+    truncated: *mut bool,
 ) -> i32 {
+    if !truncated.is_null() {
+        unsafe { *truncated = false };
+    }
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0;
     };
@@ -1146,6 +1507,9 @@ pub unsafe extern "C" fn meshemu_radio_recv_raw(
         return 0;
     };
     if packet.data.len() > max_len as usize {
+        if !truncated.is_null() {
+            unsafe { *truncated = true };
+        }
         return -(packet.data.len().min(i32::MAX as usize) as i32);
     }
     let packet = pending.pop_front().expect("front was checked above");
@@ -1170,9 +1534,9 @@ pub unsafe extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: 
     }
     propagation::airtime_ms(
         len as usize,
-        handle.channel.spreading_factor,
-        handle.channel.bandwidth_khz,
-        handle.channel.coding_rate,
+        handle.radio.channel.spreading_factor,
+        handle.radio.channel.bandwidth_khz,
+        handle.radio.channel.coding_rate,
         8,
         true,
     )
@@ -1247,11 +1611,19 @@ pub unsafe extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
 #[no_mangle]
 pub extern "C" fn meshemu_bus_tick(now_ms: u64) {
     let mut state = lock(&BUS);
-    state.now_ms = now_ms;
-    state.bus.tick(now_ms);
+    // Host clocks can be reset or sampled out of order. Radio airtime and
+    // overlap decisions use a monotonic timeline, so clamp backward jumps.
+    let monotonic_now_ms = state.now_ms.max(now_ms);
+    state.now_ms = monotonic_now_ms;
+    state.bus.tick(monotonic_now_ms);
 }
 
 #[cfg(test)]
 pub(crate) fn reset_bus() {
     *lock(&BUS) = BusState::new();
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn radio_state(radio: *mut c_void) -> Option<Sx1262State> {
+    Some((unsafe { handle_ref(radio) })?.radio.clone())
 }
