@@ -3,18 +3,30 @@
 The Mycelium Firmware SDK is the C interface between a MeshCore-based firmware
 and Mycelium's virtual T-Deck hardware. A firmware shared library exports three
 entry points for the emulator and calls the Host Services API to create and
-control its radio, board, display, GPS, storage, input, clock, packet manager,
-buzzer, and logging facilities.
+control its radio, board, display, GPS, storage, input, and buzzer facilities.
 
 The SDK contains declarations only. Mycelium supplies the implementations when
 it loads the firmware.
 
+## Canonical headers
+
+The C ABI declarations in `core/bridge/include/meshemu_bridge_*.h` are the
+canonical source of truth and must match the Rust `extern "C"` exports. The
+headers in `firmware-sdk/include/` are forwarding headers, so firmware uses
+SDK-friendly names without maintaining a second copy of each prototype.
+
+When adding or changing a bridge export, update its canonical bridge header and
+extend `firmware-sdk/tests/abi_link.c` to call it through the corresponding SDK
+header. Run `make test-sdk-headers` to compile the C consumer and link it against
+the Rust bridge.
+
 ## Integration
 
-Add both `firmware-sdk/` and `firmware-sdk/include/` to the firmware's header
-search path. Include `meshemu.h` wherever the three firmware entry points are
-defined, and include individual Host Services headers wherever their APIs are
-used.
+Add `firmware-sdk/`, `firmware-sdk/include/`, and `core/bridge/include/` to the
+firmware's header search path. Include `meshemu.h` wherever the three firmware
+entry points are defined, and include individual Host Services headers wherever
+their APIs are used. If the SDK is vendored, vendor the canonical bridge
+headers with it and update the third include path accordingly.
 
 ### PlatformIO
 
@@ -26,11 +38,11 @@ platform = native
 build_flags =
     -I/path/to/Project-Mycelium/firmware-sdk
     -I/path/to/Project-Mycelium/firmware-sdk/include
+    -I/path/to/Project-Mycelium/core/bridge/include
 ```
 
-When the SDK is vendored inside the PlatformIO project, replace the absolute
-paths with paths relative to the project directory, such as
-`-Ifirmware-sdk` and `-Ifirmware-sdk/include`.
+When the SDK and bridge headers are vendored inside the PlatformIO project,
+replace the absolute paths with paths relative to the project directory.
 
 ### CMake
 
@@ -42,6 +54,7 @@ add_library(meshemu_sdk INTERFACE)
 target_include_directories(meshemu_sdk INTERFACE
     "${PROJECT_SOURCE_DIR}/firmware-sdk"
     "${PROJECT_SOURCE_DIR}/firmware-sdk/include"
+    "${PROJECT_SOURCE_DIR}/core/bridge/include"
 )
 
 target_link_libraries(my_firmware PRIVATE meshemu_sdk)
@@ -56,17 +69,13 @@ time.
 | Header | Purpose |
 | --- | --- |
 | [`meshemu.h`](meshemu.h) | Required `firmware_setup`, `firmware_loop`, and optional-display contract |
-| [`meshemu_types.h`](include/meshemu_types.h) | Shared board, radio, GPS, position, and logging types |
-| [`meshemu_radio.h`](include/meshemu_radio.h) | RadioBus-backed virtual radio and packet statistics |
+| [`meshemu_radio.h`](include/meshemu_radio.h) | RadioBus-backed virtual radio |
 | [`meshemu_board.h`](include/meshemu_board.h) | Virtual MeshCore `MainBoard` and battery state |
-| [`meshemu_clock.h`](include/meshemu_clock.h) | Virtual MeshCore millisecond clock |
-| [`meshemu_packets.h`](include/meshemu_packets.h) | Virtual packet manager |
 | [`meshemu_display.h`](include/meshemu_display.h) | SDL2-backed LVGL display and framebuffer capture |
 | [`meshemu_storage.h`](include/meshemu_storage.h) | Host-directory-backed SPIFFS and SD card |
 | [`meshemu_gps.h`](include/meshemu_gps.h) | Virtual GPS position and NMEA sentence stream |
 | [`meshemu_input.h`](include/meshemu_input.h) | Virtual T-Deck I2C keyboard |
 | [`meshemu_buzzer.h`](include/meshemu_buzzer.h) | Host audio tone playback |
-| [`meshemu_log.h`](include/meshemu_log.h) | Firmware-to-Mycelium tracing bridge |
 
 ## Minimal firmware
 
@@ -76,14 +85,12 @@ per loop call, and exposes the display handle to Mycelium:
 ```c
 #include "meshemu.h"
 #include "meshemu_display.h"
-#include "meshemu_log.h"
 
 static void* display;
 
 void firmware_setup(void)
 {
-    display = meshemu_display_create(320, 240, "Minimal Mycelium Firmware");
-    MYCELIUM_INFO("firmware", "setup complete");
+    display = meshemu_display_create("minimal-firmware", 320, 240);
 }
 
 void firmware_loop(void)
