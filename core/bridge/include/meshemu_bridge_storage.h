@@ -35,6 +35,7 @@ bool meshemu_sdcard_write(
     size_t len
 );
 
+bool meshemu_storage_destroy(const char *instance_id);
 void meshemu_storage_data_free(uint8_t *data);
 
 #ifdef __cplusplus

@@ -1,12 +1,28 @@
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::spiffs::{instance_directory, safe_join};
 
-/// Capacity information for the host filesystem containing a virtual SD card.
+pub const TDECK_LORA_CS_PIN: u8 = 9;
+pub const TDECK_SDCARD_CS_PIN: u8 = 39;
+pub const SDHC_MAX_CAPACITY: u64 = 32 * 1_024 * 1_024 * 1_024;
+pub const FAT32_MAX_VOLUME_SIZE: u64 = 32 * 1_024 * 1_024 * 1_024;
+pub const FAT32_MAX_FILE_SIZE: u64 = (4 * 1_024 * 1_024 * 1_024) - 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SdPartitionTable {
+    Mbr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SdFilesystem {
+    Fat32,
+}
+
+/// Capacity information for a bounded virtual SD card.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SdCardInfo {
     pub total_bytes: u64,
@@ -14,35 +30,48 @@ pub struct SdCardInfo {
     pub free_bytes: u64,
 }
 
-/// Emulates an SD card using a host directory.
+/// Emulates the T-Deck's FAT32 SDHC card on its shared SPI bus.
 #[derive(Debug)]
 pub struct VirtualSdCard {
     instance_id: String,
     base_path: PathBuf,
     mounted: bool,
+    capacity: u64,
+    lora_cs_high: bool,
 }
 
 impl VirtualSdCard {
     pub fn new(instance_id: &str) -> Self {
-        let base_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".mycelium")
-            .join("instances")
-            .join(instance_directory(instance_id))
-            .join("sdcard");
-        Self {
-            instance_id: instance_id.to_owned(),
-            base_path,
-            mounted: false,
-        }
+        let base_path = default_path(instance_id);
+        Self::with_path_and_capacity(instance_id, base_path, SDHC_MAX_CAPACITY)
+    }
+
+    pub fn with_capacity(instance_id: &str, capacity: u64) -> Self {
+        Self::with_path_and_capacity(instance_id, default_path(instance_id), capacity)
     }
 
     #[cfg(test)]
     pub(crate) fn at_path(instance_id: &str, base_path: PathBuf) -> Self {
+        Self::with_path_and_capacity(instance_id, base_path, SDHC_MAX_CAPACITY)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn at_path_with_capacity(
+        instance_id: &str,
+        base_path: PathBuf,
+        capacity: u64,
+    ) -> Self {
+        Self::with_path_and_capacity(instance_id, base_path, capacity)
+    }
+
+    fn with_path_and_capacity(instance_id: &str, base_path: PathBuf, capacity: u64) -> Self {
         Self {
             instance_id: instance_id.to_owned(),
             base_path,
             mounted: false,
+            capacity,
+            // The LoRa device is deselected while the bus is idle.
+            lora_cs_high: true,
         }
     }
 
@@ -50,11 +79,41 @@ impl VirtualSdCard {
         &self.instance_id
     }
 
-    /// Mounts the card, creating its directory if needed.
+    pub const fn chip_select_pin(&self) -> u8 {
+        TDECK_SDCARD_CS_PIN
+    }
+
+    pub const fn lora_chip_select_pin(&self) -> u8 {
+        TDECK_LORA_CS_PIN
+    }
+
+    pub const fn partition_table(&self) -> SdPartitionTable {
+        SdPartitionTable::Mbr
+    }
+
+    pub const fn filesystem(&self) -> SdFilesystem {
+        SdFilesystem::Fat32
+    }
+
+    pub fn set_lora_cs_high(&mut self, high: bool) {
+        self.lora_cs_high = high;
+    }
+
+    pub fn lora_cs_high(&self) -> bool {
+        self.lora_cs_high
+    }
+
+    /// Mounts an SDHC/FAT32 volume when LoRa has released the shared SPI bus.
     pub fn mount(&mut self) -> Result<bool, io::Error> {
+        self.ensure_bus_available()?;
+        self.validate_capacity()?;
         fs::create_dir_all(&self.base_path)?;
         self.mounted = true;
         Ok(true)
+    }
+
+    pub fn unmount(&mut self) {
+        self.mounted = false;
     }
 
     pub fn is_mounted(&self) -> bool {
@@ -66,7 +125,21 @@ impl VirtualSdCard {
     }
 
     pub fn write_file(&self, path: &str, data: &[u8]) -> Result<(), io::Error> {
+        let new_size = u64::try_from(data.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SD file is too large"))?;
+        validate_file_size(new_size)?;
         let full_path = self.resolve(path)?;
+        let old_size = full_path
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let used_without_file = directory_size(&self.base_path)?.saturating_sub(old_size);
+        if used_without_file.saturating_add(new_size) > self.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "write exceeds SD card capacity",
+            ));
+        }
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -85,24 +158,103 @@ impl VirtualSdCard {
         Ok(files)
     }
 
-    /// Reports capacity for the host filesystem containing this card.
-    pub fn info(&self) -> SdCardInfo {
-        let total_bytes = fs2::total_space(&self.base_path).unwrap_or(0);
-        let free_bytes = fs2::available_space(&self.base_path).unwrap_or(0);
-        SdCardInfo {
-            total_bytes,
-            used_bytes: total_bytes.saturating_sub(free_bytes),
-            free_bytes,
-        }
+    pub fn info(&self) -> Result<SdCardInfo, io::Error> {
+        self.ensure_ready()?;
+        let used_bytes = directory_size(&self.base_path)?.min(self.capacity);
+        Ok(SdCardInfo {
+            total_bytes: self.capacity,
+            used_bytes,
+            free_bytes: self.capacity.saturating_sub(used_bytes),
+        })
     }
 
     fn resolve(&self, path: &str) -> Result<PathBuf, io::Error> {
+        self.ensure_ready()?;
+        safe_join(&self.base_path, path)
+    }
+
+    fn ensure_ready(&self) -> Result<(), io::Error> {
         if !self.mounted {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "SD card is not mounted",
             ));
         }
-        safe_join(&self.base_path, path)
+        self.ensure_bus_available()
+    }
+
+    fn ensure_bus_available(&self) -> Result<(), io::Error> {
+        if self.lora_cs_high {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "GPIO9 LoRa CS must be HIGH before SD access",
+            ))
+        }
+    }
+
+    fn validate_capacity(&self) -> Result<(), io::Error> {
+        if self.capacity == 0
+            || self.capacity > SDHC_MAX_CAPACITY
+            || self.capacity > FAT32_MAX_VOLUME_SIZE
+        {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SDHC FAT32 volumes must be between 1 byte and 32 GiB",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn default_path(instance_id: &str) -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mycelium")
+        .join("instances")
+        .join(instance_directory(instance_id))
+        .join("sdcard")
+}
+
+fn validate_file_size(size: u64) -> Result<(), io::Error> {
+    if size > FAT32_MAX_FILE_SIZE {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "FAT32 files cannot exceed 4 GiB minus one byte",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn directory_size(path: &Path) -> Result<u64, io::Error> {
+    fs::read_dir(path)?.try_fold(0_u64, |used, entry| {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            Ok(used.saturating_add(directory_size(&entry.path())?))
+        } else if metadata.is_file() {
+            Ok(used.saturating_add(metadata.len()))
+        } else {
+            Ok(used)
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_file_size, FAT32_MAX_FILE_SIZE};
+
+    #[test]
+    fn fat32_rejects_files_larger_than_four_gibibytes_minus_one() {
+        assert!(validate_file_size(FAT32_MAX_FILE_SIZE).is_ok());
+        assert_eq!(
+            validate_file_size(FAT32_MAX_FILE_SIZE + 1)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 }

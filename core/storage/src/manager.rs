@@ -22,4 +22,9 @@ impl StorageManager {
         self.sdcard.mount()?;
         Ok(())
     }
+
+    pub fn unmount_all(&mut self) {
+        self.spiffs.unmount();
+        self.sdcard.unmount();
+    }
 }
