@@ -14,17 +14,15 @@
  *
  *   include/meshemu_radio.h    - RadioBus-backed radio
  *   include/meshemu_board.h    - virtual MainBoard
- *   include/meshemu_clock.h    - millisecond clock
- *   include/meshemu_packets.h  - packet manager
  *   include/meshemu_display.h  - SDL2/LVGL display
  *   include/meshemu_storage.h  - SPIFFS and SD card storage
  *   include/meshemu_gps.h      - GPS and NMEA data
  *   include/meshemu_input.h    - T-Deck keyboard
  *   include/meshemu_buzzer.h   - host audio
- *   include/meshemu_log.h      - tracing bridge
  *
- * Add both firmware-sdk/ and firmware-sdk/include/ to the firmware project's
- * header search path. See firmware-sdk/README.md for integration examples.
+ * Add firmware-sdk/, firmware-sdk/include/, and core/bridge/include/ to the
+ * firmware project's header search path. See firmware-sdk/README.md for
+ * integration examples.
  */
 
 #pragma once

@@ -9,7 +9,7 @@
 #include <helpers/StaticPoolPacketManager.h>
 
 #include "meshemu_bridge_clock.h"
-#include "meshemu_bridge_radio.h"
+#include "meshemu_bridge_radio.hpp"
 
 namespace {
 
