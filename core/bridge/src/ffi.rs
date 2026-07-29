@@ -3,7 +3,9 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
 use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
+use sdl2::keyboard::Keycode;
 
 struct BusState {
     bus: RadioBus,
@@ -39,6 +41,106 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 unsafe fn handle_ref<'a>(radio: *mut c_void) -> Option<&'a RadioHandle> {
     (radio as *const RadioHandle).as_ref()
+}
+
+unsafe fn input_manager(instance_id: *const c_char, create: bool) -> Option<SharedInputManager> {
+    if instance_id.is_null() {
+        return None;
+    }
+    let instance_id = unsafe { CStr::from_ptr(instance_id) }.to_str().ok()?;
+    if instance_id.is_empty() {
+        return None;
+    }
+    get_input_manager(instance_id)
+        .or_else(|| create.then(|| register_input_manager(instance_id, 1.0)))
+}
+
+/// Injects a logical GT911 touch coordinate into an instance's input queue.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_inject_touch(
+    instance_id: *const c_char,
+    x: u16,
+    y: u16,
+    pressed: bool,
+) {
+    let Some(manager) = (unsafe { input_manager(instance_id, true) }) else {
+        return;
+    };
+    manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .inject_touch(x, y, pressed);
+}
+
+/// Injects an SDL keycode into an instance's input queue.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_inject_key(
+    instance_id: *const c_char,
+    keycode: u32,
+    pressed: bool,
+) {
+    let Some(keycode) = Keycode::from_i32(keycode as i32) else {
+        return;
+    };
+    let Some(manager) = (unsafe { input_manager(instance_id, true) }) else {
+        return;
+    };
+    manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .inject_key(keycode, pressed);
+}
+
+/// Polls one touch event, packed as x[0..15], y[16..31], pressure[32..39].
+///
+/// Returns zero when no event is queued.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_poll_touch(instance_id: *const c_char) -> u64 {
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return 0;
+    };
+    let event = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .poll_touch();
+    let Some(event) = event else {
+        return 0;
+    };
+    u64::from(event.x) | (u64::from(event.y) << 16) | (u64::from(event.pressure) << 32)
+}
+
+/// Polls one keyboard event, packed as row[0..7], col[8..15], pressed[16].
+///
+/// Returns zero when no event is queued.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_poll_key(instance_id: *const c_char) -> u64 {
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return 0;
+    };
+    let event = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .poll_keyboard();
+    let Some(event) = event else {
+        return 0;
+    };
+    u64::from(event.row) | (u64::from(event.col) << 8) | (u64::from(event.pressed) << 16)
 }
 
 /// Creates an LVGL v9 SDL display for a firmware instance.
