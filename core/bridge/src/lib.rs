@@ -4,34 +4,39 @@ mod ffi;
 mod flash_ffi;
 
 pub use ffi::{
-    meshemu_board_create, meshemu_board_deep_sleep, meshemu_board_destroy,
-    meshemu_board_digital_write, meshemu_board_get_adc, meshemu_board_get_battery,
-    meshemu_board_get_charger_state, meshemu_board_get_last_boot_phase,
-    meshemu_board_get_psram_free, meshemu_board_get_sleep_wake_cause, meshemu_board_get_temp,
-    meshemu_board_ledc_attach, meshemu_board_ledc_write, meshemu_board_psram_found,
-    meshemu_board_psram_readback_test, meshemu_board_psram_release, meshemu_board_psram_reserve,
+    meshemu_board_clear_rtc_noinit, meshemu_board_create, meshemu_board_deep_sleep,
+    meshemu_board_destroy, meshemu_board_digital_write, meshemu_board_get_adc,
+    meshemu_board_get_battery, meshemu_board_get_charger_state, meshemu_board_get_last_boot_phase,
+    meshemu_board_get_mcu_temperature, meshemu_board_get_psram_free,
+    meshemu_board_get_reset_reason, meshemu_board_get_rtc_noinit,
+    meshemu_board_get_sleep_wake_cause, meshemu_board_get_temp, meshemu_board_ledc_attach,
+    meshemu_board_ledc_write, meshemu_board_psram_found, meshemu_board_psram_readback_test,
+    meshemu_board_psram_release, meshemu_board_psram_reserve, meshemu_board_quiesce_peripherals,
     meshemu_board_rtc_gpio_hold, meshemu_board_set_adc_calibration, meshemu_board_set_battery,
-    meshemu_board_set_boot_phase, meshemu_board_set_external_power, meshemu_board_set_periph_power,
-    meshemu_bus_tick, meshemu_display_capture, meshemu_display_capture_free,
-    meshemu_display_create, meshemu_display_create_ex, meshemu_display_create_v,
-    meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read,
-    meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_tick,
-    meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
-    meshemu_i2c_keyboard_inject_key_byte, meshemu_i2c_keyboard_set_cross_reset,
-    meshemu_input_digital_read, meshemu_input_get_touch_mapped, meshemu_input_get_touch_raw,
-    meshemu_input_gt911_get_status, meshemu_input_gt911_set_failure_mode, meshemu_input_inject_key,
-    meshemu_input_inject_touch, meshemu_input_poll_key, meshemu_input_poll_touch,
-    meshemu_input_take_falling_edges, meshemu_radio_create, meshemu_radio_destroy,
-    meshemu_radio_get_dio2_config, meshemu_radio_get_est_airtime, meshemu_radio_get_rssi,
-    meshemu_radio_get_snr, meshemu_radio_is_send_complete, meshemu_radio_recv_raw,
-    meshemu_radio_set_dio2_config, meshemu_radio_set_position, meshemu_radio_start_send,
-    meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_set_behavior, meshemu_sdcard_write,
-    meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free,
-    meshemu_storage_destroy, meshemu_wire_available, meshemu_wire_begin,
-    meshemu_wire_begin_transmission, meshemu_wire_end_transmission, meshemu_wire_probe_address,
-    meshemu_wire_read, meshemu_wire_read_idle_levels, meshemu_wire_request_from,
-    meshemu_wire_set_clock, meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance,
-    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+    meshemu_board_set_boot_phase, meshemu_board_set_external_power,
+    meshemu_board_set_mcu_temperature, meshemu_board_set_periph_power,
+    meshemu_board_set_reset_reason, meshemu_board_set_rtc_noinit, meshemu_board_wdt_disable,
+    meshemu_board_wdt_feed, meshemu_board_wdt_get_status, meshemu_board_wdt_init, meshemu_bus_tick,
+    meshemu_display_capture, meshemu_display_capture_free, meshemu_display_create,
+    meshemu_display_create_ex, meshemu_display_create_v, meshemu_display_destroy,
+    meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read, meshemu_gps_set_enabled,
+    meshemu_gps_set_position, meshemu_gps_tick, meshemu_i2c_keyboard_create,
+    meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key_byte,
+    meshemu_i2c_keyboard_set_cross_reset, meshemu_input_digital_read,
+    meshemu_input_get_touch_mapped, meshemu_input_get_touch_raw, meshemu_input_gt911_get_status,
+    meshemu_input_gt911_set_failure_mode, meshemu_input_inject_key, meshemu_input_inject_touch,
+    meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_input_take_falling_edges,
+    meshemu_radio_create, meshemu_radio_destroy, meshemu_radio_get_dio2_config,
+    meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
+    meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_dio2_config,
+    meshemu_radio_set_position, meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read,
+    meshemu_sdcard_set_behavior, meshemu_sdcard_write, meshemu_spiffs_init, meshemu_spiffs_read,
+    meshemu_spiffs_write, meshemu_storage_data_free, meshemu_storage_destroy,
+    meshemu_wire_available, meshemu_wire_begin, meshemu_wire_begin_transmission,
+    meshemu_wire_end_transmission, meshemu_wire_probe_address, meshemu_wire_read,
+    meshemu_wire_read_idle_levels, meshemu_wire_request_from, meshemu_wire_set_clock,
+    meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance, meshemu_wire_shim_destroy,
+    meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 pub use flash_ffi::{
     meshemu_get_otadata_address, meshemu_is_under_launcher, meshemu_nvs_destroy,
@@ -622,6 +627,11 @@ mod tests {
             assert_eq!(meshemu_board_get_adc(board, 4), 2_389);
             assert_eq!(meshemu_board_get_adc(board, 5), 0);
             assert_eq!(meshemu_board_get_temp(board), 37.5);
+            assert_eq!(meshemu_board_get_mcu_temperature(board), 37.5);
+            meshemu_board_set_mcu_temperature(board, 41.75);
+            assert_eq!(meshemu_board_get_mcu_temperature(board), 41.75);
+            meshemu_board_set_mcu_temperature(board, f32::NAN);
+            assert_eq!(meshemu_board_get_mcu_temperature(board), 41.75);
             meshemu_board_set_battery(board, 3_700);
             assert_eq!(meshemu_board_get_battery(board), 3_700);
             assert_eq!(meshemu_board_get_adc(board, 4), 2_296);
@@ -638,6 +648,130 @@ mod tests {
             assert_eq!(meshemu_board_get_adc(board, 4), 4_095);
             meshemu_board_destroy(board);
         }
+    }
+
+    #[test]
+    fn rtc_noinit_ffi_survives_board_recreation_and_can_be_cleared() {
+        let id = CString::new("ffi-rtc-noinit-node").unwrap();
+        let record = [0x42, 0x10, 0x99, 0x7e];
+        let mut output = [0xff; 4];
+        unsafe {
+            meshemu_board_clear_rtc_noinit(id.as_ptr());
+            let board = meshemu_board_create(id.as_ptr(), 3_900, 35.0);
+            assert!(meshemu_board_set_rtc_noinit(
+                id.as_ptr(),
+                128,
+                record.as_ptr(),
+                record.len()
+            ));
+            meshemu_board_destroy(board);
+
+            let restarted = meshemu_board_create(id.as_ptr(), 3_900, 35.0);
+            assert!(meshemu_board_get_rtc_noinit(
+                id.as_ptr(),
+                128,
+                output.as_mut_ptr(),
+                output.len()
+            ));
+            assert_eq!(output, record);
+            assert!(!meshemu_board_get_rtc_noinit(
+                id.as_ptr(),
+                mycelium_board::RTC_NOINIT_SIZE_BYTES - 1,
+                output.as_mut_ptr(),
+                output.len()
+            ));
+            meshemu_board_clear_rtc_noinit(id.as_ptr());
+            assert!(meshemu_board_get_rtc_noinit(
+                id.as_ptr(),
+                128,
+                output.as_mut_ptr(),
+                output.len()
+            ));
+            assert_eq!(output, [0; 4]);
+            meshemu_board_destroy(restarted);
+        }
+    }
+
+    #[test]
+    fn reset_reason_and_task_watchdog_ffi_match_esp32_values() {
+        let id = CString::new("ffi-reset-wdt-node").unwrap();
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+        unsafe {
+            assert_eq!(
+                meshemu_board_get_reset_reason(board),
+                mycelium_board::RESET_REASON_UNKNOWN
+            );
+            assert!(meshemu_board_set_reset_reason(
+                board,
+                mycelium_board::RESET_REASON_SW
+            ));
+            assert!(meshemu_board_set_reset_reason(board, 0xff));
+            assert_eq!(meshemu_board_get_reset_reason(board), 0xff);
+            assert!(meshemu_board_set_reset_reason(
+                board,
+                mycelium_board::RESET_REASON_SW
+            ));
+            assert_eq!(
+                meshemu_board_get_reset_reason(board),
+                mycelium_board::RESET_REASON_SW
+            );
+            assert_eq!(
+                meshemu_board_wdt_get_status(board),
+                mycelium_board::WDT_STATUS_DISABLED
+            );
+            meshemu_board_wdt_init(board, 30, true);
+            assert!(meshemu_board_wdt_feed(board));
+            assert_eq!(
+                meshemu_board_wdt_get_status(board),
+                mycelium_board::WDT_STATUS_ENABLED
+            );
+            meshemu_board_wdt_disable(board);
+            meshemu_board_wdt_init(board, 0, true);
+            assert_eq!(
+                meshemu_board_wdt_get_status(board),
+                mycelium_board::WDT_STATUS_TIMED_OUT
+            );
+            assert_eq!(
+                meshemu_board_get_reset_reason(board),
+                mycelium_board::RESET_REASON_TASK_WDT
+            );
+            meshemu_board_destroy(board);
+        }
+    }
+
+    #[test]
+    fn quiesce_ffi_powers_off_instance_wire_and_holds_the_rail() {
+        let id = CString::new("ffi-quiesce-node").unwrap();
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+        let wire = unsafe { meshemu_wire_shim_create_for_instance(id.as_ptr()) };
+        unsafe {
+            assert!(meshemu_wire_begin(wire));
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_end_transmission(wire), 0);
+
+            assert!(meshemu_board_quiesce_peripherals(board));
+            assert!(!mycelium_board::peripherals_powered("ffi-quiesce-node"));
+            assert!(!meshemu_wire_probe_address(
+                wire,
+                mycelium_input::KEYBOARD_I2C_ADDRESS
+            ));
+            meshemu_wire_begin_transmission(wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            assert_eq!(meshemu_wire_write(wire, 0x04), 0);
+            assert_eq!(meshemu_wire_end_transmission(wire), 2);
+            assert_eq!(
+                meshemu_wire_request_from(wire, mycelium_input::KEYBOARD_I2C_ADDRESS, 1),
+                0
+            );
+            meshemu_board_set_periph_power(board, true);
+            assert!(!meshemu_wire_probe_address(
+                wire,
+                mycelium_input::KEYBOARD_I2C_ADDRESS
+            ));
+
+            meshemu_wire_shim_destroy(wire);
+            meshemu_board_destroy(board);
+        }
+        mycelium_input::remove_input_manager("ffi-quiesce-node");
     }
 
     #[test]
@@ -779,6 +913,10 @@ mod tests {
         let restarted = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
 
         assert_eq!(meshemu_board_get_last_boot_phase(), 7);
+        assert_eq!(
+            unsafe { meshemu_board_get_reset_reason(restarted) },
+            mycelium_board::RESET_REASON_DEEPSLEEP
+        );
         unsafe { meshemu_board_destroy(restarted) };
     }
 

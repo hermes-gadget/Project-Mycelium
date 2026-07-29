@@ -23,6 +23,11 @@ int main(void)
     (void)meshemu_board_get_adc(board, 4);
     meshemu_board_set_adc_calibration(board, true);
     (void)meshemu_board_get_temp(board);
+    meshemu_board_set_mcu_temperature(board, 35.0f);
+    (void)meshemu_board_get_mcu_temperature(board);
+    (void)meshemu_board_set_rtc_noinit(id, 0, &byte, 1);
+    (void)meshemu_board_get_rtc_noinit(id, 0, &byte, 1);
+    meshemu_board_clear_rtc_noinit(id);
     (void)meshemu_board_psram_found(board);
     (void)meshemu_board_get_psram_free(board);
     (void)meshemu_board_psram_readback_test(board);
@@ -35,6 +40,13 @@ int main(void)
     meshemu_board_set_external_power(board, true);
     (void)meshemu_board_get_charger_state(board);
     meshemu_board_rtc_gpio_hold(board, 9, true);
+    (void)meshemu_board_set_reset_reason(board, RESET_REASON_SW);
+    (void)meshemu_board_get_reset_reason(board);
+    meshemu_board_wdt_init(board, 30, true);
+    (void)meshemu_board_wdt_feed(board);
+    (void)meshemu_board_wdt_get_status(board);
+    meshemu_board_wdt_disable(board);
+    (void)meshemu_board_quiesce_peripherals(board);
     meshemu_board_set_boot_phase(2);
     (void)meshemu_board_get_last_boot_phase();
     (void)meshemu_board_deep_sleep(id, 1, UINT64_C(1) << 45);
