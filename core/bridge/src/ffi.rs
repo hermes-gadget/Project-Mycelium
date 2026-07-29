@@ -212,7 +212,7 @@ pub unsafe extern "C" fn meshemu_spiffs_write(
         unsafe { std::slice::from_raw_parts(data, len) }
     };
     lock(&STORAGE)
-        .get(instance_id)
+        .get_mut(instance_id)
         .is_some_and(|manager| manager.spiffs.write_file(path, bytes).is_ok())
 }
 
@@ -292,6 +292,25 @@ pub unsafe extern "C" fn meshemu_sdcard_write(
     lock(&STORAGE)
         .get(instance_id)
         .is_some_and(|manager| manager.sdcard.write_file(path, bytes).is_ok())
+}
+
+/// Unmounts and removes all storage state for an emulator instance.
+///
+/// Returns whether an instance existed.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_storage_destroy(instance_id: *const c_char) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    let Some(mut manager) = lock(&STORAGE).remove(instance_id) else {
+        return false;
+    };
+    manager.unmount_all();
+    true
 }
 
 /// Releases a buffer returned by a storage read function.

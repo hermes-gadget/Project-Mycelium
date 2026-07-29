@@ -15,7 +15,7 @@ pub use ffi::{
     meshemu_radio_get_snr, meshemu_radio_is_send_complete, meshemu_radio_recv_raw,
     meshemu_radio_set_position, meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read,
     meshemu_sdcard_write, meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write,
-    meshemu_storage_data_free, meshemu_wire_available, meshemu_wire_begin,
+    meshemu_storage_data_free, meshemu_storage_destroy, meshemu_wire_available, meshemu_wire_begin,
     meshemu_wire_begin_transmission, meshemu_wire_end_transmission, meshemu_wire_read,
     meshemu_wire_request_from, meshemu_wire_set_clock, meshemu_wire_shim_create,
     meshemu_wire_shim_create_for_instance, meshemu_wire_shim_destroy,
@@ -347,7 +347,8 @@ mod tests {
             .unwrap()
             .as_nanos();
         let id = CString::new(format!("ffi-storage-{}-{nonce}", std::process::id())).unwrap();
-        let path = CString::new("/nested/data.bin").unwrap();
+        let spiffs_path = CString::new("/data.bin").unwrap();
+        let sdcard_path = CString::new("/nested/data.bin").unwrap();
         let spiffs_data = b"spiffs";
         let sdcard_data = b"sdcard";
 
@@ -355,12 +356,12 @@ mod tests {
             assert!(meshemu_spiffs_init(id.as_ptr()));
             assert!(meshemu_spiffs_write(
                 id.as_ptr(),
-                path.as_ptr(),
+                spiffs_path.as_ptr(),
                 spiffs_data.as_ptr(),
                 spiffs_data.len()
             ));
             let mut len = usize::MAX;
-            let data = meshemu_spiffs_read(id.as_ptr(), path.as_ptr(), &mut len);
+            let data = meshemu_spiffs_read(id.as_ptr(), spiffs_path.as_ptr(), &mut len);
             assert!(!data.is_null());
             assert_eq!(std::slice::from_raw_parts(data, len), spiffs_data);
             meshemu_storage_data_free(data);
@@ -368,14 +369,22 @@ mod tests {
             assert!(meshemu_sdcard_init(id.as_ptr()));
             assert!(meshemu_sdcard_write(
                 id.as_ptr(),
-                path.as_ptr(),
+                sdcard_path.as_ptr(),
                 sdcard_data.as_ptr(),
                 sdcard_data.len()
             ));
-            let data = meshemu_sdcard_read(id.as_ptr(), path.as_ptr(), &mut len);
+            let data = meshemu_sdcard_read(id.as_ptr(), sdcard_path.as_ptr(), &mut len);
             assert!(!data.is_null());
             assert_eq!(std::slice::from_raw_parts(data, len), sdcard_data);
             meshemu_storage_data_free(data);
+            assert!(meshemu_storage_destroy(id.as_ptr()));
+            assert!(!meshemu_spiffs_write(
+                id.as_ptr(),
+                spiffs_path.as_ptr(),
+                spiffs_data.as_ptr(),
+                spiffs_data.len()
+            ));
+            assert!(!meshemu_storage_destroy(id.as_ptr()));
         }
     }
 
@@ -392,6 +401,7 @@ mod tests {
                 std::ptr::null(),
                 1
             ));
+            assert!(!meshemu_storage_destroy(std::ptr::null()));
             meshemu_storage_data_free(std::ptr::null_mut());
         }
     }

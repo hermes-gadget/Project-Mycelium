@@ -11,7 +11,7 @@
 
 int main(void)
 {
-    const char* id = NULL;
+    const char* id = "abi-link";
     uint8_t byte = 0;
     size_t size = 0;
 
@@ -25,10 +25,11 @@ int main(void)
     meshemu_buzzer_stop(id);
     (void)meshemu_buzzer_is_playing(id);
 
-    void* display = meshemu_display_create(id, 320, 240);
-    void* versioned_display = meshemu_display_create_v(320, 240, id, 9);
+    void* display = meshemu_display_create(id, 0, 0);
+    void* versioned_display = meshemu_display_create_v(0, 0, id, 9);
     uint8_t* pixels = meshemu_display_capture(display, &size);
     meshemu_display_capture_free(pixels, size);
+    meshemu_display_destroy(display);
     meshemu_display_destroy(versioned_display);
 
     void* gps = meshemu_gps_create(id, 51.5, -0.1);
@@ -73,6 +74,7 @@ int main(void)
     uint8_t* sdcard_data = meshemu_sdcard_read(id, id, &size);
     (void)meshemu_sdcard_write(id, id, &byte, 1);
     meshemu_storage_data_free(sdcard_data);
+    (void)meshemu_storage_destroy(id);
 
     return 0;
 }
