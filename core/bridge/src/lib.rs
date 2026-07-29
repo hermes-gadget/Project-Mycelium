@@ -62,14 +62,14 @@ mod tests {
         let packet = [1, 2, 3, 4];
         assert!(send(sender, &packet));
         assert!(receive(receiver).is_empty());
-        assert!(!meshemu_radio_is_send_complete(sender));
+        assert!(!unsafe { meshemu_radio_is_send_complete(sender) });
         let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
         meshemu_bus_tick(u64::from(airtime));
         assert_eq!(receive(receiver), packet);
         assert!(unsafe { meshemu_radio_get_rssi(receiver) } < 0.0);
         assert!(unsafe { meshemu_radio_get_snr(receiver) } > 0.0);
         assert_eq!(unsafe { meshemu_radio_get_est_airtime(sender, 16) }, 52);
-        assert!(meshemu_radio_is_send_complete(sender));
+        assert!(unsafe { meshemu_radio_is_send_complete(sender) });
 
         destroy(receiver);
         destroy(sender);
@@ -190,10 +190,10 @@ mod tests {
         assert!(send(sender, &packet));
         assert!(!send(sender, &packet));
         meshemu_bus_tick(u64::from(airtime - 1));
-        assert!(!meshemu_radio_is_send_complete(sender));
+        assert!(!unsafe { meshemu_radio_is_send_complete(sender) });
         assert!(!send(sender, &packet));
         meshemu_bus_tick(u64::from(airtime));
-        assert!(meshemu_radio_is_send_complete(sender));
+        assert!(unsafe { meshemu_radio_is_send_complete(sender) });
         assert!(send(sender, &packet));
 
         destroy(sender);

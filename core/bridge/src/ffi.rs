@@ -959,8 +959,11 @@ pub unsafe extern "C" fn meshemu_radio_get_snr(radio: *mut c_void) -> f32 {
     lock(&handle.last_rx).map(|(_, snr)| snr).unwrap_or(0.0)
 }
 
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_is_send_complete(radio: *mut c_void) -> bool {
+pub unsafe extern "C" fn meshemu_radio_is_send_complete(radio: *mut c_void) -> bool {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return false;
     };
