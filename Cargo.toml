@@ -7,6 +7,7 @@ license = "MIT"
 [workspace]
 members = [
     "core",
+    "core/bridge",
     "core/radio_bus",
     "core/display",
     "core/input",
