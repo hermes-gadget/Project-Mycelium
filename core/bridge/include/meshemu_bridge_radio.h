@@ -29,7 +29,7 @@ public:
                                        spreading_factor, coding_rate,
                                        tx_power_dbm, lat, lon)) {}
 
-    ~MeshemuRadio() override { meshemu_radio_destroy(handle_); }
+    ~MeshemuRadio() { meshemu_radio_destroy(handle_); }
 
     MeshemuRadio(const MeshemuRadio&) = delete;
     MeshemuRadio& operator=(const MeshemuRadio&) = delete;
