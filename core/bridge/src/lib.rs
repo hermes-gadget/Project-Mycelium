@@ -3,9 +3,9 @@
 mod ffi;
 
 pub use ffi::{
-    meshemu_bus_tick, meshemu_radio_create, meshemu_radio_destroy, meshemu_radio_get_rssi,
-    meshemu_radio_get_snr, meshemu_radio_is_send_complete, meshemu_radio_recv_raw,
-    meshemu_radio_set_position, meshemu_radio_start_send,
+    meshemu_bus_tick, meshemu_radio_create, meshemu_radio_destroy, meshemu_radio_get_est_airtime,
+    meshemu_radio_get_rssi, meshemu_radio_get_snr, meshemu_radio_is_send_complete,
+    meshemu_radio_recv_raw, meshemu_radio_set_position, meshemu_radio_start_send,
 };
 
 #[cfg(test)]
@@ -46,6 +46,7 @@ mod tests {
         assert_eq!(receive(receiver), packet);
         assert!(meshemu_radio_get_rssi(receiver) < 0.0);
         assert!(meshemu_radio_get_snr(receiver) > 0.0);
+        assert_eq!(meshemu_radio_get_est_airtime(sender, 16), 56);
         assert!(meshemu_radio_is_send_complete(sender));
 
         meshemu_radio_destroy(receiver);
