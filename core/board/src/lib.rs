@@ -3,6 +3,7 @@
 mod buzzer;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 pub use buzzer::{
@@ -17,6 +18,13 @@ pub const BUZZER_GPIO: u8 = 46;
 pub const ADC_MAX_COUNT: u16 = 4_095;
 pub const BATTERY_MV_PER_ADC_COUNT: f64 = 1.61;
 pub const TP4054_FULL_MV: u16 = 4_200;
+pub const DEFAULT_PSRAM_SIZE_BYTES: u32 = 8_388_608;
+pub const SLEEP_WAKE_CAUSE_UNKNOWN: u8 = 0;
+pub const SLEEP_WAKE_CAUSE_TIMER: u8 = 1;
+pub const SLEEP_WAKE_CAUSE_EXT1: u8 = 2;
+pub const SLEEP_WAKE_CAUSE_TIMER_EXT1: u8 = 3;
+
+static LAST_BOOT_PHASE: AtomicU8 = AtomicU8::new(0);
 
 static PERIPHERAL_POWER: LazyLock<Mutex<HashMap<String, bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -32,6 +40,14 @@ pub fn peripherals_powered(instance_id: &str) -> bool {
         .get(instance_id)
         .copied()
         .unwrap_or(true)
+}
+
+pub fn set_boot_phase(phase: u8) {
+    LAST_BOOT_PHASE.store(phase, Ordering::Release);
+}
+
+pub fn last_boot_phase() -> u8 {
+    LAST_BOOT_PHASE.load(Ordering::Acquire)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,11 +69,15 @@ struct LedcChannel {
 pub struct VirtualBoard {
     pub battery_mv: u16,
     pub mcu_temperature: f32,
+    pub psram_size_bytes: u32,
     pub manufacturer: String,
     pub startup_reason: u8,
     pub external_powered: bool,
     pub periph_pwr_enabled: bool,
     pub instance_id: String,
+    psram_used_bytes: u32,
+    psram_region: Vec<u8>,
+    rtc_gpio_holds: HashMap<u8, bool>,
     ledc_channels: HashMap<u8, LedcChannel>,
 }
 
@@ -67,11 +87,15 @@ impl VirtualBoard {
         Self {
             battery_mv: config.battery_mv,
             mcu_temperature: config.mcu_temperature,
+            psram_size_bytes: DEFAULT_PSRAM_SIZE_BYTES,
             manufacturer: config.manufacturer,
             startup_reason: config.startup_reason,
             external_powered: config.external_powered,
             periph_pwr_enabled: config.periph_pwr_enabled,
             instance_id: instance_id.to_owned(),
+            psram_used_bytes: 0,
+            psram_region: Vec::new(),
+            rtc_gpio_holds: HashMap::new(),
             ledc_channels: HashMap::new(),
         }
     }
@@ -96,6 +120,71 @@ impl VirtualBoard {
 
     pub fn set_battery(&mut self, mv: u16) {
         self.battery_mv = mv;
+    }
+
+    pub fn psram_found(&self) -> bool {
+        self.psram_size_bytes > 0
+    }
+
+    pub fn psram_used_bytes(&self) -> u32 {
+        self.psram_used_bytes.min(self.psram_size_bytes)
+    }
+
+    pub fn psram_free_bytes(&self) -> u32 {
+        self.psram_size_bytes
+            .saturating_sub(self.psram_used_bytes())
+    }
+
+    /// Reserves bytes from external RAM so host adapters can model firmware
+    /// allocations and expose the resulting pressure through free-PSRAM
+    /// telemetry.
+    pub fn reserve_psram(&mut self, bytes: u32) -> bool {
+        if bytes > self.psram_free_bytes() {
+            return false;
+        }
+        self.psram_used_bytes = self.psram_used_bytes.saturating_add(bytes);
+        true
+    }
+
+    pub fn release_psram(&mut self, bytes: u32) {
+        self.psram_used_bytes = self.psram_used_bytes.saturating_sub(bytes);
+    }
+
+    /// Writes a deterministic pattern into an allocatable PSRAM region,
+    /// verifies every byte, restores the previous contents, and releases the
+    /// temporary reservation.
+    pub fn psram_readback_test(&mut self) -> bool {
+        const READBACK_BYTES: u32 = 64;
+
+        let test_bytes = self.psram_free_bytes().min(READBACK_BYTES);
+        if test_bytes == 0 || !self.reserve_psram(test_bytes) {
+            return false;
+        }
+
+        let start = self.psram_used_bytes.saturating_sub(test_bytes) as usize;
+        let end = start.saturating_add(test_bytes as usize);
+        if self.psram_region.len() < end {
+            self.psram_region.resize(end, 0);
+        }
+        let previous = self.psram_region[start..end].to_vec();
+        for (index, byte) in self.psram_region[start..end].iter_mut().enumerate() {
+            *byte = 0xA5 ^ (index as u8).wrapping_mul(0x3D);
+        }
+        let verified = self.psram_region[start..end]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte == (0xA5 ^ (index as u8).wrapping_mul(0x3D)));
+        self.psram_region[start..end].copy_from_slice(&previous);
+        self.release_psram(test_bytes);
+        verified
+    }
+
+    pub fn rtc_gpio_hold(&mut self, gpio: u8, level: bool) {
+        self.rtc_gpio_holds.insert(gpio, level);
+    }
+
+    pub fn rtc_gpio_hold_level(&self, gpio: u8) -> Option<bool> {
+        self.rtc_gpio_holds.get(&gpio).copied()
     }
 
     pub fn set_external_power(&mut self, powered: bool) {
@@ -227,6 +316,67 @@ mod tests {
         assert_eq!(board.get_adc(BATTERY_ADC_GPIO), 2_329);
         assert_eq!(board.get_adc(5), 0);
         assert_eq!(board.get_temperature(), 35.0);
+    }
+
+    #[test]
+    fn psram_defaults_to_eight_megabytes_and_tracks_pressure() {
+        let mut board = VirtualBoard::new("psram-node", BoardConfig::default());
+
+        assert!(board.psram_found());
+        assert_eq!(board.psram_size_bytes, DEFAULT_PSRAM_SIZE_BYTES);
+        assert_eq!(board.psram_used_bytes(), 0);
+        assert_eq!(board.psram_free_bytes(), DEFAULT_PSRAM_SIZE_BYTES);
+        assert!(board.reserve_psram(1_048_576));
+        assert_eq!(board.psram_used_bytes(), 1_048_576);
+        assert_eq!(
+            board.psram_free_bytes(),
+            DEFAULT_PSRAM_SIZE_BYTES - 1_048_576
+        );
+        assert!(!board.reserve_psram(DEFAULT_PSRAM_SIZE_BYTES));
+
+        board.release_psram(524_288);
+        assert_eq!(board.psram_used_bytes(), 524_288);
+        board.release_psram(u32::MAX);
+        assert_eq!(board.psram_used_bytes(), 0);
+    }
+
+    #[test]
+    fn psram_readback_uses_allocatable_memory_without_leaking_it() {
+        let mut board = VirtualBoard::new("psram-readback", BoardConfig::default());
+        assert!(board.reserve_psram(123_456));
+        let free_before = board.psram_free_bytes();
+
+        assert!(board.psram_readback_test());
+        assert_eq!(board.psram_free_bytes(), free_before);
+
+        assert!(board.reserve_psram(free_before));
+        assert!(!board.psram_readback_test());
+        board.psram_size_bytes = 0;
+        assert!(!board.psram_found());
+        assert_eq!(board.psram_free_bytes(), 0);
+        assert!(!board.psram_readback_test());
+    }
+
+    #[test]
+    fn rtc_gpio_holds_remember_each_pin_level() {
+        let mut board = VirtualBoard::new("rtc-hold-node", BoardConfig::default());
+        assert_eq!(board.rtc_gpio_hold_level(9), None);
+
+        board.rtc_gpio_hold(9, true);
+        board.rtc_gpio_hold(45, false);
+
+        assert_eq!(board.rtc_gpio_hold_level(9), Some(true));
+        assert_eq!(board.rtc_gpio_hold_level(45), Some(false));
+    }
+
+    #[test]
+    fn boot_phase_survives_board_recreation() {
+        set_boot_phase(17);
+        let board = VirtualBoard::new("boot-phase-node", BoardConfig::default());
+        drop(board);
+        let _restarted = VirtualBoard::new("boot-phase-node", BoardConfig::default());
+
+        assert_eq!(last_boot_phase(), 17);
     }
 
     #[test]

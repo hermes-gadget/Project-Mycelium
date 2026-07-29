@@ -3,11 +3,15 @@
 mod ffi;
 
 pub use ffi::{
-    meshemu_board_create, meshemu_board_destroy, meshemu_board_digital_write,
-    meshemu_board_get_adc, meshemu_board_get_battery, meshemu_board_get_charger_state,
-    meshemu_board_get_temp, meshemu_board_ledc_attach, meshemu_board_ledc_write,
-    meshemu_board_set_battery, meshemu_board_set_external_power, meshemu_bus_tick,
-    meshemu_display_capture, meshemu_display_capture_free, meshemu_display_create,
+    meshemu_board_create, meshemu_board_deep_sleep, meshemu_board_destroy,
+    meshemu_board_digital_write, meshemu_board_get_adc, meshemu_board_get_battery,
+    meshemu_board_get_charger_state, meshemu_board_get_last_boot_phase,
+    meshemu_board_get_psram_free, meshemu_board_get_sleep_wake_cause, meshemu_board_get_temp,
+    meshemu_board_ledc_attach, meshemu_board_ledc_write, meshemu_board_psram_found,
+    meshemu_board_psram_readback_test, meshemu_board_psram_release, meshemu_board_psram_reserve,
+    meshemu_board_rtc_gpio_hold, meshemu_board_set_battery, meshemu_board_set_boot_phase,
+    meshemu_board_set_external_power, meshemu_bus_tick, meshemu_display_capture,
+    meshemu_display_capture_free, meshemu_display_create, meshemu_display_create_ex,
     meshemu_display_create_v, meshemu_display_destroy, meshemu_gps_create, meshemu_gps_destroy,
     meshemu_gps_read, meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_tick,
     meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
@@ -18,10 +22,11 @@ pub use ffi::{
     meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
     meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_write,
     meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free,
-    meshemu_wire_available, meshemu_wire_begin, meshemu_wire_begin_transmission,
-    meshemu_wire_end_transmission, meshemu_wire_read, meshemu_wire_request_from,
-    meshemu_wire_set_clock, meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance,
-    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+    meshemu_storage_destroy, meshemu_wire_available, meshemu_wire_begin,
+    meshemu_wire_begin_transmission, meshemu_wire_end_transmission, meshemu_wire_read,
+    meshemu_wire_request_from, meshemu_wire_set_clock, meshemu_wire_shim_create,
+    meshemu_wire_shim_create_for_instance, meshemu_wire_shim_destroy,
+    meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 pub use mycelium_board::{meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop};
 
@@ -523,6 +528,148 @@ mod tests {
     }
 
     #[test]
+    fn board_ffi_models_psram_capacity_pressure_and_readback() {
+        let id = CString::new("ffi-psram-node").unwrap();
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+
+        unsafe {
+            assert!(meshemu_board_psram_found(board));
+            assert_eq!(
+                meshemu_board_get_psram_free(board),
+                mycelium_board::DEFAULT_PSRAM_SIZE_BYTES
+            );
+            assert!(meshemu_board_psram_readback_test(board));
+            assert_eq!(
+                meshemu_board_get_psram_free(board),
+                mycelium_board::DEFAULT_PSRAM_SIZE_BYTES
+            );
+
+            assert!(meshemu_board_psram_reserve(board, 1_000_000));
+            assert_eq!(
+                meshemu_board_get_psram_free(board),
+                mycelium_board::DEFAULT_PSRAM_SIZE_BYTES - 1_000_000
+            );
+            assert!(!meshemu_board_psram_reserve(
+                board,
+                mycelium_board::DEFAULT_PSRAM_SIZE_BYTES
+            ));
+            meshemu_board_psram_release(board, 400_000);
+            assert_eq!(
+                meshemu_board_get_psram_free(board),
+                mycelium_board::DEFAULT_PSRAM_SIZE_BYTES - 600_000
+            );
+            meshemu_board_destroy(board);
+
+            let mut missing = Box::new(mycelium_board::VirtualBoard::new(
+                "ffi-no-psram",
+                mycelium_board::BoardConfig::default(),
+            ));
+            missing.psram_size_bytes = 0;
+            let missing = Box::into_raw(missing).cast::<c_void>();
+            assert!(!meshemu_board_psram_found(missing));
+            assert_eq!(meshemu_board_get_psram_free(missing), 0);
+            assert!(!meshemu_board_psram_readback_test(missing));
+            meshemu_board_destroy(missing);
+
+            assert!(!meshemu_board_psram_found(std::ptr::null_mut()));
+            assert_eq!(meshemu_board_get_psram_free(std::ptr::null_mut()), 0);
+            assert!(!meshemu_board_psram_readback_test(std::ptr::null_mut()));
+            assert!(!meshemu_board_psram_reserve(std::ptr::null_mut(), 1));
+            meshemu_board_psram_release(std::ptr::null_mut(), 1);
+        }
+    }
+
+    #[test]
+    fn deep_sleep_advances_time_drops_rx_and_restores_the_radio() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let sender = create("sleep-sender", (0.0, 0.0));
+        let receiver = create("sleep-receiver", (0.0, 0.0001));
+        let receiver_id = CString::new("sleep-receiver").unwrap();
+        let packet = [1, 2, 3, 4];
+        let airtime = unsafe { meshemu_radio_get_est_airtime(sender, packet.len() as i32) };
+
+        meshemu_bus_tick(1_000);
+        assert!(send(sender, &packet));
+        let wake_at = unsafe { meshemu_board_deep_sleep(receiver_id.as_ptr(), 2, 1_u64 << 45) };
+
+        assert_eq!(wake_at, 3_000);
+        assert_eq!(
+            meshemu_board_get_sleep_wake_cause(),
+            mycelium_board::SLEEP_WAKE_CAUSE_TIMER_EXT1
+        );
+        assert_eq!(
+            ffi::sleep_request("sleep-receiver"),
+            Some((1_000, 3_000, 2, 1_u64 << 45, false))
+        );
+        assert!(receive(receiver).is_empty());
+
+        assert!(send(sender, &packet));
+        meshemu_bus_tick(wake_at + u64::from(airtime));
+        assert_eq!(receive(receiver), packet);
+
+        destroy(receiver);
+        destroy(sender);
+    }
+
+    #[test]
+    fn deep_sleep_reports_timer_ext1_and_unknown_wake_sources() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let id = CString::new("wake-causes").unwrap();
+
+        meshemu_bus_tick(10);
+        assert_eq!(
+            unsafe { meshemu_board_deep_sleep(id.as_ptr(), 2, 0) },
+            2_010
+        );
+        assert_eq!(
+            meshemu_board_get_sleep_wake_cause(),
+            mycelium_board::SLEEP_WAKE_CAUSE_TIMER
+        );
+        assert_eq!(
+            unsafe { meshemu_board_deep_sleep(id.as_ptr(), 0, 1_u64 << 3) },
+            2_010
+        );
+        assert_eq!(
+            meshemu_board_get_sleep_wake_cause(),
+            mycelium_board::SLEEP_WAKE_CAUSE_EXT1
+        );
+        assert_eq!(
+            unsafe { meshemu_board_deep_sleep(id.as_ptr(), 0, 0) },
+            2_010
+        );
+        assert_eq!(
+            meshemu_board_get_sleep_wake_cause(),
+            mycelium_board::SLEEP_WAKE_CAUSE_UNKNOWN
+        );
+        assert_eq!(
+            unsafe { meshemu_board_deep_sleep(std::ptr::null(), 10, 0) },
+            2_010
+        );
+    }
+
+    #[test]
+    fn boot_phase_persists_across_destroy_recreate_and_deep_sleep() {
+        let _serial = TEST_BUS.lock().unwrap();
+        ffi::reset_bus();
+        let id = CString::new("ffi-boot-phase").unwrap();
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+
+        meshemu_board_set_boot_phase(7);
+        unsafe {
+            meshemu_board_rtc_gpio_hold(board, 9, true);
+            meshemu_board_rtc_gpio_hold(board, 45, false);
+            meshemu_board_destroy(board);
+            assert_eq!(meshemu_board_deep_sleep(id.as_ptr(), 1, 0), 1_000);
+        }
+        let restarted = unsafe { meshemu_board_create(id.as_ptr(), 3_900, 35.0) };
+
+        assert_eq!(meshemu_board_get_last_boot_phase(), 7);
+        unsafe { meshemu_board_destroy(restarted) };
+    }
+
+    #[test]
     fn board_power_gpio_gates_gps_sd_and_gpio46_pwm_buzzer() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -572,6 +719,7 @@ mod tests {
             ));
 
             meshemu_board_digital_write(board, mycelium_board::PERIPH_PWR_EN_GPIO, true);
+            meshemu_gps_tick(gps, 1_000);
             assert!(
                 meshemu_gps_read(
                     gps,

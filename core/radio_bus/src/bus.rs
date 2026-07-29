@@ -53,6 +53,7 @@ struct NodeState {
     current_channel: RadioChannel,
     inbox: Vec<RxPacket>,
     tx_busy_until_ms: u64,
+    rx_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -117,6 +118,7 @@ impl RadioBus {
                 current_channel: channel,
                 inbox: Vec::new(),
                 tx_busy_until_ms: 0,
+                rx_enabled: true,
             },
         );
     }
@@ -128,6 +130,18 @@ impl RadioBus {
     pub fn update_position(&mut self, id: &str, position: (f64, f64)) {
         if let Some(node) = self.nodes.get_mut(id) {
             node.position = position;
+        }
+    }
+
+    /// Enables or disables packet reception for one node. Entering the
+    /// disabled state clears the hardware receive FIFO, matching the radio
+    /// reset that accompanies ESP32 deep sleep.
+    pub fn set_receive_enabled(&mut self, id: &str, enabled: bool) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.rx_enabled = enabled;
+            if !enabled {
+                node.inbox.clear();
+            }
         }
     }
 
@@ -213,7 +227,10 @@ impl RadioBus {
     fn deliver_completed(&mut self, event: &TxEvent, all_events: &[TxEvent]) {
         let config = self.config;
         for (receiver_id, receiver) in &mut self.nodes {
-            if *receiver_id == event.node_id || receiver.current_channel != event.channel {
+            if *receiver_id == event.node_id
+                || !receiver.rx_enabled
+                || receiver.current_channel != event.channel
+            {
                 continue;
             }
 
@@ -385,6 +402,23 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].data, vec![42]);
         assert_eq!(packets[0].timestamp_ms, 1_100);
+    }
+
+    #[test]
+    fn disabled_receiver_drops_packets_until_reenabled() {
+        let mut bus = RadioBus::new();
+        register(&mut bus, "alice", (51.5074, -0.1278), 14.0);
+        register(&mut bus, "bob", (51.5075, -0.1278), 14.0);
+        bus.set_receive_enabled("bob", false);
+
+        assert!(bus.broadcast(transmission("alice", 1, 1_000)));
+        bus.tick(1_100);
+        assert!(bus.poll("bob").is_empty());
+
+        bus.set_receive_enabled("bob", true);
+        assert!(bus.broadcast(transmission("alice", 2, 1_100)));
+        bus.tick(1_200);
+        assert_eq!(bus.poll("bob")[0].data, vec![2]);
     }
 
     #[test]

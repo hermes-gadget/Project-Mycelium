@@ -3,12 +3,17 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use mycelium_board::{peripherals_powered, BoardConfig, Tp4054State, VirtualBoard};
+use mycelium_board::{
+    peripherals_powered, BoardConfig, Tp4054State, VirtualBoard, SLEEP_WAKE_CAUSE_EXT1,
+    SLEEP_WAKE_CAUSE_TIMER, SLEEP_WAKE_CAUSE_UNKNOWN,
+};
 use mycelium_gps::GpsManager;
 use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
 use mycelium_storage::StorageManager;
+#[cfg(test)]
+use radio_bus::Sx1262State;
 use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
 use sdl2::keyboard::Keycode;
 
@@ -16,6 +21,8 @@ struct BusState {
     bus: RadioBus,
     node_ids: HashSet<String>,
     now_ms: u64,
+    sleep_requests: HashMap<String, (u64, u64, u32, u64, bool)>,
+    last_wake_cause: u8,
 }
 
 impl BusState {
@@ -24,6 +31,8 @@ impl BusState {
             bus: RadioBus::new(),
             node_ids: HashSet::new(),
             now_ms: 0,
+            sleep_requests: HashMap::new(),
+            last_wake_cause: SLEEP_WAKE_CAUSE_UNKNOWN,
         }
     }
 }
@@ -396,6 +405,20 @@ pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_le
     gps.manager.read(output).min(i32::MAX as usize) as i32
 }
 
+/// Advances the virtual GPS clock and movement model.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
+    if let Some(gps) = unsafe { gps_mut(gps) } {
+        if peripherals_powered(&gps.instance_id) {
+            gps.manager.tick(delta_ms);
+        }
+    }
+}
+
 /// Enables or disables NMEA output.
 ///
 /// # Safety
@@ -477,6 +500,60 @@ pub unsafe extern "C" fn meshemu_board_get_temp(board: *mut c_void) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Reports whether external PSRAM is installed.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_found(board: *mut c_void) -> bool {
+    unsafe { board_ref(board) }.is_some_and(VirtualBoard::psram_found)
+}
+
+/// Returns bytes still allocatable from the simulated external PSRAM heap.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_psram_free(board: *mut c_void) -> u32 {
+    unsafe { board_ref(board) }
+        .map(VirtualBoard::psram_free_bytes)
+        .unwrap_or(0)
+}
+
+/// Writes and verifies a deterministic pattern in simulated PSRAM.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_readback_test(board: *mut c_void) -> bool {
+    unsafe { board_mut(board) }.is_some_and(VirtualBoard::psram_readback_test)
+}
+
+/// Reserves simulated PSRAM for a firmware allocation.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_reserve(board: *mut c_void, bytes: u32) -> bool {
+    unsafe { board_mut(board) }.is_some_and(|board| board.reserve_psram(bytes))
+}
+
+/// Releases a previous simulated PSRAM reservation.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_psram_release(board: *mut c_void, bytes: u32) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.release_psram(bytes);
+    }
+}
+
 /// # Safety
 ///
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
@@ -549,6 +626,84 @@ pub unsafe extern "C" fn meshemu_board_get_charger_state(board: *mut c_void) -> 
     unsafe { board_ref(board) }
         .map(|board| board.charger_state() as u8)
         .unwrap_or(Tp4054State::NoBattery as u8)
+}
+
+/// Holds one RTC-capable GPIO at `level` across deep sleep.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_rtc_gpio_hold(board: *mut c_void, gpio: u8, level: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.rtc_gpio_hold(gpio, level);
+    }
+}
+
+/// Enters and completes one synchronous virtual deep-sleep interval.
+///
+/// Bus time advances by `sleep_secs`; the instance radio drops packets that
+/// finish during that interval. A nonzero wake mask models an EXT1 wake
+/// source, so the reported wake cause is a bitwise combination of timer and
+/// EXT1 flags.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_deep_sleep(
+    instance_id: *const c_char,
+    sleep_secs: u32,
+    wake_pin_mask: u64,
+) -> u64 {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return lock(&BUS).now_ms;
+    };
+
+    let wake_cause = if sleep_secs > 0 {
+        SLEEP_WAKE_CAUSE_TIMER
+    } else {
+        SLEEP_WAKE_CAUSE_UNKNOWN
+    } | if wake_pin_mask != 0 {
+        SLEEP_WAKE_CAUSE_EXT1
+    } else {
+        SLEEP_WAKE_CAUSE_UNKNOWN
+    };
+
+    let mut state = lock(&BUS);
+    let requested_at_ms = state.now_ms;
+    let wake_at_ms = requested_at_ms.saturating_add(u64::from(sleep_secs).saturating_mul(1_000));
+    state.sleep_requests.insert(
+        instance_id.to_owned(),
+        (requested_at_ms, wake_at_ms, sleep_secs, wake_pin_mask, true),
+    );
+    state.bus.set_receive_enabled(instance_id, false);
+    state.bus.tick(wake_at_ms);
+    state.now_ms = wake_at_ms;
+    state.bus.set_receive_enabled(instance_id, true);
+    if let Some(request) = state.sleep_requests.get_mut(instance_id) {
+        request.4 = false;
+    }
+    state.last_wake_cause = wake_cause;
+    wake_at_ms
+}
+
+/// Returns the wake-cause flags from the most recently completed sleep.
+#[no_mangle]
+pub extern "C" fn meshemu_board_get_sleep_wake_cause() -> u8 {
+    lock(&BUS).last_wake_cause
+}
+
+/// Persists the latest boot checkpoint across board-handle restarts.
+#[no_mangle]
+pub extern "C" fn meshemu_board_set_boot_phase(phase: u8) {
+    mycelium_board::set_boot_phase(phase);
+}
+
+/// Returns the latest persistent boot checkpoint.
+#[no_mangle]
+pub extern "C" fn meshemu_board_get_last_boot_phase() -> u8 {
+    mycelium_board::last_boot_phase()
 }
 
 /// Destroys a board handle.
@@ -1117,19 +1272,24 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
 
 /// Copies one queued packet into `buffer`, returning zero when none is ready.
 ///
-/// If the buffer is too small, the packet remains queued and its required
-/// length is returned as a negative value.
+/// If the buffer is too small, `truncated` is set, the packet remains queued,
+/// and its required length is returned as a negative value.
 ///
 /// # Safety
 ///
 /// `radio` must be a live bridge handle, and `buffer` must reference at least
-/// `max_len` writable bytes when `max_len` is positive.
+/// `max_len` writable bytes when `max_len` is positive. When non-null,
+/// `truncated` must point to writable storage.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_radio_recv_raw(
     radio: *mut c_void,
     buffer: *mut u8,
     max_len: i32,
+    truncated: *mut bool,
 ) -> i32 {
+    if !truncated.is_null() {
+        unsafe { *truncated = false };
+    }
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0;
     };
@@ -1146,6 +1306,9 @@ pub unsafe extern "C" fn meshemu_radio_recv_raw(
         return 0;
     };
     if packet.data.len() > max_len as usize {
+        if !truncated.is_null() {
+            unsafe { *truncated = true };
+        }
         return -(packet.data.len().min(i32::MAX as usize) as i32);
     }
     let packet = pending.pop_front().expect("front was checked above");
@@ -1247,11 +1410,23 @@ pub unsafe extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
 #[no_mangle]
 pub extern "C" fn meshemu_bus_tick(now_ms: u64) {
     let mut state = lock(&BUS);
-    state.now_ms = now_ms;
-    state.bus.tick(now_ms);
+    let monotonic_now_ms = state.now_ms.max(now_ms);
+    state.now_ms = monotonic_now_ms;
+    state.bus.tick(monotonic_now_ms);
 }
 
 #[cfg(test)]
 pub(crate) fn reset_bus() {
     *lock(&BUS) = BusState::new();
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn radio_state(radio: *mut c_void) -> Option<Sx1262State> {
+    let handle = unsafe { handle_ref(radio) }?;
+    Sx1262State::new(handle.channel.clone(), handle.tx_power_dbm)
+}
+
+#[cfg(test)]
+pub(crate) fn sleep_request(instance_id: &str) -> Option<(u64, u64, u32, u64, bool)> {
+    lock(&BUS).sleep_requests.get(instance_id).copied()
 }
