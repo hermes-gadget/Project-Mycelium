@@ -765,6 +765,10 @@ pub unsafe extern "C" fn meshemu_display_capture_free(data: *mut u8, size: usize
 /// Destroys a Mycelium-managed compatibility display.
 ///
 /// Native LVGL v9 displays remain owned by their firmware runtime.
+///
+/// # Safety
+///
+/// `display` must be null or a live handle returned by the v8 display creator.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_display_destroy(display: *mut c_void) {
     unsafe { mycelium_display::meshemu_display_destroy(display) };
