@@ -3,10 +3,13 @@
 mod ffi;
 
 pub use ffi::{
-    meshemu_bus_tick, meshemu_display_capture, meshemu_display_capture_free,
-    meshemu_display_create, meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
-    meshemu_i2c_keyboard_inject_key, meshemu_input_inject_key, meshemu_input_inject_touch,
-    meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_radio_create, meshemu_radio_destroy,
+    meshemu_board_create, meshemu_board_destroy, meshemu_board_get_battery, meshemu_board_get_temp,
+    meshemu_board_set_battery, meshemu_bus_tick, meshemu_display_capture,
+    meshemu_display_capture_free, meshemu_display_create, meshemu_gps_create, meshemu_gps_destroy,
+    meshemu_gps_read, meshemu_gps_set_enabled, meshemu_gps_set_position,
+    meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key,
+    meshemu_input_inject_key, meshemu_input_inject_touch, meshemu_input_poll_key,
+    meshemu_input_poll_touch, meshemu_radio_create, meshemu_radio_destroy,
     meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
     meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
     meshemu_radio_start_send, meshemu_wire_available, meshemu_wire_begin_transmission,
@@ -221,5 +224,62 @@ mod tests {
         assert_eq!(unsafe { meshemu_input_poll_key(id.as_ptr()) }, 1 << 16);
         assert_eq!(unsafe { meshemu_input_poll_key(id.as_ptr()) }, 0);
         mycelium_input::remove_input_manager("ffi-input-node");
+    }
+
+    #[test]
+    fn gps_ffi_streams_nmea_and_can_be_disabled() {
+        let id = CString::new("ffi-gps-node").unwrap();
+        let gps = unsafe { meshemu_gps_create(id.as_ptr(), 51.5074, -0.1278) };
+        assert!(!gps.is_null());
+        let mut buffer = [0_u8; 256];
+
+        let len = unsafe { meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32) };
+        let sentence = std::str::from_utf8(&buffer[..len as usize]).unwrap();
+        assert!(sentence.starts_with("$GPGGA,"));
+        assert!(sentence.contains(",5130.4440,N,00007.6680,W,"));
+
+        unsafe {
+            meshemu_gps_set_position(gps, -33.8688, 151.2093, 58.0);
+            meshemu_gps_set_enabled(gps, false);
+            assert_eq!(
+                meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32),
+                0
+            );
+            meshemu_gps_destroy(gps);
+        }
+    }
+
+    #[test]
+    fn board_ffi_exposes_battery_and_temperature() {
+        let id = CString::new("ffi-board-node").unwrap();
+        let board = unsafe { meshemu_board_create(id.as_ptr(), 3_850, 37.5) };
+        assert!(!board.is_null());
+
+        unsafe {
+            assert_eq!(meshemu_board_get_battery(board), 3_850);
+            assert_eq!(meshemu_board_get_temp(board), 37.5);
+            meshemu_board_set_battery(board, 3_700);
+            assert_eq!(meshemu_board_get_battery(board), 3_700);
+            meshemu_board_destroy(board);
+        }
+    }
+
+    #[test]
+    fn gps_and_board_ffi_reject_invalid_arguments() {
+        let id = CString::new("ffi-invalid-node").unwrap();
+        unsafe {
+            assert!(meshemu_gps_create(std::ptr::null(), 0.0, 0.0).is_null());
+            assert!(meshemu_gps_create(id.as_ptr(), 91.0, 0.0).is_null());
+            assert_eq!(
+                meshemu_gps_read(std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                0
+            );
+            assert!(meshemu_board_create(std::ptr::null(), 3_900, 35.0).is_null());
+            assert!(meshemu_board_create(id.as_ptr(), 3_900, f32::NAN).is_null());
+            assert_eq!(meshemu_board_get_battery(std::ptr::null_mut()), 0);
+            assert_eq!(meshemu_board_get_temp(std::ptr::null_mut()), 0.0);
+            meshemu_gps_destroy(std::ptr::null_mut());
+            meshemu_board_destroy(std::ptr::null_mut());
+        }
     }
 }
