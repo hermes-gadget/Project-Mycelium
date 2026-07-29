@@ -45,8 +45,12 @@ unsafe fn handle_ref<'a>(radio: *mut c_void) -> Option<&'a RadioHandle> {
 ///
 /// Returns null when the identifier or radio configuration is invalid, or when
 /// another live radio already uses the same identifier.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_create(
+pub unsafe extern "C" fn meshemu_radio_create(
     instance_id: *const c_char,
     freq_mhz: f64,
     bandwidth_khz: u16,
@@ -99,8 +103,17 @@ pub extern "C" fn meshemu_radio_create(
 }
 
 /// Starts an instantaneous virtual transmission.
+///
+/// # Safety
+///
+/// `radio` must be a live bridge handle. When `len` is nonzero, `data` must
+/// reference at least `len` readable bytes.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_start_send(radio: *mut c_void, data: *const u8, len: u32) -> bool {
+pub unsafe extern "C" fn meshemu_radio_start_send(
+    radio: *mut c_void,
+    data: *const u8,
+    len: u32,
+) -> bool {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return false;
     };
@@ -136,8 +149,17 @@ pub extern "C" fn meshemu_radio_start_send(radio: *mut c_void, data: *const u8, 
 }
 
 /// Copies one queued packet into `buffer`, returning zero when none is ready.
+///
+/// # Safety
+///
+/// `radio` must be a live bridge handle, and `buffer` must reference at least
+/// `max_len` writable bytes when `max_len` is positive.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_recv_raw(radio: *mut c_void, buffer: *mut u8, max_len: i32) -> i32 {
+pub unsafe extern "C" fn meshemu_radio_recv_raw(
+    radio: *mut c_void,
+    buffer: *mut u8,
+    max_len: i32,
+) -> i32 {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0;
     };
@@ -162,8 +184,11 @@ pub extern "C" fn meshemu_radio_recv_raw(radio: *mut c_void, buffer: *mut u8, ma
     len as i32
 }
 
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: i32) -> u32 {
+pub unsafe extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: i32) -> u32 {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0;
     };
@@ -180,16 +205,22 @@ pub extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: i32) ->
     )
 }
 
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_get_rssi(radio: *mut c_void) -> f32 {
+pub unsafe extern "C" fn meshemu_radio_get_rssi(radio: *mut c_void) -> f32 {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0.0;
     };
     lock(&handle.last_rx).map(|(rssi, _)| rssi).unwrap_or(0.0)
 }
 
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_get_snr(radio: *mut c_void) -> f32 {
+pub unsafe extern "C" fn meshemu_radio_get_snr(radio: *mut c_void) -> f32 {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0.0;
     };
@@ -201,8 +232,11 @@ pub extern "C" fn meshemu_radio_is_send_complete(radio: *mut c_void) -> bool {
     !radio.is_null()
 }
 
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_set_position(radio: *mut c_void, lat: f64, lon: f64) {
+pub unsafe extern "C" fn meshemu_radio_set_position(radio: *mut c_void, lat: f64, lon: f64) {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return;
     };
@@ -212,8 +246,13 @@ pub extern "C" fn meshemu_radio_set_position(radio: *mut c_void, lat: f64, lon: 
 }
 
 /// Destroys a radio handle. The caller must pass each non-null handle once.
+///
+/// # Safety
+///
+/// `radio` must be null or a live bridge handle. A non-null handle must be
+/// passed exactly once and must not be used afterward.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
+pub unsafe extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
     if radio.is_null() {
         return;
     }
