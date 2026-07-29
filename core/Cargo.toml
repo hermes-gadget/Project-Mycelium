@@ -1,0 +1,11 @@
+[package]
+name = "mycelium-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+autobins = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
