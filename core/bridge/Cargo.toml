@@ -12,3 +12,4 @@ libloading = "0.8"
 mycelium-display = { path = "../display" }
 mycelium-input = { path = "../input" }
 radio_bus = { path = "../radio_bus" }
+sdl2 = { version = "0.38", features = ["bundled"] }

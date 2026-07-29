@@ -546,6 +546,7 @@ dependencies = [
  "mycelium-display",
  "mycelium-input",
  "radio_bus",
+ "sdl2",
 ]
 
 [[package]]
@@ -615,6 +616,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libloading",
+ "mycelium-input",
  "png",
  "sdl2",
 ]

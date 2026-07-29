@@ -5,7 +5,8 @@ mod ffi;
 pub use ffi::{
     meshemu_bus_tick, meshemu_display_capture, meshemu_display_capture_free,
     meshemu_display_create, meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
-    meshemu_i2c_keyboard_inject_key, meshemu_radio_create, meshemu_radio_destroy,
+    meshemu_i2c_keyboard_inject_key, meshemu_input_inject_key, meshemu_input_inject_touch,
+    meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_radio_create, meshemu_radio_destroy,
     meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
     meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
     meshemu_radio_start_send, meshemu_wire_available, meshemu_wire_begin_transmission,
@@ -196,5 +197,29 @@ mod tests {
             assert_eq!(meshemu_wire_available(wire), 0);
             meshemu_wire_shim_destroy(wire);
         }
+    }
+
+    #[test]
+    fn input_ffi_injects_and_consumes_packed_events() {
+        let id = CString::new("ffi-input-node").unwrap();
+        unsafe {
+            meshemu_input_inject_touch(id.as_ptr(), 123, 45, true);
+        }
+        assert_eq!(
+            unsafe { meshemu_input_poll_touch(id.as_ptr()) },
+            123 | (45 << 16) | (255 << 32)
+        );
+        assert_eq!(unsafe { meshemu_input_poll_touch(id.as_ptr()) }, 0);
+
+        unsafe {
+            meshemu_input_inject_key(
+                id.as_ptr(),
+                i32::from(sdl2::keyboard::Keycode::Q) as u32,
+                true,
+            );
+        }
+        assert_eq!(unsafe { meshemu_input_poll_key(id.as_ptr()) }, 1 << 16);
+        assert_eq!(unsafe { meshemu_input_poll_key(id.as_ptr()) }, 0);
+        mycelium_input::remove_input_manager("ffi-input-node");
     }
 }
