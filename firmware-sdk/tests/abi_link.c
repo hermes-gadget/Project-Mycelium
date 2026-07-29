@@ -3,6 +3,8 @@
 #include "meshemu_display.h"
 #include "meshemu_gps.h"
 #include "meshemu_input.h"
+#include "meshemu_nvs.h"
+#include "meshemu_partition.h"
 #include "meshemu_radio.h"
 #include "meshemu_storage.h"
 
@@ -114,6 +116,29 @@ int main(void)
     (void)meshemu_sdcard_write(id, id, &byte, 1);
     meshemu_storage_data_free(sdcard_data);
     (void)meshemu_storage_destroy(id);
+
+    (void)meshemu_nvs_init(id, MESHEMU_NVS_SIZE_STANDALONE);
+    (void)meshemu_nvs_exists(id, "touch", "sd_mig_busy");
+    (void)meshemu_nvs_get_bool(id, "touch", "sd_mig_busy", false);
+    (void)meshemu_nvs_put_bool(id, "touch", "sd_mig_busy", true);
+    char string_value[16];
+    (void)meshemu_nvs_get_string(id, "touch", "label", "", string_value,
+                                 sizeof(string_value));
+    (void)meshemu_nvs_put_string(id, "touch", "label", "T-Deck");
+    (void)meshemu_nvs_remove(id, "touch", "sd_mig_busy");
+
+    uint32_t address = 0;
+    uint32_t partition_size = 0;
+    (void)meshemu_partition_set_launcher_mode(id, false);
+    (void)meshemu_partition_find_first(
+        MESHEMU_PARTITION_TYPE_DATA, MESHEMU_PARTITION_SUBTYPE_DATA_NVS,
+        &address, &partition_size);
+    (void)meshemu_partition_find_first_for_instance(
+        id, MESHEMU_PARTITION_TYPE_DATA, MESHEMU_PARTITION_SUBTYPE_DATA_OTA,
+        &address, &partition_size);
+    (void)meshemu_get_otadata_address();
+    (void)meshemu_is_under_launcher(id);
+    (void)meshemu_nvs_destroy(id);
 
     return 0;
 }
