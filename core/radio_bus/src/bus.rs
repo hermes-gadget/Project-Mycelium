@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use crate::propagation::{self, PropagationModel};
 use crate::types::{RadioChannel, RxPacket, TxEvent};
 
-const DEFAULT_NOISE_FLOOR_DBM: f64 = -120.0;
+const THERMAL_NOISE_DENSITY_DBM_PER_HZ: f64 = -174.0;
+const DEFAULT_NOISE_FIGURE_DB: f64 = 6.0;
 const CAPTURE_THRESHOLD_DB: f64 = 6.0;
 
 /// Physical parameters shared by the virtual radio network.
@@ -16,7 +17,8 @@ pub struct RadioBusConfig {
     pub antenna_gain_rx_dbi: f64,
     /// Feedline, enclosure, polarization, and other unmodelled losses.
     pub system_loss_db: f64,
-    pub noise_floor_dbm: f64,
+    /// Receiver noise figure added to integrated thermal noise.
+    pub noise_figure_db: f64,
     /// Signals this close to a receiver's center frequency contribute
     /// interference, even when their modulation settings are not decodable.
     pub frequency_tolerance_khz: f64,
@@ -32,7 +34,7 @@ impl Default for RadioBusConfig {
             antenna_gain_tx_dbi: 0.0,
             antenna_gain_rx_dbi: 0.0,
             system_loss_db: 6.0,
-            noise_floor_dbm: DEFAULT_NOISE_FLOOR_DBM,
+            noise_figure_db: DEFAULT_NOISE_FIGURE_DB,
             frequency_tolerance_khz: 125.0,
         }
     }
@@ -270,16 +272,20 @@ impl RadioBus {
                 continue;
             }
 
-            let combined_noise_dbm = sum_dbm(&[
-                config.noise_floor_dbm,
+            let noise_floor_dbm =
+                thermal_noise_floor_dbm(event.channel.bandwidth_khz, config.noise_figure_db);
+            let noise_and_interference_dbm = sum_dbm(&[
+                noise_floor_dbm,
                 interference_dbm.unwrap_or(f64::NEG_INFINITY),
             ])
-            .unwrap_or(config.noise_floor_dbm);
+            .unwrap_or(noise_floor_dbm);
             receiver.inbox.push(RxPacket {
                 from_node: event.node_id.clone(),
                 data: event.data.clone(),
                 rssi_dbm,
-                snr_db: rssi_dbm - combined_noise_dbm,
+                // Retain the established field/API name, but report SINR when
+                // overlapping transmissions contribute interference.
+                snr_db: rssi_dbm - noise_and_interference_dbm,
                 channel: event.channel.clone(),
                 timestamp_ms: transmission_end(event),
             });
@@ -314,6 +320,11 @@ fn same_transmission(first: &TxEvent, second: &TxEvent) -> bool {
 
 fn frequency_overlaps(first_mhz: f64, second_mhz: f64, tolerance_khz: f64) -> bool {
     (first_mhz - second_mhz).abs() * 1_000.0 <= tolerance_khz
+}
+
+fn thermal_noise_floor_dbm(bandwidth_khz: u16, noise_figure_db: f64) -> f64 {
+    let bandwidth_hz = f64::from(bandwidth_khz) * 1_000.0;
+    THERMAL_NOISE_DENSITY_DBM_PER_HZ + 10.0 * bandwidth_hz.log10() + noise_figure_db
 }
 
 fn sum_dbm(levels: &[f64]) -> Option<f64> {
@@ -446,6 +457,64 @@ mod tests {
         bus.tick(1_100);
 
         assert!(bus.poll("receiver").is_empty());
+    }
+
+    #[test]
+    fn aggregate_below_sensitivity_interferers_can_corrupt_a_packet() {
+        let mut bus = RadioBus::with_config(RadioBusConfig {
+            propagation_model: PropagationModel::FixedRange {
+                max_distance_km: 10.0,
+            },
+            system_loss_db: 0.0,
+            ..RadioBusConfig::default()
+        });
+        register(&mut bus, "wanted", (0.0, 0.001), -118.0);
+        register(&mut bus, "interferer-a", (0.0, 0.001), -125.0);
+        register(&mut bus, "interferer-b", (0.0, 0.001), -125.0);
+        register(&mut bus, "receiver", (0.0, 0.0), 14.0);
+
+        // Each interferer is below the SF7 sensitivity threshold (-123 dBm),
+        // but together they exceed the six-decibel capture margin.
+        assert!(bus.broadcast(transmission("wanted", 1, 1_000)));
+        assert!(bus.broadcast(transmission("interferer-a", 2, 1_000)));
+        assert!(bus.broadcast(transmission("interferer-b", 3, 1_000)));
+        bus.tick(1_100);
+
+        assert!(bus.poll("receiver").is_empty());
+    }
+
+    #[test]
+    fn reported_snr_is_sinr_when_capture_succeeds() {
+        let mut bus = RadioBus::with_config(RadioBusConfig {
+            propagation_model: PropagationModel::FixedRange {
+                max_distance_km: 10.0,
+            },
+            system_loss_db: 0.0,
+            ..RadioBusConfig::default()
+        });
+        register(&mut bus, "wanted", (0.0, 0.001), -100.0);
+        register(&mut bus, "interferer", (0.0, 0.001), -110.0);
+        register(&mut bus, "receiver", (0.0, 0.0), 14.0);
+
+        assert!(bus.broadcast(transmission("wanted", 1, 1_000)));
+        assert!(bus.broadcast(transmission("interferer", 2, 1_000)));
+        bus.tick(1_100);
+
+        let packets = bus.poll("receiver");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].from_node, "wanted");
+        // Interference dominates the roughly -117 dBm thermal noise floor.
+        assert!(packets[0].snr_db > 9.0 && packets[0].snr_db < 10.0);
+    }
+
+    #[test]
+    fn wider_bandwidth_raises_integrated_thermal_noise() {
+        let narrow = thermal_noise_floor_dbm(125, 6.0);
+        let wide = thermal_noise_floor_dbm(500, 6.0);
+
+        assert!((narrow - -117.0309).abs() < 0.001);
+        assert!((wide - -111.0103).abs() < 0.001);
+        assert!((wide - narrow - 6.0206).abs() < 0.001);
     }
 
     #[test]

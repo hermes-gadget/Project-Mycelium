@@ -61,7 +61,8 @@ int main(void)
 
     void* radio = meshemu_radio_create(id, 915.0, 125, 7, 5, 14.0, 51.5, -0.1);
     (void)meshemu_radio_start_send(radio, &byte, 1);
-    (void)meshemu_radio_recv_raw(radio, &byte, 1);
+    bool truncated = false;
+    (void)meshemu_radio_recv_raw(radio, &byte, 1, &truncated);
     (void)meshemu_radio_get_est_airtime(radio, 1);
     (void)meshemu_radio_get_rssi(radio);
     (void)meshemu_radio_get_snr(radio);

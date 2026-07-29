@@ -25,7 +25,8 @@ public:
     bool valid() const { return handle_ != nullptr; }
 
     int recvRaw(uint8_t* bytes, int size) override {
-        return meshemu_radio_recv_raw(handle_, bytes, size);
+        bool truncated = false;
+        return meshemu_radio_recv_raw(handle_, bytes, size, &truncated);
     }
 
     uint32_t getEstAirtimeFor(int len_bytes) override {
