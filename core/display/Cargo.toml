@@ -10,5 +10,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 anyhow = "1"
 libloading = "0.8"
+mycelium-input = { path = "../input" }
 png = "0.17"
 sdl2 = { version = "0.38", features = ["bundled"] }
