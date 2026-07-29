@@ -186,10 +186,12 @@ impl InputManager {
 
     fn handle_keycode(&mut self, keycode: Keycode, pressed: bool, events: &mut Vec<InputEvent>) {
         if let Some(event) = self.keyboard.handle_key(keycode, pressed) {
-            self.i2c_keyboard
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .inject_key(event.row, event.col, event.pressed);
+            if event.pressed && event.key_byte != 0 {
+                self.i2c_keyboard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .inject_key_byte(event.key_byte);
+            }
             self.keyboard_events.push_back(event);
             events.push(InputEvent::Keyboard(event));
         }
@@ -319,15 +321,19 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_events_update_lvgl_queue_and_raw_i2c_state() {
+    fn keyboard_events_update_lvgl_queue_and_raw_i2c_key_bytes() {
         let mut manager = InputManager::new("node", 1.0);
         let mut wire = manager.wire_shim();
-        wire.write_byte(1);
+        wire.begin();
+        wire.set_clock(crate::wire_shim::KEYBOARD_I2C_CLOCK_HZ);
+        wire.begin_transmission(crate::KEYBOARD_I2C_ADDRESS);
+        wire.write_byte(crate::KEYBOARD_KEY_MODE_COMMAND);
+        assert_eq!(wire.end_transmission(), 0);
 
         assert_eq!(manager.inject_key(Keycode::D, true).len(), 1);
         assert_eq!(manager.poll_keyboard().unwrap().col, 2);
         assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
-        assert_eq!(wire.read(), 0b0000_0100);
+        assert_eq!(wire.read(), i32::from(b'd'));
 
         manager.inject_key(Keycode::D, false);
         assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
@@ -335,9 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn shifted_host_key_reaches_i2c_as_uppercase_ascii() {
+        let mut manager = InputManager::new("node", 1.0);
+        let mut wire = manager.wire_shim();
+        wire.begin();
+        wire.begin_transmission(crate::KEYBOARD_I2C_ADDRESS);
+        wire.write_byte(crate::KEYBOARD_KEY_MODE_COMMAND);
+        assert_eq!(wire.end_transmission(), 0);
+        manager.inject_key(Keycode::LShift, true);
+        manager.inject_key(Keycode::Q, true);
+        assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
+        assert_eq!(wire.read(), i32::from(b'Q'));
+    }
+
+    #[test]
     fn sdl_touch_and_firmware_wire_share_the_gt911() {
         let mut manager = InputManager::new("node", 1.0);
         let mut wire = manager.wire_shim();
+        wire.begin();
         manager.handle_sdl_event(&Event::MouseButtonDown {
             timestamp: 0,
             window_id: 1,

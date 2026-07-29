@@ -12,7 +12,7 @@ pub use gt911::{
     Gt911Controller, Gt911Point, GT911_I2C_ADDRESS, GT911_INT_GPIO, GT911_MAX_TOUCHES,
     GT911_STATUS_REGISTER,
 };
-pub use i2c_keyboard::{I2cTransaction, KEYBOARD_COLS, KEYBOARD_I2C_ADDRESS, KEYBOARD_ROWS};
+pub use i2c_keyboard::{KEYBOARD_I2C_ADDRESS, KEYBOARD_KEY_MODE_COMMAND};
 pub use keyboard::{KeyEvent, KeyboardEmulator, TDeckKeyMapping};
 pub use manager::{
     get_input_manager, register_input_manager, remove_input_manager, InputEvent, InputManager,
