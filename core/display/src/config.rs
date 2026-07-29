@@ -2,6 +2,32 @@ use crate::LvglVersion;
 
 pub const T_DECK_WIDTH: u32 = 320;
 pub const T_DECK_HEIGHT: u32 = 240;
+pub const DEFAULT_DRAW_BUFFER_ROWS: u32 = 24;
+
+/// Firmware-facing display backend options.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayBackendOptions {
+    /// Number of full-width RGB565 rows allocated for LVGL partial rendering.
+    pub draw_buffer_rows: u32,
+    /// Enable the optional ST7789 command/SPI fidelity model.
+    pub st7789_fidelity: bool,
+}
+
+impl Default for DisplayBackendOptions {
+    fn default() -> Self {
+        Self {
+            draw_buffer_rows: DEFAULT_DRAW_BUFFER_ROWS,
+            st7789_fidelity: false,
+        }
+    }
+}
+
+impl DisplayBackendOptions {
+    pub(crate) fn validated(self, height: u32) -> Option<Self> {
+        (self.draw_buffer_rows > 0 && self.draw_buffer_rows <= height).then_some(self)
+    }
+}
 
 /// Configuration shared by the LVGL v8 and v9 display backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,5 +69,13 @@ mod tests {
     #[test]
     fn t_deck_geometry_is_fixed() {
         assert_eq!((T_DECK_WIDTH, T_DECK_HEIGHT), (320, 240));
+    }
+
+    #[test]
+    fn backend_defaults_use_a_partial_t_deck_buffer() {
+        let options = DisplayBackendOptions::default();
+        assert_eq!(options.draw_buffer_rows, 24);
+        assert!(options.draw_buffer_rows < T_DECK_HEIGHT);
+        assert!(!options.st7789_fidelity);
     }
 }

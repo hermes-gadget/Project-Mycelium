@@ -118,6 +118,20 @@ impl FirmwareInstance {
     }
 }
 
+impl Drop for FirmwareInstance {
+    fn drop(&mut self) {
+        let Some(get_display) = self.get_display else {
+            return;
+        };
+        with_firmware_library(&self.lib, || unsafe {
+            let display = get_display();
+            if !display.is_null() {
+                mycelium_display::destroy_managed_display(display);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

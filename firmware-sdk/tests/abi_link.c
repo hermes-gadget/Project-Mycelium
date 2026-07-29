@@ -25,10 +25,14 @@ int main(void)
     meshemu_buzzer_stop(id);
     (void)meshemu_buzzer_is_playing(id);
 
-    void* display = meshemu_display_create(id, 0, 0);
-    void* versioned_display = meshemu_display_create_v(0, 0, id, 9);
+    void* display = meshemu_display_create(320, 240, id);
+    void* versioned_display = meshemu_display_create_v(320, 240, id, 9);
+    const meshemu_display_options display_options = {24, true};
+    void* fidelity_display =
+        meshemu_display_create_ex(320, 240, id, 9, &display_options);
     uint8_t* pixels = meshemu_display_capture(display, &size);
     meshemu_display_capture_free(pixels, size);
+    meshemu_display_destroy(fidelity_display);
     meshemu_display_destroy(display);
     meshemu_display_destroy(versioned_display);
 

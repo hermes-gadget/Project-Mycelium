@@ -1,10 +1,10 @@
 use std::io::Cursor;
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use sdl2::event::{Event, WindowEvent};
 use sdl2::pixels::PixelFormatEnum;
-use sdl2::render::{Canvas, TextureCreator};
-use sdl2::video::{Window, WindowContext};
+use sdl2::render::Canvas;
+use sdl2::video::Window;
 use sdl2::{Sdl, VideoSubsystem};
 
 use crate::LvglVersion;
@@ -36,7 +36,7 @@ pub struct DisplayWindow {
     pub scale: u32,
     pub lvgl_version: LvglVersion,
     canvas: Canvas<Window>,
-    texture_creator: TextureCreator<WindowContext>,
+    texture: *mut sdl2::sys::SDL_Texture,
     framebuffer: Vec<u8>,
     standalone_context: Option<Sdl>,
 }
@@ -79,7 +79,21 @@ impl DisplayWindow {
         canvas
             .set_logical_size(width, height)
             .map_err(|error| anyhow!(error))?;
-        let texture_creator = canvas.texture_creator();
+        // Keep one streaming texture for the window lifetime. Recreating it on
+        // every LVGL flush discards the benefit of partial updates and differs
+        // from the persistent GRAM in an ST7789 controller.
+        let texture = unsafe {
+            sdl2::sys::SDL_CreateTexture(
+                canvas.raw(),
+                PixelFormatEnum::RGB565 as u32,
+                sdl2::sys::SDL_TextureAccess::SDL_TEXTUREACCESS_STREAMING as i32,
+                width as i32,
+                height as i32,
+            )
+        };
+        if texture.is_null() {
+            return Err(anyhow!(sdl2::get_error()));
+        }
 
         Ok(Self {
             id: title.to_owned(),
@@ -88,7 +102,7 @@ impl DisplayWindow {
             scale,
             lvgl_version: LvglVersion::Unknown,
             canvas,
-            texture_creator,
+            texture,
             framebuffer: vec![0; framebuffer_len],
             standalone_context: None,
         })
@@ -103,29 +117,20 @@ impl DisplayWindow {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        ensure!(width > 0 && height > 0, "display area cannot be empty");
-        let right = x.checked_add(width).context("display area x overflowed")?;
-        let bottom = y.checked_add(height).context("display area y overflowed")?;
-        ensure!(
-            right <= self.width && bottom <= self.height,
-            "display area is outside the framebuffer"
-        );
-        let expected = rgb565_len(width, height)?;
-        ensure!(
-            pixels.len() == expected,
-            "RGB565 data length is {}, expected {expected}",
-            pixels.len()
-        );
-
-        let source_pitch = width as usize * 2;
-        let target_pitch = self.width as usize * 2;
-        for row in 0..height as usize {
-            let source_start = row * source_pitch;
-            let target_start = (y as usize + row) * target_pitch + x as usize * 2;
-            self.framebuffer[target_start..target_start + source_pitch]
-                .copy_from_slice(&pixels[source_start..source_start + source_pitch]);
-        }
-        self.render()
+        let area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        crate::framebuffer::update_rgb565(
+            &mut self.framebuffer,
+            self.width,
+            self.height,
+            pixels,
+            area,
+        )?;
+        self.render(area)
     }
 
     /// Capture the current logical framebuffer as PNG bytes.
@@ -157,17 +162,38 @@ impl DisplayWindow {
         self.canvas.window().id()
     }
 
-    fn render(&mut self) -> Result<()> {
-        let mut texture = self
-            .texture_creator
-            .create_texture_streaming(PixelFormatEnum::RGB565, self.width, self.height)
-            .map_err(|error| anyhow!(error))?;
-        texture
-            .update(None, &self.framebuffer, self.width as usize * 2)
-            .map_err(|error| anyhow!(error))?;
-        self.canvas.clear();
-        self.canvas.copy(&texture, None, None).map_err(sdl_error)?;
-        self.canvas.present();
+    fn render(&mut self, area: Rect) -> Result<()> {
+        let rect = sdl2::sys::SDL_Rect {
+            x: area.x as i32,
+            y: area.y as i32,
+            w: area.width as i32,
+            h: area.height as i32,
+        };
+        let source_start = (area.y as usize * self.width as usize + area.x as usize) * 2;
+        let result = unsafe {
+            sdl2::sys::SDL_UpdateTexture(
+                self.texture,
+                &rect,
+                self.framebuffer[source_start..].as_ptr().cast(),
+                (self.width * 2) as i32,
+            )
+        };
+        if result != 0 {
+            return Err(anyhow!(sdl2::get_error()));
+        }
+        unsafe {
+            sdl2::sys::SDL_RenderClear(self.canvas.raw());
+            if sdl2::sys::SDL_RenderCopy(
+                self.canvas.raw(),
+                self.texture,
+                std::ptr::null(),
+                std::ptr::null(),
+            ) != 0
+            {
+                return Err(anyhow!(sdl2::get_error()));
+            }
+            sdl2::sys::SDL_RenderPresent(self.canvas.raw());
+        }
         Ok(())
     }
 
@@ -197,6 +223,12 @@ impl DisplayWindow {
             writer.write_image_data(&rgb)?;
         }
         Ok(png)
+    }
+}
+
+impl Drop for DisplayWindow {
+    fn drop(&mut self) {
+        unsafe { sdl2::sys::SDL_DestroyTexture(self.texture) };
     }
 }
 

@@ -11,7 +11,9 @@ use std::ptr;
 use libloading::Library;
 use sdl2::pixels::PixelFormatEnum;
 
-use crate::framebuffer_size;
+use crate::shared_spi::SharedSpiBus;
+use crate::st7789::{St7789Controller, ST7789_CASET, ST7789_RAMWR, ST7789_RASET};
+use crate::{framebuffer_size, host_rgb565_to_st7789_wire, DisplayBackendOptions, Rect};
 
 const LV_COLOR_DEPTH: u32 = 16;
 
@@ -211,6 +213,7 @@ struct LvglV8Display {
     width: usize,
     height: usize,
     framebuffer: Vec<u8>,
+    controller: Option<St7789Controller>,
     _pixels: Vec<u8>,
     _draw_buf: Box<LvDispDrawBuf>,
     driver: Box<LvDispDrv>,
@@ -274,11 +277,35 @@ impl LvglV8Display {
         // SAFETY: LVGL guarantees `color_p` contains the packed pixels for the
         // inclusive flush area for the duration of this callback.
         let source = unsafe { std::slice::from_raw_parts(pixels, source_len) };
-        for row in 0..height {
-            let source_start = row * width * 2;
-            let target_start = ((y1 as usize + row) * self.width + x1 as usize) * 2;
-            self.framebuffer[target_start..target_start + width * 2]
-                .copy_from_slice(&source[source_start..source_start + width * 2]);
+        if let Some(controller) = self.controller.as_mut() {
+            let column = [(x1 as u16).to_be_bytes(), (x2 as u16).to_be_bytes()].concat();
+            let row = [(y1 as u16).to_be_bytes(), (y2 as u16).to_be_bytes()].concat();
+            let result = controller
+                .write_command(ST7789_CASET, &column)
+                .and_then(|_| controller.write_command(ST7789_RASET, &row))
+                .and_then(|_| controller.write_command(ST7789_RAMWR, &[]))
+                .and_then(|_| {
+                    controller.write_pixels(
+                        &host_rgb565_to_st7789_wire(source).expect("even RGB565 source"),
+                    )
+                });
+            if result.is_ok() {
+                self.framebuffer
+                    .copy_from_slice(controller.framebuffer_host_rgb565());
+            }
+        } else {
+            let _ = crate::framebuffer::update_rgb565(
+                &mut self.framebuffer,
+                self.width as u32,
+                self.height as u32,
+                source,
+                Rect {
+                    x: x1 as u32,
+                    y: y1 as u32,
+                    width: width as u32,
+                    height: height as u32,
+                },
+            );
         }
 
         let rect = sdl2::sys::SDL_Rect {
@@ -319,6 +346,15 @@ impl LvglV8Display {
 /// The display and its SDL resources are thread-affine and must be used,
 /// captured, and destroyed on the thread that creates them.
 pub fn lvgl_v8_init_sdl(instance_id: &str, width: i32, height: i32) -> *mut c_void {
+    lvgl_v8_init_sdl_with_options(instance_id, width, height, DisplayBackendOptions::default())
+}
+
+pub(crate) fn lvgl_v8_init_sdl_with_options(
+    instance_id: &str,
+    width: i32,
+    height: i32,
+    options: DisplayBackendOptions,
+) -> *mut c_void {
     if instance_id.is_empty() || !crate::is_t_deck_resolution(width, height) {
         return ptr::null_mut();
     }
@@ -328,7 +364,7 @@ pub fn lvgl_v8_init_sdl(instance_id: &str, width: i32, height: i32) -> *mut c_vo
     else {
         return ptr::null_mut();
     };
-    unsafe { lvgl_v8_init_sdl_with_api(instance_id, width, height, api) }
+    unsafe { lvgl_v8_init_sdl_with_api(instance_id, width, height, api, options) }
 }
 
 unsafe fn lvgl_v8_init_sdl_with_api(
@@ -336,6 +372,7 @@ unsafe fn lvgl_v8_init_sdl_with_api(
     width: i32,
     height: i32,
     api: LvglV8Api,
+    options: DisplayBackendOptions,
 ) -> *mut c_void {
     if instance_id.is_empty()
         || width <= 0
@@ -343,10 +380,11 @@ unsafe fn lvgl_v8_init_sdl_with_api(
         || width > LvCoord::MAX.into()
         || height > LvCoord::MAX.into()
         || LV_COLOR_DEPTH != 16
+        || options.validated(height as u32).is_none()
     {
         return ptr::null_mut();
     }
-    let Some(pixel_count) = (width as usize).checked_mul(height as usize) else {
+    let Some(pixel_count) = (width as usize).checked_mul(options.draw_buffer_rows as usize) else {
         return ptr::null_mut();
     };
     let Ok(pixel_count_u32) = u32::try_from(pixel_count) else {
@@ -365,6 +403,19 @@ unsafe fn lvgl_v8_init_sdl_with_api(
     // any field is read.
     let mut draw_buf = Box::new(unsafe { std::mem::zeroed::<LvDispDrawBuf>() });
     let mut driver = Box::new(unsafe { std::mem::zeroed::<LvDispDrv>() });
+    let controller = if options.st7789_fidelity {
+        let mut controller =
+            St7789Controller::new(width as u16, height as u16, SharedSpiBus::default());
+        controller.set_reset(false);
+        controller.set_reset(true);
+        if controller.initialize_t_deck().is_err() {
+            return ptr::null_mut();
+        }
+        controller.set_backlight(u8::MAX);
+        Some(controller)
+    } else {
+        None
+    };
 
     unsafe {
         (api.draw_buf_init)(
@@ -387,6 +438,7 @@ unsafe fn lvgl_v8_init_sdl_with_api(
             width: width as usize,
             height: height as usize,
             framebuffer: vec![0; buffer_len],
+            controller,
             _pixels: pixels,
             _draw_buf: draw_buf,
             driver,
@@ -533,12 +585,17 @@ mod tests {
     }
 
     #[test]
-    fn registers_real_v8_driver_and_full_screen_draw_buffer() {
+    fn registers_real_v8_driver_and_configurable_partial_draw_buffer() {
         let _serial = crate::SDL_TEST_LOCK.lock().unwrap();
         std::env::set_var("SDL_VIDEODRIVER", "dummy");
         reset_calls();
 
-        let display = unsafe { lvgl_v8_init_sdl_with_api("v8 registration", 8, 6, fake_api()) };
+        let options = DisplayBackendOptions {
+            draw_buffer_rows: 2,
+            st7789_fidelity: false,
+        };
+        let display =
+            unsafe { lvgl_v8_init_sdl_with_api("v8 registration", 8, 6, fake_api(), options) };
 
         assert!(!display.is_null());
         assert_eq!(crate::LvglVersion::detect(display), crate::LvglVersion::V8);
@@ -552,7 +609,7 @@ mod tests {
         let driver = unsafe { &*driver };
         assert_eq!(driver.hor_res, 8);
         assert_eq!(driver.ver_res, 6);
-        assert_eq!(unsafe { (*driver.draw_buf).size }, 8 * 6);
+        assert_eq!(unsafe { (*driver.draw_buf).size }, 8 * 2);
         assert!(driver.flush_cb.is_some());
 
         assert!(unsafe { destroy_display(display) });
@@ -582,7 +639,11 @@ mod tests {
         let _serial = crate::SDL_TEST_LOCK.lock().unwrap();
         std::env::set_var("SDL_VIDEODRIVER", "dummy");
         reset_calls();
-        let display = unsafe { lvgl_v8_init_sdl_with_api("v8 render", 4, 3, fake_api()) };
+        let options = DisplayBackendOptions {
+            draw_buffer_rows: 1,
+            st7789_fidelity: false,
+        };
+        let display = unsafe { lvgl_v8_init_sdl_with_api("v8 render", 4, 3, fake_api(), options) };
         assert!(!display.is_null());
 
         let driver = DRIVER.load(Ordering::SeqCst);
@@ -621,9 +682,42 @@ mod tests {
         let _serial = crate::SDL_TEST_LOCK.lock().unwrap();
         reset_calls();
 
-        assert!(unsafe { lvgl_v8_init_sdl_with_api("", 4, 3, fake_api()) }.is_null());
-        assert!(unsafe { lvgl_v8_init_sdl_with_api("bad", 0, 3, fake_api()) }.is_null());
-        assert!(unsafe { lvgl_v8_init_sdl_with_api("bad", 4, -1, fake_api()) }.is_null());
+        let options = DisplayBackendOptions {
+            draw_buffer_rows: 1,
+            st7789_fidelity: false,
+        };
+        assert!(unsafe { lvgl_v8_init_sdl_with_api("", 4, 3, fake_api(), options) }.is_null());
+        assert!(unsafe { lvgl_v8_init_sdl_with_api("bad", 0, 3, fake_api(), options) }.is_null());
+        assert!(unsafe { lvgl_v8_init_sdl_with_api("bad", 4, -1, fake_api(), options) }.is_null());
         assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn registers_t_deck_realistic_partial_buffer_sizes() {
+        let _serial = crate::SDL_TEST_LOCK.lock().unwrap();
+        std::env::set_var("SDL_VIDEODRIVER", "dummy");
+        for rows in [10, 24, 40] {
+            reset_calls();
+            let options = DisplayBackendOptions {
+                draw_buffer_rows: rows,
+                st7789_fidelity: false,
+            };
+            let display = unsafe {
+                lvgl_v8_init_sdl_with_api(
+                    "t-deck partial buffer",
+                    crate::T_DECK_WIDTH as i32,
+                    crate::T_DECK_HEIGHT as i32,
+                    fake_api(),
+                    options,
+                )
+            };
+            assert!(!display.is_null());
+            let driver = DRIVER.load(Ordering::SeqCst);
+            assert_eq!(
+                unsafe { (*(*driver).draw_buf).size },
+                crate::T_DECK_WIDTH * rows
+            );
+            assert!(unsafe { destroy_display(display) });
+        }
     }
 }

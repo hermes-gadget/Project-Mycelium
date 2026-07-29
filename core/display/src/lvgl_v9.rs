@@ -1,185 +1,351 @@
-//! Runtime-bound LVGL v9 SDL integration.
+//! Runtime-bound LVGL v9 partial display driver.
 //!
-//! Firmware shared libraries bring their own LVGL build. Resolving its symbols
-//! at runtime keeps the emulator usable for headless firmware and avoids
-//! pinning the Rust workspace to a second LVGL copy.
+//! Firmware shared libraries bring their own LVGL build. Mycelium registers a
+//! flush callback in that runtime and owns a persistent logical RGB565
+//! framebuffer. Capture therefore reads valid driver-owned memory before or
+//! after host presentation and never touches SDL's invalidated backbuffer.
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::cell::RefCell;
+use std::ffi::{c_int, c_void};
 use std::ptr;
 
-use libloading::{Library, Symbol};
-use sdl2::pixels::PixelFormatEnum;
+use libloading::Library;
+
+use crate::shared_spi::SharedSpiBus;
+use crate::st7789::{St7789Controller, ST7789_CASET, ST7789_RAMWR, ST7789_RASET};
+use crate::{host_rgb565_to_st7789_wire, DisplayBackendOptions, Rect, BYTES_PER_PIXEL};
 
 type LvInit = unsafe extern "C" fn();
-type LvSdlWindowCreate = unsafe extern "C" fn(c_int, c_int) -> *mut c_void;
+type LvDisplayCreate = unsafe extern "C" fn(c_int, c_int) -> *mut c_void;
 type LvDisplayDelete = unsafe extern "C" fn(*mut c_void);
-type LvDisplayGetColorFormat = unsafe extern "C" fn(*mut c_void) -> u32;
-type LvSdlWindowSetTitle = unsafe extern "C" fn(*mut c_void, *const c_char);
-type LvSdlWindowSetResizable = unsafe extern "C" fn(*mut c_void, bool);
-type LvSdlWindowGetRenderer = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
-type LvSdlWindowGetWindow = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
-type LvDisplayGetResolution = unsafe extern "C" fn(*mut c_void) -> c_int;
-type SdlHideWindow = unsafe extern "C" fn(*mut c_void);
-type SdlRenderReadPixels =
-    unsafe extern "C" fn(*mut c_void, *const sdl2::sys::SDL_Rect, u32, *mut c_void, c_int) -> c_int;
+type LvDisplaySetColorFormat = unsafe extern "C" fn(*mut c_void, u32);
+type LvDisplaySetBuffers = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32);
+type LvDisplaySetFlushCallback = unsafe extern "C" fn(*mut c_void, Option<FlushCallbackV9>);
+type LvDisplayFlushReady = unsafe extern "C" fn(*mut c_void);
+type FlushCallbackV9 = unsafe extern "C" fn(*mut c_void, *const LvArea, *mut u8);
 
 // `lv_color_format_t` encodes RGB565 as 0x12 in LVGL v9.
 const LV_COLOR_FORMAT_RGB565: u32 = 0x12;
+// `lv_display_render_mode_t::LV_DISPLAY_RENDER_MODE_PARTIAL`.
+const LV_DISPLAY_RENDER_MODE_PARTIAL: u32 = 0;
 
-/// Initialize LVGL v9 with its built-in SDL2 display driver.
-///
-/// Returns null when no firmware library is active, the firmware's LVGL/SDL
-/// symbols are incomplete, its native color depth is not RGB565, or the
-/// supplied dimensions do not match the T-Deck panel.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct LvArea {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+}
+
+#[derive(Clone, Copy)]
+struct LvglV9Api {
+    init: LvInit,
+    create: LvDisplayCreate,
+    delete: LvDisplayDelete,
+    set_color_format: LvDisplaySetColorFormat,
+    set_buffers: LvDisplaySetBuffers,
+    set_flush_callback: LvDisplaySetFlushCallback,
+    flush_ready: LvDisplayFlushReady,
+}
+
+impl LvglV9Api {
+    unsafe fn load(library: &Library) -> Option<Self> {
+        Some(Self {
+            init: *unsafe { library.get::<LvInit>(b"lv_init\0").ok()? },
+            create: *unsafe {
+                library
+                    .get::<LvDisplayCreate>(b"lv_display_create\0")
+                    .ok()?
+            },
+            delete: *unsafe {
+                library
+                    .get::<LvDisplayDelete>(b"lv_display_delete\0")
+                    .ok()?
+            },
+            set_color_format: *unsafe {
+                library
+                    .get::<LvDisplaySetColorFormat>(b"lv_display_set_color_format\0")
+                    .ok()?
+            },
+            set_buffers: *unsafe {
+                library
+                    .get::<LvDisplaySetBuffers>(b"lv_display_set_buffers\0")
+                    .ok()?
+            },
+            set_flush_callback: *unsafe {
+                library
+                    .get::<LvDisplaySetFlushCallback>(b"lv_display_set_flush_cb\0")
+                    .ok()?
+            },
+            flush_ready: *unsafe {
+                library
+                    .get::<LvDisplayFlushReady>(b"lv_display_flush_ready\0")
+                    .ok()?
+            },
+        })
+    }
+}
+
+struct LvglV9Display {
+    display: *mut c_void,
+    width: u32,
+    height: u32,
+    framebuffer: Vec<u8>,
+    _draw_buffer: Vec<u8>,
+    controller: Option<St7789Controller>,
+    api: LvglV9Api,
+}
+
+thread_local! {
+    static DISPLAYS: RefCell<Vec<LvglV9Display>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe extern "C" fn flush_callback_v9(display: *mut c_void, area: *const LvArea, pixels: *mut u8) {
+    if display.is_null() {
+        return;
+    }
+    DISPLAYS.with(|displays| {
+        let mut displays = displays.borrow_mut();
+        let Some(state) = displays
+            .iter_mut()
+            .find(|candidate| candidate.display == display)
+        else {
+            return;
+        };
+        if let (Some(area), false) = (unsafe { area.as_ref() }, pixels.is_null()) {
+            state.flush(*area, pixels);
+        }
+        // LVGL requires completion exactly once even when an invalid area was
+        // rejected, otherwise its render pipeline remains permanently busy.
+        unsafe { (state.api.flush_ready)(display) };
+    });
+}
+
+impl LvglV9Display {
+    fn flush(&mut self, area: LvArea, pixels: *const u8) {
+        if area.x1 < 0
+            || area.y1 < 0
+            || area.x2 < area.x1
+            || area.y2 < area.y1
+            || area.x2 as u32 >= self.width
+            || area.y2 as u32 >= self.height
+        {
+            return;
+        }
+        let width = (area.x2 - area.x1 + 1) as u32;
+        let height = (area.y2 - area.y1 + 1) as u32;
+        let Some(source_len) = crate::framebuffer_size(width, height) else {
+            return;
+        };
+        // SAFETY: LVGL guarantees the inclusive flush area is tightly packed
+        // in `pixels` for the duration of this callback.
+        let source = unsafe { std::slice::from_raw_parts(pixels, source_len) };
+
+        if let Some(controller) = self.controller.as_mut() {
+            let columns = [
+                (area.x1 as u16).to_be_bytes(),
+                (area.x2 as u16).to_be_bytes(),
+            ]
+            .concat();
+            let rows = [
+                (area.y1 as u16).to_be_bytes(),
+                (area.y2 as u16).to_be_bytes(),
+            ]
+            .concat();
+            let result = controller
+                .write_command(ST7789_CASET, &columns)
+                .and_then(|_| controller.write_command(ST7789_RASET, &rows))
+                .and_then(|_| controller.write_command(ST7789_RAMWR, &[]))
+                .and_then(|_| {
+                    controller.write_pixels(
+                        &host_rgb565_to_st7789_wire(source).expect("even RGB565 source"),
+                    )
+                });
+            if result.is_ok() {
+                self.framebuffer
+                    .copy_from_slice(controller.framebuffer_host_rgb565());
+            }
+        } else {
+            let _ = crate::framebuffer::update_rgb565(
+                &mut self.framebuffer,
+                self.width,
+                self.height,
+                source,
+                Rect {
+                    x: area.x1 as u32,
+                    y: area.y1 as u32,
+                    width,
+                    height,
+                },
+            );
+        }
+    }
+}
+
+/// Initialize a v9 partial display in the active firmware's LVGL runtime.
 pub fn lvgl_v9_init_sdl(instance_id: &str, width: i32, height: i32) -> *mut c_void {
+    lvgl_v9_init_sdl_with_options(instance_id, width, height, DisplayBackendOptions::default())
+}
+
+pub(crate) fn lvgl_v9_init_sdl_with_options(
+    instance_id: &str,
+    width: i32,
+    height: i32,
+    options: DisplayBackendOptions,
+) -> *mut c_void {
     crate::with_active_firmware_library(|library| unsafe {
-        lvgl_v9_init_sdl_with_library(library, instance_id, width, height)
+        lvgl_v9_init_sdl_with_library_and_options(library, instance_id, width, height, options)
     })
     .unwrap_or(ptr::null_mut())
 }
 
-/// Initialize LVGL v9 by resolving every symbol from one firmware library.
+/// Initialize a v9 display by resolving every symbol from one firmware library.
 ///
 /// # Safety
 ///
-/// `library` must contain LVGL v9 and SDL functions with the declared ABIs.
+/// `library` must contain LVGL v9 functions with the declared ABIs.
 pub unsafe fn lvgl_v9_init_sdl_with_library(
     library: &Library,
     instance_id: &str,
     width: i32,
     height: i32,
 ) -> *mut c_void {
-    if instance_id.is_empty() || !crate::is_t_deck_resolution(width, height) {
+    unsafe {
+        lvgl_v9_init_sdl_with_library_and_options(
+            library,
+            instance_id,
+            width,
+            height,
+            DisplayBackendOptions::default(),
+        )
+    }
+}
+
+unsafe fn lvgl_v9_init_sdl_with_library_and_options(
+    library: &Library,
+    instance_id: &str,
+    width: i32,
+    height: i32,
+    options: DisplayBackendOptions,
+) -> *mut c_void {
+    if instance_id.is_empty()
+        || !crate::is_t_deck_resolution(width, height)
+        || options.validated(height as u32).is_none()
+    {
         return ptr::null_mut();
     }
-    let Ok(title) = CString::new(format!("T-Deck — {instance_id}")) else {
+    let Some(api) = (unsafe { LvglV9Api::load(library) }) else {
+        return ptr::null_mut();
+    };
+    let Some(framebuffer_len) = crate::framebuffer_size(width as u32, height as u32) else {
+        return ptr::null_mut();
+    };
+    let Some(draw_buffer_len) = (width as usize)
+        .checked_mul(options.draw_buffer_rows as usize)
+        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+    else {
+        return ptr::null_mut();
+    };
+    let Ok(draw_buffer_len_u32) = u32::try_from(draw_buffer_len) else {
         return ptr::null_mut();
     };
 
-    // SAFETY: Symbols are resolved from the already-loaded firmware/LVGL image
-    // with their documented LVGL v9 signatures and called immediately.
-    unsafe {
-        let Ok(lv_init) = library.get::<LvInit>(b"lv_init\0") else {
-            return ptr::null_mut();
-        };
-        let Ok(create) = library.get::<LvSdlWindowCreate>(b"lv_sdl_window_create\0") else {
-            return ptr::null_mut();
-        };
-        let Ok(get_color_format) =
-            library.get::<LvDisplayGetColorFormat>(b"lv_display_get_color_format\0")
-        else {
-            return ptr::null_mut();
-        };
-        let Ok(delete) = library.get::<LvDisplayDelete>(b"lv_display_delete\0") else {
-            return ptr::null_mut();
-        };
-        let Ok(get_window) = library.get::<LvSdlWindowGetWindow>(b"lv_sdl_window_get_window\0")
-        else {
-            return ptr::null_mut();
-        };
-        let Ok(hide_window) = library.get::<SdlHideWindow>(b"SDL_HideWindow\0") else {
-            return ptr::null_mut();
-        };
-        let set_title: Option<Symbol<LvSdlWindowSetTitle>> =
-            library.get(b"lv_sdl_window_set_title\0").ok();
-        let set_resizable: Option<Symbol<LvSdlWindowSetResizable>> =
-            library.get(b"lv_sdl_window_set_resizeable\0").ok();
-
-        lv_init();
-        let display = create(width, height);
-        if display.is_null() {
-            return ptr::null_mut();
-        }
-        // The SDL driver allocates its draw buffers in `create`. Changing the
-        // format afterwards would leave those allocations at the old size, so
-        // only accept firmware built natively for the T-Deck's RGB565 panel.
-        if get_color_format(display) != LV_COLOR_FORMAT_RGB565 {
-            delete(display);
-            return ptr::null_mut();
-        }
-        if let Some(set_title) = set_title {
-            set_title(display, title.as_ptr());
-        }
-        if let Some(set_resizable) = set_resizable {
-            set_resizable(display, false);
-        }
-        let native_window = get_window(display);
-        if native_window.is_null() {
-            delete(display);
-            return ptr::null_mut();
-        }
-        // DisplayManager owns the visible, resizable, letterboxed host window.
-        // LVGL's SDL window remains only as its RGB565 rendering surface.
-        hide_window(native_window);
-        display
+    unsafe { (api.init)() };
+    let display = unsafe { (api.create)(width, height) };
+    if display.is_null() {
+        return ptr::null_mut();
     }
+    let mut draw_buffer = vec![0; draw_buffer_len];
+    let controller = if options.st7789_fidelity {
+        let mut controller =
+            St7789Controller::new(width as u16, height as u16, SharedSpiBus::default());
+        controller.set_reset(false);
+        controller.set_reset(true);
+        if controller.initialize_t_deck().is_err() {
+            unsafe { (api.delete)(display) };
+            return ptr::null_mut();
+        }
+        controller.set_backlight(u8::MAX);
+        Some(controller)
+    } else {
+        None
+    };
+
+    unsafe {
+        (api.set_color_format)(display, LV_COLOR_FORMAT_RGB565);
+        (api.set_buffers)(
+            display,
+            draw_buffer.as_mut_ptr().cast(),
+            ptr::null_mut(),
+            draw_buffer_len_u32,
+            LV_DISPLAY_RENDER_MODE_PARTIAL,
+        );
+    }
+    DISPLAYS.with(|displays| {
+        displays.borrow_mut().push(LvglV9Display {
+            display,
+            width: width as u32,
+            height: height as u32,
+            framebuffer: vec![0; framebuffer_len],
+            _draw_buffer: draw_buffer,
+            controller,
+            api,
+        });
+    });
+    unsafe { (api.set_flush_callback)(display, Some(flush_callback_v9)) };
+    display
 }
 
-/// Capture an LVGL SDL display's logical framebuffer as packed RGB565.
-///
-/// Returns `None` if the handle is null, required LVGL symbols are unavailable,
-/// the display has invalid dimensions, or SDL cannot read the renderer.
+/// Capture the persistent logical framebuffer owned by the v9 driver.
 ///
 /// # Safety
 ///
-/// `display` must be a live `lv_display_t` created by LVGL's SDL driver.
+/// `display` must be null or a live display returned by this module.
 pub unsafe fn capture_lvgl_rgb565(display: *mut c_void) -> Option<Vec<u8>> {
-    crate::with_active_firmware_library(|library| unsafe {
-        capture_lvgl_rgb565_with_library(library, display)
-    })
-    .flatten()
+    unsafe { capture_managed_rgb565(display) }
 }
 
-/// Capture a v9 SDL framebuffer using the same library that owns the display.
+/// Compatibility entry point retaining the prior library-scoped signature.
+///
+/// Capture no longer uses symbols or SDL renderer state from `library`.
 ///
 /// # Safety
 ///
-/// `display` must be a live LVGL display created by `library`.
+/// `display` must be null or a live display returned by this module.
 pub unsafe fn capture_lvgl_rgb565_with_library(
-    library: &Library,
+    _library: &Library,
     display: *mut c_void,
 ) -> Option<Vec<u8>> {
-    if display.is_null() {
-        return None;
-    }
+    unsafe { capture_managed_rgb565(display) }
+}
 
-    // SAFETY: The caller guarantees a live LVGL display. Symbols are resolved
-    // with their LVGL v9 signatures and SDL writes into an exactly sized buffer.
-    unsafe {
-        let renderer = library
-            .get::<LvSdlWindowGetRenderer>(b"lv_sdl_window_get_renderer\0")
-            .ok()?(display);
-        let width = library
-            .get::<LvDisplayGetResolution>(b"lv_display_get_horizontal_resolution\0")
-            .ok()?(display);
-        let height = library
-            .get::<LvDisplayGetResolution>(b"lv_display_get_vertical_resolution\0")
-            .ok()?(display);
-        if renderer.is_null() || !crate::is_t_deck_resolution(width, height) {
-            return None;
-        }
-        let len = (width as usize)
-            .checked_mul(height as usize)?
-            .checked_mul(2)?;
-        let mut pixels = vec![0_u8; len];
-        let rect = sdl2::sys::SDL_Rect {
-            x: 0,
-            y: 0,
-            w: width,
-            h: height,
-        };
-        let render_read_pixels = library
-            .get::<SdlRenderReadPixels>(b"SDL_RenderReadPixels\0")
-            .ok()?;
-        let result = render_read_pixels(
-            renderer.cast(),
-            &rect,
-            PixelFormatEnum::RGB565 as u32,
-            pixels.as_mut_ptr().cast(),
-            width * 2,
-        );
-        (result == 0).then_some(pixels)
+pub(crate) unsafe fn capture_managed_rgb565(display: *mut c_void) -> Option<Vec<u8>> {
+    DISPLAYS.with(|displays| {
+        displays
+            .borrow()
+            .iter()
+            .find(|candidate| candidate.display == display)
+            .map(|candidate| candidate.framebuffer.clone())
+    })
+}
+
+pub(crate) unsafe fn destroy_display(display: *mut c_void) -> bool {
+    if display.is_null() {
+        return false;
     }
+    let removed = DISPLAYS.with(|displays| {
+        let mut displays = displays.borrow_mut();
+        displays
+            .iter()
+            .position(|candidate| candidate.display == display)
+            .map(|index| displays.remove(index))
+    });
+    let Some(removed) = removed else {
+        return false;
+    };
+    unsafe { (removed.api.delete)(display) };
+    true
 }
 
 #[cfg(test)]
