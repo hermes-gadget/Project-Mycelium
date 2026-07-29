@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{ensure, Result};
 use clap::{Parser, Subcommand};
+use mycelium_core::display::{DisplayConfig, DisplayEvent, DisplayManager};
 use mycelium_core::instance::{InstanceConfig, InstanceManager};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
@@ -59,9 +60,22 @@ async fn run(firmware: PathBuf, nodes: usize) -> Result<()> {
     );
 
     let mut manager = InstanceManager::new();
+    let mut display_manager = None;
     for _ in 0..nodes {
         let id = manager.spawn(&firmware, InstanceConfig::default())?;
         info!(instance_id = %id, firmware = %firmware.display(), "started firmware instance");
+        let has_display = manager
+            .get(&id)
+            .and_then(|instance| instance.display())
+            .is_some_and(|display| !display.is_null());
+        if has_display {
+            let displays = match display_manager.as_mut() {
+                Some(displays) => displays,
+                None => display_manager.insert(DisplayManager::new()?),
+            };
+            displays.create_window(&id, DisplayConfig::default())?;
+            info!(instance_id = %id, "created firmware display window");
+        }
     }
 
     let mut ticker = tokio::time::interval(Duration::from_millis(1));
@@ -76,7 +90,22 @@ async fn run(firmware: PathBuf, nodes: usize) -> Result<()> {
                 info!("received SIGINT, shutting down");
                 break;
             }
-            _ = ticker.tick() => manager.tick_all(),
+            _ = ticker.tick() => {
+                manager.tick_all();
+                if let Some(displays) = display_manager.as_mut() {
+                    for event in displays.handle_events() {
+                        match event {
+                            DisplayEvent::Close { instance_id } => {
+                                displays.destroy_window(&instance_id);
+                                info!(%instance_id, "closed firmware display window");
+                            }
+                            DisplayEvent::Resized { instance_id, width, height } => {
+                                info!(%instance_id, width, height, "resized firmware display window");
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
 

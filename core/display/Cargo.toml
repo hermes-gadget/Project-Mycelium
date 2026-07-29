@@ -8,5 +8,7 @@ license = "MIT"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-libc = "0.2"
+anyhow = "1"
+libloading = "0.8"
+png = "0.17"
 sdl2 = { version = "0.38", features = ["bundled"] }

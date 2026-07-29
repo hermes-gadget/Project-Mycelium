@@ -29,6 +29,10 @@ impl DisplayHeader {
             abi_version,
         }
     }
+
+    pub(crate) fn is_mycelium_handle(&self) -> bool {
+        self.magic == DISPLAY_MAGIC
+    }
 }
 
 impl LvglVersion {

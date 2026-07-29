@@ -1,12 +1,13 @@
-//! SDL2-backed LVGL v8 and v9 display emulation.
+//! SDL2-backed display emulation for virtual T-Deck instances.
 
 mod config;
 mod lvgl_v8;
-mod lvgl_v9;
+pub mod lvgl_v9;
+pub mod manager;
 mod version;
+pub mod window;
 
 use std::ffi::{c_char, c_void, CStr};
-use std::ptr;
 
 use sdl2::render::Canvas;
 use sdl2::video::Window;
@@ -14,20 +15,20 @@ use sdl2::video::Window;
 pub use config::DisplayConfig;
 pub use lvgl_v8::lvgl_v8_init_sdl;
 pub use lvgl_v9::lvgl_v9_init_sdl;
+pub use manager::DisplayManager;
 pub use version::LvglVersion;
+pub use window::{DisplayEvent, DisplayWindow, Rect};
 
 pub(crate) const BYTES_PER_PIXEL: usize = 2;
 
 pub(crate) enum BackendState {
     V8(lvgl_v8::LvglV8State),
-    V9(lvgl_v9::LvglV9State),
 }
 
 impl BackendState {
-    fn is_valid(&self, width: u32, height: u32, framebuffer_len: usize) -> bool {
+    fn is_valid(&self, width: u32, height: u32) -> bool {
         match self {
             Self::V8(state) => state.is_valid(width, height),
-            Self::V9(state) => state.is_valid(width, height, framebuffer_len),
         }
     }
 }
@@ -54,7 +55,7 @@ impl DisplayHandle {
         let width = u32::try_from(width).ok().filter(|width| *width > 0)?;
         let height = u32::try_from(height).ok().filter(|height| *height > 0)?;
         let framebuffer_len = framebuffer_size(width, height)?;
-        if !backend.is_valid(width, height, framebuffer_len) {
+        if !backend.is_valid(width, height) {
             return None;
         }
 
@@ -77,14 +78,6 @@ impl DisplayHandle {
             _canvas: canvas,
         }))
     }
-
-    fn framebuffer(&self) -> &[u8] {
-        debug_assert_eq!(
-            Some(self.framebuffer.len()),
-            framebuffer_size(self.width, self.height)
-        );
-        &self.framebuffer
-    }
 }
 
 pub(crate) fn framebuffer_size(width: u32, height: u32) -> Option<usize> {
@@ -93,9 +86,10 @@ pub(crate) fn framebuffer_size(width: u32, height: u32) -> Option<usize> {
         .checked_mul(BYTES_PER_PIXEL)
 }
 
-/// Initializes an SDL display using the requested LVGL ABI.
+/// Initialize an SDL display using the requested LVGL ABI.
 ///
-/// `Unknown` deliberately uses v9 because it is Mycelium's primary target.
+/// Unknown versions deliberately use v9 because it is Mycelium's primary
+/// target.
 pub fn meshemu_display_init(
     instance_id: &str,
     width: i32,
@@ -108,14 +102,11 @@ pub fn meshemu_display_init(
     }
 }
 
-/// Creates an SDL-backed display for a specific LVGL major version.
-///
-/// Unsupported version numbers follow the default v9 path.
+/// Create an SDL display for an explicit LVGL major version.
 ///
 /// # Safety
 ///
-/// When non-null, `window_title` must point to a valid NUL-terminated string
-/// for the duration of this call.
+/// `window_title` must be null or point to a valid NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_display_create_v(
     width: i32,
@@ -138,129 +129,81 @@ pub unsafe extern "C" fn meshemu_display_create_v(
     meshemu_display_init(&title, width, height, version)
 }
 
-/// Creates an SDL-backed LVGL v9 display.
+/// Copy a host-managed compatibility display's RGB565 framebuffer.
+///
+/// Returns `None` when the pointer is null or is not a Mycelium-managed handle.
 ///
 /// # Safety
 ///
-/// When non-null, `window_title` must point to a valid NUL-terminated string
-/// for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_display_create(
-    width: i32,
-    height: i32,
-    window_title: *const c_char,
-) -> *mut c_void {
-    unsafe { meshemu_display_create_v(width, height, window_title, 9) }
+/// `display` must be null or point to readable display-handle memory.
+pub unsafe fn capture_managed_rgb565(display: *mut c_void) -> Option<Vec<u8>> {
+    let header = unsafe { display.cast::<version::DisplayHeader>().as_ref()? };
+    if !header.is_mycelium_handle() {
+        return None;
+    }
+    let display = unsafe { &*display.cast::<DisplayHandle>() };
+    Some(display.framebuffer.clone())
 }
 
-/// Copies the current RGB565 framebuffer into a C-allocated buffer.
-///
-/// The caller owns the returned allocation and may release it with `free()`.
+/// Destroy a host-managed LVGL v8 compatibility display.
 ///
 /// # Safety
 ///
-/// `display` must be a live Mycelium display handle. When non-null, `size_out`
-/// must be writable. The display must not be concurrently destroyed.
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_display_capture(
-    display: *mut c_void,
-    size_out: *mut usize,
-) -> *mut u8 {
-    if !size_out.is_null() {
-        unsafe { *size_out = 0 };
-    }
-    let Some(display) = (display as *const DisplayHandle).as_ref() else {
-        return ptr::null_mut();
+/// `display` must be null or a live handle returned by [`lvgl_v8_init_sdl`].
+pub unsafe fn destroy_managed_display(display: *mut c_void) {
+    let Some(header) = (unsafe { display.cast::<version::DisplayHeader>().as_ref() }) else {
+        return;
     };
-    let framebuffer = display.framebuffer();
-    let captured = unsafe { libc::malloc(framebuffer.len()) }.cast::<u8>();
-    if captured.is_null() {
-        return ptr::null_mut();
+    if header.is_mycelium_handle() {
+        unsafe { drop(Box::from_raw(display.cast::<DisplayHandle>())) };
     }
-    unsafe {
-        ptr::copy_nonoverlapping(framebuffer.as_ptr(), captured, framebuffer.len());
-        if !size_out.is_null() {
-            *size_out = framebuffer.len();
-        }
-    }
-    captured
 }
 
-/// Destroys a display handle. Null is accepted as a no-op.
+/// Destroy a Mycelium-managed compatibility display.
+///
+/// Native LVGL v9 displays remain owned by the firmware's LVGL runtime.
 ///
 /// # Safety
 ///
-/// A non-null handle must have been returned by a Mycelium display creation
-/// function and must be passed exactly once.
+/// `display` must be null or point to readable display-handle memory.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_display_destroy(display: *mut c_void) {
-    if !display.is_null() {
-        drop(unsafe { Box::from_raw(display as *mut DisplayHandle) });
-    }
+    unsafe { destroy_managed_display(display) };
 }
 
 #[cfg(test)]
-mod tests {
-    use std::ffi::CString;
-    use std::sync::Mutex;
+pub(crate) static SDL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
+mod tests {
     use super::*;
 
-    static SDL_TEST: Mutex<()> = Mutex::new(());
-
-    fn with_dummy_sdl(test: impl FnOnce()) {
-        let _serial = SDL_TEST.lock().unwrap();
+    #[test]
+    fn v8_compatibility_initializer_returns_a_versioned_handle() {
+        let _serial = SDL_TEST_LOCK.lock().unwrap();
         std::env::set_var("SDL_VIDEODRIVER", "dummy");
-        test();
+        let display = lvgl_v8_init_sdl("v8 test", 320, 240);
+
+        assert!(!display.is_null());
+        assert_eq!(LvglVersion::detect(display), LvglVersion::V8);
+        let display_ref = unsafe { &*display.cast::<DisplayHandle>() };
+        assert_eq!(display_ref.framebuffer.len(), 320 * 240 * BYTES_PER_PIXEL);
+        assert_eq!(
+            unsafe { capture_managed_rgb565(display) }.unwrap().len(),
+            320 * 240 * BYTES_PER_PIXEL
+        );
+
+        unsafe { destroy_managed_display(display) };
     }
 
     #[test]
-    fn v8_and_v9_initializers_return_versioned_handles() {
-        with_dummy_sdl(|| {
-            let v8 = lvgl_v8_init_sdl("v8 test", 320, 240);
-            let v9 = lvgl_v9_init_sdl("v9 test", 320, 240);
+    fn versioned_create_preserves_v8_compatibility() {
+        let _serial = SDL_TEST_LOCK.lock().unwrap();
+        std::env::set_var("SDL_VIDEODRIVER", "dummy");
+        let title = std::ffi::CString::new("v8 versioned").unwrap();
+        let display = unsafe { meshemu_display_create_v(8, 6, title.as_ptr(), 8) };
 
-            assert!(!v8.is_null());
-            assert!(!v9.is_null());
-            assert_eq!(LvglVersion::detect(v8), LvglVersion::V8);
-            assert_eq!(LvglVersion::detect(v9), LvglVersion::V9);
-
-            unsafe {
-                meshemu_display_destroy(v8);
-                meshemu_display_destroy(v9);
-            }
-        });
-    }
-
-    #[test]
-    fn both_versions_allocate_full_rgb565_framebuffers() {
-        with_dummy_sdl(|| {
-            for version in [LvglVersion::V8, LvglVersion::V9] {
-                let display = meshemu_display_init("buffer test", 17, 11, version);
-                assert!(!display.is_null());
-
-                let mut size = 0;
-                let capture = unsafe { meshemu_display_capture(display, &mut size) };
-                assert!(!capture.is_null());
-                assert_eq!(size, 17 * 11 * BYTES_PER_PIXEL);
-
-                unsafe {
-                    libc::free(capture.cast());
-                    meshemu_display_destroy(display);
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn legacy_create_defaults_to_v9_and_rejects_invalid_dimensions() {
-        with_dummy_sdl(|| {
-            let title = CString::new("legacy").unwrap();
-            let display = unsafe { meshemu_display_create(320, 240, title.as_ptr()) };
-            assert_eq!(LvglVersion::detect(display), LvglVersion::V9);
-            unsafe { meshemu_display_destroy(display) };
-
-            assert!(meshemu_display_init("invalid", 0, 240, LvglVersion::V8).is_null());
-        });
+        assert_eq!(LvglVersion::detect(display), LvglVersion::V8);
+        unsafe { meshemu_display_destroy(display) };
     }
 }
