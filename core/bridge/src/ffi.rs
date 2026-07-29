@@ -119,6 +119,25 @@ fn valid_position(lat: f64, lon: f64) -> bool {
         && (-180.0..=180.0).contains(&lon)
 }
 
+fn valid_radio_config(
+    freq_mhz: f64,
+    bandwidth_khz: u16,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: f64,
+) -> bool {
+    // SX1262 operating limits and the LoRa modulation settings supported by
+    // the bridge. Reject rather than passing unchecked values into airtime
+    // arithmetic across the FFI boundary.
+    freq_mhz.is_finite()
+        && (150.0..=960.0).contains(&freq_mhz)
+        && matches!(bandwidth_khz, 125 | 250 | 500)
+        && (7..=12).contains(&spreading_factor)
+        && (5..=8).contains(&coding_rate)
+        && tx_power_dbm.is_finite()
+        && (-17.0..=22.0).contains(&tx_power_dbm)
+}
+
 /// Mounts the virtual SPIFFS partition for an emulator instance.
 ///
 /// # Safety
@@ -786,12 +805,14 @@ pub unsafe extern "C" fn meshemu_radio_create(
     lon: f64,
 ) -> *mut c_void {
     if instance_id.is_null()
-        || !freq_mhz.is_finite()
-        || freq_mhz <= 0.0
-        || bandwidth_khz == 0
-        || !tx_power_dbm.is_finite()
-        || !lat.is_finite()
-        || !lon.is_finite()
+        || !valid_radio_config(
+            freq_mhz,
+            bandwidth_khz,
+            spreading_factor,
+            coding_rate,
+            tx_power_dbm,
+        )
+        || !valid_position(lat, lon)
     {
         return ptr::null_mut();
     }
@@ -827,7 +848,7 @@ pub unsafe extern "C" fn meshemu_radio_create(
     })) as *mut c_void
 }
 
-/// Starts an instantaneous virtual transmission.
+/// Starts a virtual transmission, returning false while the SX1262 is busy.
 ///
 /// # Safety
 ///
@@ -842,7 +863,7 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return false;
     };
-    if data.is_null() && len != 0 {
+    if (data.is_null() && len != 0) || len > 255 {
         return false;
     }
 
@@ -869,11 +890,13 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
         airtime_ms,
         position: (0.0, 0.0),
         timestamp_ms,
-    });
-    true
+    })
 }
 
 /// Copies one queued packet into `buffer`, returning zero when none is ready.
+///
+/// If the buffer is too small, the packet remains queued and its required
+/// length is returned as a negative value.
 ///
 /// # Safety
 ///
@@ -897,11 +920,14 @@ pub unsafe extern "C" fn meshemu_radio_recv_raw(
         let packets = lock(&BUS).bus.poll(&handle.node_id);
         pending.extend(packets);
     }
-    let Some(packet) = pending.pop_front() else {
+    let Some(packet) = pending.front() else {
         return 0;
     };
-
-    let len = packet.data.len().min(max_len as usize);
+    if packet.data.len() > max_len as usize {
+        return -(packet.data.len().min(i32::MAX as usize) as i32);
+    }
+    let packet = pending.pop_front().expect("front was checked above");
+    let len = packet.data.len();
     unsafe {
         ptr::copy_nonoverlapping(packet.data.as_ptr(), buffer, len);
     }
@@ -952,9 +978,16 @@ pub unsafe extern "C" fn meshemu_radio_get_snr(radio: *mut c_void) -> f32 {
     lock(&handle.last_rx).map(|(_, snr)| snr).unwrap_or(0.0)
 }
 
+/// # Safety
+///
+/// `radio` must be a live bridge handle.
 #[no_mangle]
-pub extern "C" fn meshemu_radio_is_send_complete(radio: *mut c_void) -> bool {
-    !radio.is_null()
+pub unsafe extern "C" fn meshemu_radio_is_send_complete(radio: *mut c_void) -> bool {
+    let Some(handle) = (unsafe { handle_ref(radio) }) else {
+        return false;
+    };
+    let state = lock(&BUS);
+    state.bus.is_send_complete(&handle.node_id, state.now_ms)
 }
 
 /// # Safety
@@ -965,7 +998,7 @@ pub unsafe extern "C" fn meshemu_radio_set_position(radio: *mut c_void, lat: f64
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return;
     };
-    if lat.is_finite() && lon.is_finite() {
+    if valid_position(lat, lon) {
         lock(&BUS).bus.update_position(&handle.node_id, (lat, lon));
     }
 }

@@ -1,21 +1,48 @@
-// The main RadioBus — routes packets between virtual nodes with propagation simulation
+// The main RadioBus — routes packets between virtual nodes with propagation simulation.
 
 use std::collections::HashMap;
 
-use crate::channel::ChannelState;
-use crate::propagation;
+use crate::propagation::{self, PropagationModel};
 use crate::types::{RadioChannel, RxPacket, TxEvent};
 
 const DEFAULT_NOISE_FLOOR_DBM: f64 = -120.0;
 const CAPTURE_THRESHOLD_DB: f64 = 6.0;
 
+/// Physical parameters shared by the virtual radio network.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadioBusConfig {
+    pub propagation_model: PropagationModel,
+    pub antenna_gain_tx_dbi: f64,
+    pub antenna_gain_rx_dbi: f64,
+    /// Feedline, enclosure, polarization, and other unmodelled losses.
+    pub system_loss_db: f64,
+    pub noise_floor_dbm: f64,
+    /// Signals this close to a receiver's center frequency contribute
+    /// interference, even when their modulation settings are not decodable.
+    pub frequency_tolerance_khz: f64,
+}
+
+impl Default for RadioBusConfig {
+    fn default() -> Self {
+        Self {
+            propagation_model: PropagationModel::TwoRayGround {
+                tx_height_m: 1.5,
+                rx_height_m: 1.5,
+            },
+            antenna_gain_tx_dbi: 0.0,
+            antenna_gain_rx_dbi: 0.0,
+            system_loss_db: 6.0,
+            noise_floor_dbm: DEFAULT_NOISE_FLOOR_DBM,
+            frequency_tolerance_khz: 125.0,
+        }
+    }
+}
+
 /// A single-threaded virtual LoRa network.
 pub struct RadioBus {
     nodes: HashMap<String, NodeState>,
-    channels: HashMap<String, ChannelState>,
-    antenna_gain_tx_dbi: f64,
-    antenna_gain_rx_dbi: f64,
-    noise_floor_dbm: f64,
+    transmissions: Vec<ScheduledTransmission>,
+    config: RadioBusConfig,
 }
 
 struct NodeState {
@@ -23,26 +50,54 @@ struct NodeState {
     tx_power_dbm: f64,
     current_channel: RadioChannel,
     inbox: Vec<RxPacket>,
+    tx_busy_until_ms: u64,
+}
+
+#[derive(Clone)]
+struct ScheduledTransmission {
+    event: TxEvent,
+    finalized: bool,
 }
 
 impl RadioBus {
     pub fn new() -> Self {
+        Self::with_config(RadioBusConfig::default())
+    }
+
+    pub fn with_config(config: RadioBusConfig) -> Self {
         Self {
             nodes: HashMap::new(),
-            channels: HashMap::new(),
-            antenna_gain_tx_dbi: 0.0,
-            antenna_gain_rx_dbi: 0.0,
-            noise_floor_dbm: DEFAULT_NOISE_FLOOR_DBM,
+            transmissions: Vec::new(),
+            config,
         }
     }
 
     /// Creates a reproducible bus.
     ///
-    /// The current free-space model has no stochastic loss, so every bus is
-    /// deterministic. The seed is accepted to keep construction stable when
-    /// seeded propagation effects are introduced.
+    /// All currently supplied propagation models are deterministic. The seed
+    /// remains part of the API for future stochastic fading models.
     pub fn with_seed(_seed: u64) -> Self {
         Self::new()
+    }
+
+    pub fn config(&self) -> RadioBusConfig {
+        self.config
+    }
+
+    pub fn set_propagation_model(&mut self, model: PropagationModel) {
+        self.config.propagation_model = model;
+    }
+
+    pub fn set_system_loss_db(&mut self, system_loss_db: f64) {
+        if system_loss_db.is_finite() && system_loss_db >= 0.0 {
+            self.config.system_loss_db = system_loss_db;
+        }
+    }
+
+    pub fn set_frequency_tolerance_khz(&mut self, tolerance_khz: f64) {
+        if tolerance_khz.is_finite() && tolerance_khz >= 0.0 {
+            self.config.frequency_tolerance_khz = tolerance_khz;
+        }
     }
 
     pub fn register_node(
@@ -52,10 +107,6 @@ impl RadioBus {
         tx_power: f64,
         channel: RadioChannel,
     ) {
-        let channel_key = channel_key(&channel);
-        self.channels
-            .entry(channel_key)
-            .or_insert_with(|| ChannelState::new(channel.clone()));
         self.nodes.insert(
             id,
             NodeState {
@@ -63,6 +114,7 @@ impl RadioBus {
                 tx_power_dbm: tx_power,
                 current_channel: channel,
                 inbox: Vec::new(),
+                tx_busy_until_ms: 0,
             },
         );
     }
@@ -77,88 +129,38 @@ impl RadioBus {
         }
     }
 
-    /// Broadcasts a packet to every tuned node whose link budget can decode it.
-    pub fn broadcast(&mut self, mut tx: TxEvent) {
-        let Some(sender) = self.nodes.get(&tx.node_id) else {
-            return;
+    /// Schedules a packet for delivery after its airtime has elapsed.
+    ///
+    /// Returns false for an unknown sender or when that radio is already
+    /// transmitting at the requested start time.
+    pub fn broadcast(&mut self, mut tx: TxEvent) -> bool {
+        let Some(sender) = self.nodes.get_mut(&tx.node_id) else {
+            return false;
         };
+        if tx.timestamp_ms < sender.tx_busy_until_ms {
+            return false;
+        }
 
         // Registered node state is authoritative, which also makes position
         // updates apply even when a caller constructed the event earlier.
         tx.position = sender.position;
         tx.tx_power_dbm = sender.tx_power_dbm;
         tx.channel = sender.current_channel.clone();
-
-        let key = channel_key(&tx.channel);
-        let mut contenders: Vec<TxEvent> = self
-            .channels
-            .get(&key)
-            .into_iter()
-            .flat_map(|state| state.overlapping_transmissions(tx.timestamp_ms, tx.airtime_ms))
-            .cloned()
-            .collect();
-        contenders.push(tx.clone());
-
-        let sensitivity_dbm = propagation::sensitivity(&tx.channel);
-        for (receiver_id, receiver) in &mut self.nodes {
-            if receiver.current_channel != tx.channel {
-                continue;
-            }
-
-            remove_contender_packets(&mut receiver.inbox, &contenders);
-
-            // A node cannot receive while it is one of the overlapping transmitters.
-            if contenders
-                .iter()
-                .any(|contender| contender.node_id == *receiver_id)
-            {
-                continue;
-            }
-
-            let mut audible: Vec<(&TxEvent, f64)> = contenders
-                .iter()
-                .filter_map(|contender| {
-                    let distance = propagation::distance_km(contender.position, receiver.position);
-                    let rssi = propagation::received_rssi(
-                        contender.tx_power_dbm,
-                        distance,
-                        contender.channel.freq_mhz,
-                        self.antenna_gain_tx_dbi,
-                        self.antenna_gain_rx_dbi,
-                    );
-                    (rssi.is_finite() && rssi > sensitivity_dbm).then_some((contender, rssi))
-                })
-                .collect();
-
-            audible.sort_by(|left, right| right.1.total_cmp(&left.1));
-            let winner = match audible.as_slice() {
-                [] => None,
-                [only] => Some(*only),
-                [strongest, second, ..] if strongest.1 - second.1 > CAPTURE_THRESHOLD_DB => {
-                    Some(*strongest)
-                }
-                _ => None,
-            };
-
-            if let Some((event, rssi_dbm)) = winner {
-                receiver.inbox.push(RxPacket {
-                    from_node: event.node_id.clone(),
-                    data: event.data.clone(),
-                    rssi_dbm,
-                    snr_db: rssi_dbm - self.noise_floor_dbm,
-                    channel: event.channel.clone(),
-                    timestamp_ms: event.timestamp_ms,
-                });
-            }
-        }
-
-        self.channels
-            .entry(key)
-            .or_insert_with(|| ChannelState::new(tx.channel.clone()))
-            .add_transmission(tx);
+        sender.tx_busy_until_ms = tx.timestamp_ms.saturating_add(u64::from(tx.airtime_ms));
+        self.transmissions.push(ScheduledTransmission {
+            event: tx,
+            finalized: false,
+        });
+        true
     }
 
-    /// Drains all packets currently queued for a node.
+    pub fn is_send_complete(&self, node_id: &str, now_ms: u64) -> bool {
+        self.nodes
+            .get(node_id)
+            .is_some_and(|node| now_ms >= node.tx_busy_until_ms)
+    }
+
+    /// Drains all packets whose transmissions have completed for a node.
     pub fn poll(&mut self, node_id: &str) -> Vec<RxPacket> {
         self.nodes
             .get_mut(node_id)
@@ -166,10 +168,121 @@ impl RadioBus {
             .unwrap_or_default()
     }
 
-    /// Removes transmissions whose airtime has elapsed.
+    /// Advances radio time, resolving completed transmissions before removing
+    /// collision history that is no longer needed.
     pub fn tick(&mut self, now_ms: u64) {
-        for channel in self.channels.values_mut() {
-            channel.remove_expired(now_ms);
+        let all_events: Vec<TxEvent> = self
+            .transmissions
+            .iter()
+            .map(|scheduled| scheduled.event.clone())
+            .collect();
+        let completed_indices: Vec<usize> = self
+            .transmissions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, scheduled)| {
+                (!scheduled.finalized && transmission_end(&scheduled.event) <= now_ms)
+                    .then_some(index)
+            })
+            .collect();
+
+        for index in completed_indices {
+            let event = self.transmissions[index].event.clone();
+            self.deliver_completed(&event, &all_events);
+            self.transmissions[index].finalized = true;
+        }
+
+        // Keep finalized transmissions while an unfinished overlapping packet
+        // still needs them for collision evaluation.
+        let unfinished: Vec<TxEvent> = self
+            .transmissions
+            .iter()
+            .filter(|scheduled| !scheduled.finalized)
+            .map(|scheduled| scheduled.event.clone())
+            .collect();
+        self.transmissions.retain(|scheduled| {
+            !scheduled.finalized
+                || unfinished
+                    .iter()
+                    .any(|event| transmissions_overlap(&scheduled.event, event))
+        });
+    }
+
+    fn deliver_completed(&mut self, event: &TxEvent, all_events: &[TxEvent]) {
+        let config = self.config;
+        for (receiver_id, receiver) in &mut self.nodes {
+            if *receiver_id == event.node_id || receiver.current_channel != event.channel {
+                continue;
+            }
+
+            // SX1262 is half-duplex.
+            if all_events
+                .iter()
+                .any(|other| other.node_id == *receiver_id && transmissions_overlap(event, other))
+            {
+                continue;
+            }
+
+            let distance = propagation::distance_km(event.position, receiver.position);
+            let Some(rssi_dbm) = propagation::received_rssi_with_model(
+                event.tx_power_dbm,
+                distance,
+                event.channel.freq_mhz,
+                config.antenna_gain_tx_dbi,
+                config.antenna_gain_rx_dbi,
+                config.system_loss_db,
+                config.propagation_model,
+            ) else {
+                continue;
+            };
+            if !rssi_dbm.is_finite() || rssi_dbm < propagation::sensitivity(&event.channel) {
+                continue;
+            }
+
+            let interfering_rssi: Vec<f64> = all_events
+                .iter()
+                .filter(|other| {
+                    !same_transmission(event, other)
+                        && transmissions_overlap(event, other)
+                        && frequency_overlaps(
+                            other.channel.freq_mhz,
+                            receiver.current_channel.freq_mhz,
+                            config.frequency_tolerance_khz,
+                        )
+                })
+                .filter_map(|other| {
+                    let distance = propagation::distance_km(other.position, receiver.position);
+                    propagation::received_rssi_with_model(
+                        other.tx_power_dbm,
+                        distance,
+                        other.channel.freq_mhz,
+                        config.antenna_gain_tx_dbi,
+                        config.antenna_gain_rx_dbi,
+                        config.system_loss_db,
+                        config.propagation_model,
+                    )
+                    .filter(|rssi| rssi.is_finite())
+                })
+                .collect();
+
+            let interference_dbm = sum_dbm(&interfering_rssi);
+            if interference_dbm.is_some_and(|level| rssi_dbm - level <= CAPTURE_THRESHOLD_DB) {
+                continue;
+            }
+
+            let combined_noise_dbm = sum_dbm(&[
+                config.noise_floor_dbm,
+                interference_dbm.unwrap_or(f64::NEG_INFINITY),
+            ])
+            .unwrap_or(config.noise_floor_dbm);
+            receiver.inbox.push(RxPacket {
+                from_node: event.node_id.clone(),
+                data: event.data.clone(),
+                rssi_dbm,
+                snr_db: rssi_dbm - combined_noise_dbm,
+                channel: event.channel.clone(),
+                timestamp_ms: transmission_end(event),
+            });
         }
     }
 }
@@ -180,37 +293,53 @@ impl Default for RadioBus {
     }
 }
 
-fn channel_key(channel: &RadioChannel) -> String {
-    format!(
-        "{:016x}:{}:{}:{}",
-        channel.freq_mhz.to_bits(),
-        channel.bandwidth_khz,
-        channel.spreading_factor,
-        channel.coding_rate
-    )
+fn transmission_end(event: &TxEvent) -> u64 {
+    event
+        .timestamp_ms
+        .saturating_add(u64::from(event.airtime_ms))
 }
 
-fn remove_contender_packets(inbox: &mut Vec<RxPacket>, contenders: &[TxEvent]) {
-    inbox.retain(|packet| {
-        !contenders.iter().any(|contender| {
-            packet.from_node == contender.node_id
-                && packet.timestamp_ms == contender.timestamp_ms
-                && packet.channel == contender.channel
-        })
-    });
+fn transmissions_overlap(first: &TxEvent, second: &TxEvent) -> bool {
+    if first.airtime_ms == 0 || second.airtime_ms == 0 {
+        return false;
+    }
+    first.timestamp_ms < transmission_end(second) && second.timestamp_ms < transmission_end(first)
+}
+
+fn same_transmission(first: &TxEvent, second: &TxEvent) -> bool {
+    first.node_id == second.node_id
+        && first.timestamp_ms == second.timestamp_ms
+        && first.channel == second.channel
+}
+
+fn frequency_overlaps(first_mhz: f64, second_mhz: f64, tolerance_khz: f64) -> bool {
+    (first_mhz - second_mhz).abs() * 1_000.0 <= tolerance_khz
+}
+
+fn sum_dbm(levels: &[f64]) -> Option<f64> {
+    let milliwatts: f64 = levels
+        .iter()
+        .filter(|level| level.is_finite())
+        .map(|level| 10_f64.powf(level / 10.0))
+        .sum();
+    (milliwatts > 0.0).then(|| 10.0 * milliwatts.log10())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn channel() -> RadioChannel {
+    fn channel_at(freq_mhz: f64) -> RadioChannel {
         RadioChannel {
-            freq_mhz: 915.0,
+            freq_mhz,
             bandwidth_khz: 125,
             spreading_factor: 7,
             coding_rate: 5,
         }
+    }
+
+    fn channel() -> RadioChannel {
+        channel_at(915.0)
     }
 
     fn transmission(node_id: &str, data: u8, timestamp_ms: u64) -> TxEvent {
@@ -230,46 +359,47 @@ mod tests {
     }
 
     #[test]
-    fn two_nodes_in_range_exchange_packets_and_poll_drains_inbox() {
+    fn packet_is_delivered_only_at_end_of_airtime() {
         let mut bus = RadioBus::new();
         register(&mut bus, "alice", (51.5074, -0.1278), 14.0);
         register(&mut bus, "bob", (51.5075, -0.1278), 14.0);
 
-        bus.broadcast(transmission("alice", 42, 1_000));
-        let packets = bus.poll("bob");
-
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].from_node, "alice");
-        assert_eq!(packets[0].data, vec![42]);
-        assert!(packets[0].rssi_dbm > propagation::sensitivity(&channel()));
-        assert!((packets[0].snr_db - (packets[0].rssi_dbm + 120.0)).abs() < f64::EPSILON);
+        assert!(bus.broadcast(transmission("alice", 42, 1_000)));
         assert!(bus.poll("bob").is_empty());
-        assert!(bus.poll("alice").is_empty());
+        bus.tick(1_099);
+        assert!(bus.poll("bob").is_empty());
+        bus.tick(1_100);
+
+        let packets = bus.poll("bob");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].data, vec![42]);
+        assert_eq!(packets[0].timestamp_ms, 1_100);
     }
 
     #[test]
-    fn nodes_beyond_the_link_budget_do_not_exchange_packets() {
+    fn transmitter_is_busy_and_overlapping_send_is_rejected() {
         let mut bus = RadioBus::new();
         register(&mut bus, "alice", (0.0, 0.0), 14.0);
-        register(&mut bus, "bob", (0.0, 180.0), 14.0);
 
-        bus.broadcast(transmission("alice", 42, 1_000));
-
-        assert!(bus.poll("bob").is_empty());
+        assert!(bus.broadcast(transmission("alice", 1, 1_000)));
+        assert!(!bus.is_send_complete("alice", 1_099));
+        assert!(!bus.broadcast(transmission("alice", 2, 1_099)));
+        assert!(bus.is_send_complete("alice", 1_100));
+        assert!(bus.broadcast(transmission("alice", 3, 1_100)));
     }
 
     #[test]
-    fn simultaneous_equal_strength_transmissions_collide_for_every_receiver() {
+    fn collision_result_does_not_depend_on_poll_timing() {
         let mut bus = RadioBus::new();
         register(&mut bus, "alice", (0.0, -0.001), 14.0);
         register(&mut bus, "bob", (0.0, 0.001), 14.0);
         register(&mut bus, "carol", (0.0, 0.0), 14.0);
 
-        bus.broadcast(transmission("alice", 1, 1_000));
-        bus.broadcast(transmission("bob", 2, 1_000));
-
-        assert!(bus.poll("alice").is_empty());
-        assert!(bus.poll("bob").is_empty());
+        assert!(bus.broadcast(transmission("alice", 1, 1_000)));
+        assert!(bus.poll("carol").is_empty());
+        assert!(bus.broadcast(transmission("bob", 2, 1_000)));
+        assert!(bus.poll("carol").is_empty());
+        bus.tick(1_100);
         assert!(bus.poll("carol").is_empty());
     }
 
@@ -280,42 +410,60 @@ mod tests {
         register(&mut bus, "strong", (0.0, 0.0001), 14.0);
         register(&mut bus, "receiver", (0.0, 0.0), 14.0);
 
-        bus.broadcast(transmission("weak", 1, 1_000));
-        bus.broadcast(transmission("strong", 2, 1_000));
+        assert!(bus.broadcast(transmission("weak", 1, 1_000)));
+        assert!(bus.broadcast(transmission("strong", 2, 1_000)));
+        bus.tick(1_100);
         let packets = bus.poll("receiver");
 
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].from_node, "strong");
-        assert_eq!(packets[0].data, vec![2]);
     }
 
     #[test]
-    fn updated_position_is_used_and_unknown_nodes_are_ignored() {
-        let mut bus = RadioBus::new();
-        register(&mut bus, "alice", (0.0, 180.0), 14.0);
-        register(&mut bus, "bob", (0.0, 0.0), 14.0);
+    fn nearby_frequency_with_different_modulation_still_interferes() {
+        let mut bus = RadioBus::with_config(RadioBusConfig {
+            propagation_model: PropagationModel::FreeSpace,
+            system_loss_db: 0.0,
+            frequency_tolerance_khz: 2.0,
+            ..RadioBusConfig::default()
+        });
+        register(&mut bus, "wanted", (0.0, -0.001), 14.0);
+        register(&mut bus, "receiver", (0.0, 0.0), 14.0);
+        bus.register_node(
+            "interferer".into(),
+            (0.0, 0.001),
+            14.0,
+            RadioChannel {
+                spreading_factor: 8,
+                ..channel_at(915.001)
+            },
+        );
 
-        bus.update_position("alice", (0.0, 0.0001));
-        bus.broadcast(transmission("alice", 1, 0));
-        bus.broadcast(transmission("unknown", 2, 200));
+        assert!(bus.broadcast(transmission("wanted", 1, 1_000)));
+        let mut interference = transmission("interferer", 2, 1_000);
+        interference.channel = channel_at(915.001);
+        assert!(bus.broadcast(interference));
+        bus.tick(1_100);
 
-        assert_eq!(bus.poll("bob").len(), 1);
-        assert!(bus.poll("unknown").is_empty());
+        assert!(bus.poll("receiver").is_empty());
     }
 
     #[test]
-    fn unregister_stops_delivery_and_tick_expires_transmissions() {
-        let mut bus = RadioBus::new();
+    fn fixed_range_model_applies_a_simple_cutoff() {
+        let mut bus = RadioBus::with_config(RadioBusConfig {
+            propagation_model: PropagationModel::FixedRange {
+                max_distance_km: 1.0,
+            },
+            system_loss_db: 0.0,
+            ..RadioBusConfig::default()
+        });
         register(&mut bus, "alice", (0.0, 0.0), 14.0);
-        register(&mut bus, "bob", (0.0, 0.0001), 14.0);
-        register(&mut bus, "carol", (0.0, 0.0002), 14.0);
+        register(&mut bus, "near", (0.0, 0.005), 14.0);
+        register(&mut bus, "far", (0.0, 0.02), 14.0);
 
-        bus.broadcast(transmission("alice", 1, 100));
-        bus.tick(200);
-        bus.broadcast(transmission("bob", 2, 200));
-        bus.unregister_node("carol");
-
-        assert_eq!(bus.poll("alice").len(), 1);
-        assert!(bus.poll("carol").is_empty());
+        assert!(bus.broadcast(transmission("alice", 1, 0)));
+        bus.tick(100);
+        assert_eq!(bus.poll("near").len(), 1);
+        assert!(bus.poll("far").is_empty());
     }
 }
