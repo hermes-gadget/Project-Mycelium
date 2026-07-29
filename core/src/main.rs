@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "mycelium", version, about = "T-Deck + Mesh emulator")]
+#[command(name = "meshemu", version, about = "T-Deck + Mesh emulator")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

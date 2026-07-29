@@ -17,7 +17,7 @@ members = [
 resolver = "2"
 
 [[bin]]
-name = "mycelium"
+name = "meshemu"
 path = "core/src/main.rs"
 
 [dependencies]
