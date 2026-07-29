@@ -3,6 +3,8 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use mycelium_board::{BoardConfig, VirtualBoard};
+use mycelium_gps::GpsManager;
 use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
@@ -88,6 +90,33 @@ fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
     }
     unsafe { *out_len = data.len() };
     output
+}
+
+unsafe fn gps_mut<'a>(gps: *mut c_void) -> Option<&'a mut GpsManager> {
+    unsafe { (gps as *mut GpsManager).as_mut() }
+}
+
+unsafe fn board_ref<'a>(board: *mut c_void) -> Option<&'a VirtualBoard> {
+    unsafe { (board as *const VirtualBoard).as_ref() }
+}
+
+unsafe fn board_mut<'a>(board: *mut c_void) -> Option<&'a mut VirtualBoard> {
+    unsafe { (board as *mut VirtualBoard).as_mut() }
+}
+
+unsafe fn instance_id(instance_id: *const c_char) -> Option<String> {
+    if instance_id.is_null() {
+        return None;
+    }
+    let instance_id = unsafe { CStr::from_ptr(instance_id) }.to_str().ok()?;
+    (!instance_id.is_empty()).then(|| instance_id.to_owned())
+}
+
+fn valid_position(lat: f64, lon: f64) -> bool {
+    lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
 }
 
 /// Mounts the virtual SPIFFS partition for an emulator instance.
@@ -254,6 +283,149 @@ pub unsafe extern "C" fn meshemu_sdcard_write(
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_storage_data_free(data: *mut u8) {
     unsafe { libc::free(data.cast()) };
+}
+
+/// Creates an independently owned virtual GPS.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_create(
+    instance_id: *const c_char,
+    lat: f64,
+    lon: f64,
+) -> *mut c_void {
+    if (unsafe { self::instance_id(instance_id) }).is_none() || !valid_position(lat, lon) {
+        return ptr::null_mut();
+    }
+    Box::into_raw(Box::new(GpsManager::new(lat, lon))).cast()
+}
+
+/// Updates a virtual GPS position and altitude.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_position(gps: *mut c_void, lat: f64, lon: f64, alt: f64) {
+    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+        return;
+    };
+    if valid_position(lat, lon) && alt.is_finite() {
+        gps.state_mut().latitude = lat;
+        gps.state_mut().longitude = lon;
+        gps.state_mut().altitude_m = alt;
+    }
+}
+
+/// Copies the next NMEA bytes into `buf`.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle and `buf` must reference at least
+/// `max_len` writable bytes when `max_len` is positive.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_len: i32) -> i32 {
+    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+        return 0;
+    };
+    if buf.is_null() || max_len <= 0 {
+        return 0;
+    }
+    let output = unsafe { std::slice::from_raw_parts_mut(buf, max_len as usize) };
+    gps.read(output).min(i32::MAX as usize) as i32
+}
+
+/// Enables or disables NMEA output.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool) {
+    if let Some(gps) = unsafe { gps_mut(gps) } {
+        gps.state_mut().enabled = enabled;
+    }
+}
+
+/// Destroys a GPS handle.
+///
+/// # Safety
+///
+/// `gps` must be null or a live GPS handle, passed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_destroy(gps: *mut c_void) {
+    if !gps.is_null() {
+        unsafe { drop(Box::from_raw(gps.cast::<GpsManager>())) };
+    }
+}
+
+/// Creates an independently owned virtual main board.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_create(
+    instance_id: *const c_char,
+    mv: u16,
+    temp: f32,
+) -> *mut c_void {
+    let Some(instance_id) = (unsafe { self::instance_id(instance_id) }) else {
+        return ptr::null_mut();
+    };
+    if !temp.is_finite() {
+        return ptr::null_mut();
+    }
+    let config = BoardConfig {
+        battery_mv: mv,
+        mcu_temperature: temp,
+        ..BoardConfig::default()
+    };
+    Box::into_raw(Box::new(VirtualBoard::new(&instance_id, config))).cast()
+}
+
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_battery(board: *mut c_void) -> u16 {
+    unsafe { board_ref(board) }
+        .map(VirtualBoard::get_battery_mv)
+        .unwrap_or(0)
+}
+
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_temp(board: *mut c_void) -> f32 {
+    unsafe { board_ref(board) }
+        .map(VirtualBoard::get_temperature)
+        .unwrap_or(0.0)
+}
+
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.set_battery(mv);
+    }
+}
+
+/// Destroys a board handle.
+///
+/// # Safety
+///
+/// `board` must be null or a live board handle, passed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_destroy(board: *mut c_void) {
+    if !board.is_null() {
+        unsafe { drop(Box::from_raw(board.cast::<VirtualBoard>())) };
+    }
 }
 
 /// Creates an independently owned virtual T-Deck keyboard.
