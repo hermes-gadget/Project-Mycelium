@@ -104,6 +104,28 @@ mod tests {
     }
 
     #[test]
+    fn sdcard_directory_exists_and_remove_operations_follow_mount_state() {
+        let root = test_directory("sdcard-directory-operations");
+        let mut sdcard = VirtualSdCard::at_path("test", root.clone());
+
+        assert!(sdcard.create_dir("/logs").is_err());
+        sdcard.mount().unwrap();
+        sdcard.create_dir("/logs/archive").unwrap();
+        assert!(sdcard.exists("logs").unwrap());
+        assert!(sdcard.exists("/logs/archive").unwrap());
+        assert!(!sdcard.exists("/missing").unwrap());
+
+        sdcard.write_file("/logs/current.txt", b"data").unwrap();
+        assert!(sdcard.exists("/logs/current.txt").unwrap());
+        sdcard.remove_file("/logs/current.txt").unwrap();
+        assert!(!sdcard.exists("/logs/current.txt").unwrap());
+
+        sdcard.unmount();
+        assert!(sdcard.exists("/logs").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn format_clears_all_spiffs_data_and_keeps_it_mounted() {
         let root = test_directory("spiffs-format");
         let mut spiffs = VirtualSpiffs::at_path("test", root.clone());

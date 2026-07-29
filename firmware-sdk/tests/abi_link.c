@@ -95,6 +95,9 @@ int main(void)
     uint8_t sda = 0;
     uint8_t scl = 0;
     meshemu_wire_read_idle_levels(wire, &sda, &scl);
+    meshemu_wire_set_sda_stuck(wire, true);
+    (void)meshemu_wire_clock_out_recovery(wire);
+    meshemu_wire_emit_stop(wire);
     meshemu_wire_begin_transmission(wire, 0x55);
     (void)meshemu_wire_write(wire, byte);
     (void)meshemu_wire_end_transmission(wire);
@@ -103,6 +106,9 @@ int main(void)
     (void)meshemu_wire_read(wire);
     meshemu_wire_shim_destroy(wire);
     meshemu_i2c_keyboard_destroy(keyboard);
+    meshemu_input_set_gpio_intr_enabled(id, 3, true);
+    (void)meshemu_input_get_gpio_intr_enabled(id, 3);
+    (void)meshemu_input_take_falling_edges(id, 3);
 
     void* radio = meshemu_radio_create(id, 915.0, 125, 7, 5, 14.0, 51.5, -0.1);
     (void)meshemu_radio_start_send(radio, &byte, 1);
@@ -124,9 +130,24 @@ int main(void)
     meshemu_storage_data_free(spiffs_data);
     meshemu_sdcard_set_behavior(false, 0);
     (void)meshemu_sdcard_init(id);
+    (void)meshemu_sdcard_card_type(id);
+    (void)meshemu_sdcard_total_bytes(id);
+    (void)meshemu_sdcard_used_bytes(id);
+    (void)meshemu_sdcard_mkdir(id, "logs");
+    (void)meshemu_sdcard_exists(id, "logs");
+    uint32_t sdcard_handle =
+        meshemu_sdcard_open(id, "logs/abi.bin", MESHEMU_SD_OPEN_WRITE);
+    (void)meshemu_sdcard_write_file(sdcard_handle, &byte, 1);
+    (void)meshemu_sdcard_close_file(sdcard_handle);
+    sdcard_handle =
+        meshemu_sdcard_open(id, "logs/abi.bin", MESHEMU_SD_OPEN_READ);
+    (void)meshemu_sdcard_read_file(sdcard_handle, &byte, 1);
+    (void)meshemu_sdcard_close_file(sdcard_handle);
+    (void)meshemu_sdcard_remove(id, "logs/abi.bin");
     uint8_t* sdcard_data = meshemu_sdcard_read(id, id, &size);
     (void)meshemu_sdcard_write(id, id, &byte, 1);
     meshemu_storage_data_free(sdcard_data);
+    meshemu_sdcard_end(id);
     (void)meshemu_storage_destroy(id);
 
     (void)meshemu_nvs_init(id, MESHEMU_NVS_SIZE_STANDALONE);

@@ -183,6 +183,14 @@ impl InputManager {
         self.trackball.take_falling_edges(gpio)
     }
 
+    pub fn set_gpio_intr_enabled(&mut self, gpio: u8, enabled: bool) {
+        self.trackball.set_gpio_intr_enabled(gpio, enabled);
+    }
+
+    pub fn gpio_intr_enabled(&self, gpio: u8) -> bool {
+        self.trackball.gpio_intr_enabled(gpio)
+    }
+
     pub fn poll_touch(&mut self) -> Option<Gt911TouchEvent> {
         self.touch_events.pop_front()
     }
@@ -539,5 +547,21 @@ mod tests {
 
         manager.handle_sdl_event(&key_event(1, Keycode::Up, false));
         assert!(manager.digital_read(crate::TRACKBALL_UP_GPIO));
+    }
+
+    #[test]
+    fn gpio_interrupt_enable_survives_unrelated_injected_input() {
+        let mut manager = InputManager::new("node", 1.0);
+        manager.set_gpio_intr_enabled(crate::TRACKBALL_UP_GPIO, false);
+        manager.inject_touch(20, 30, true);
+        manager.inject_key(Keycode::Q, true);
+        assert!(!manager.gpio_intr_enabled(crate::TRACKBALL_UP_GPIO));
+
+        manager.inject_key(Keycode::Up, true);
+        assert_eq!(manager.take_falling_edges(crate::TRACKBALL_UP_GPIO), 0);
+        manager.inject_key(Keycode::Up, false);
+        manager.set_gpio_intr_enabled(crate::TRACKBALL_UP_GPIO, true);
+        manager.inject_key(Keycode::Up, true);
+        assert_eq!(manager.take_falling_edges(crate::TRACKBALL_UP_GPIO), 1);
     }
 }

@@ -42,6 +42,7 @@ pub struct TrackballGpio {
     right: bool,
     click: bool,
     boot_state: bool,
+    gpio_intr_enabled: [bool; 5],
     falling_edges: [u32; 5],
     last_event: Option<TrackballEvent>,
 }
@@ -55,6 +56,9 @@ impl TrackballGpio {
             right: true,
             click: true,
             boot_state: true,
+            // Falling-edge collection was historically always active in
+            // Mycelium; retain that default while exposing the hardware bits.
+            gpio_intr_enabled: [true; 5],
             falling_edges: [0; 5],
             last_event: None,
         }
@@ -76,7 +80,10 @@ impl TrackballGpio {
     pub fn set_boot_pressed(&mut self, pressed: bool) {
         let was_high = self.digital_read(TRACKBALL_CLICK_GPIO);
         self.boot_state = !pressed;
-        if was_high && !self.digital_read(TRACKBALL_CLICK_GPIO) {
+        if was_high
+            && !self.digital_read(TRACKBALL_CLICK_GPIO)
+            && self.gpio_intr_enabled[direction_index(TrackballDirection::Center)]
+        {
             self.falling_edges[direction_index(TrackballDirection::Center)] += 1;
         }
     }
@@ -85,7 +92,10 @@ impl TrackballGpio {
         let gpio = direction.gpio();
         let was_high = self.digital_read(gpio);
         *self.pin(direction) = false;
-        if was_high && !self.digital_read(gpio) {
+        if was_high
+            && !self.digital_read(gpio)
+            && self.gpio_intr_enabled[direction_index(direction)]
+        {
             self.falling_edges[direction_index(direction)] += 1;
         }
     }
@@ -102,6 +112,16 @@ impl TrackballGpio {
         let edges = self.falling_edges[index];
         self.falling_edges[index] = 0;
         edges
+    }
+
+    pub fn set_gpio_intr_enabled(&mut self, gpio: u8, enabled: bool) {
+        if let Some(index) = gpio_index(gpio) {
+            self.gpio_intr_enabled[index] = enabled;
+        }
+    }
+
+    pub fn gpio_intr_enabled(&self, gpio: u8) -> bool {
+        gpio_index(gpio).is_some_and(|index| self.gpio_intr_enabled[index])
     }
 
     pub fn handle_key(&mut self, keycode: Keycode, pressed: bool) -> Option<TrackballEvent> {
@@ -244,5 +264,23 @@ mod tests {
         assert!(trackball.handle_key(Keycode::Up, false).is_some());
         assert!(trackball.handle_key(Keycode::Up, false).is_none());
         assert_eq!(trackball.take_falling_edges(TRACKBALL_UP_GPIO), 1);
+    }
+
+    #[test]
+    fn gpio_interrupt_enable_bit_gates_edges_and_is_sticky_across_input() {
+        let mut trackball = TrackballGpio::new();
+        trackball.set_gpio_intr_enabled(TRACKBALL_LEFT_GPIO, false);
+        assert!(!trackball.gpio_intr_enabled(TRACKBALL_LEFT_GPIO));
+
+        trackball.press(TrackballDirection::Left);
+        assert_eq!(trackball.take_falling_edges(TRACKBALL_LEFT_GPIO), 0);
+        trackball.release(TrackballDirection::Left);
+        assert!(!trackball.gpio_intr_enabled(TRACKBALL_LEFT_GPIO));
+
+        trackball.set_gpio_intr_enabled(TRACKBALL_LEFT_GPIO, true);
+        trackball.press(TrackballDirection::Left);
+        assert_eq!(trackball.take_falling_edges(TRACKBALL_LEFT_GPIO), 1);
+        assert!(trackball.gpio_intr_enabled(TRACKBALL_LEFT_GPIO));
+        assert!(!trackball.gpio_intr_enabled(99));
     }
 }

@@ -61,6 +61,9 @@ bool meshemu_wire_begin(void *wire);
 void meshemu_wire_set_clock(void *wire, uint32_t clock_hz);
 bool meshemu_wire_probe_address(void *wire, uint8_t address);
 void meshemu_wire_read_idle_levels(void *wire, uint8_t *sda, uint8_t *scl);
+uint8_t meshemu_wire_clock_out_recovery(void *wire);
+void meshemu_wire_emit_stop(void *wire);
+void meshemu_wire_set_sda_stuck(void *wire, bool stuck);
 void meshemu_wire_begin_transmission(void *wire, uint8_t address);
 size_t meshemu_wire_write(void *wire, uint8_t byte);
 uint8_t meshemu_wire_end_transmission(void *wire);
@@ -70,6 +73,13 @@ int32_t meshemu_wire_read(void *wire);
 void meshemu_wire_shim_destroy(void *wire);
 bool meshemu_input_digital_read(const char *instance_id, uint8_t gpio);
 uint32_t meshemu_input_take_falling_edges(const char *instance_id, uint8_t gpio);
+void meshemu_input_set_gpio_intr_enabled(
+    const char *instance_id,
+    uint8_t gpio,
+    bool enabled);
+bool meshemu_input_get_gpio_intr_enabled(
+    const char *instance_id,
+    uint8_t gpio);
 
 #ifdef __cplusplus
 }
@@ -96,6 +106,13 @@ public:
     }
     void readIdleLevels(uint8_t *sda, uint8_t *scl) {
         meshemu_wire_read_idle_levels(handle_, sda, scl);
+    }
+    uint8_t clockOutRecovery() {
+        return meshemu_wire_clock_out_recovery(handle_);
+    }
+    void emitStop() { meshemu_wire_emit_stop(handle_); }
+    void setSdaStuck(bool stuck) {
+        meshemu_wire_set_sda_stuck(handle_, stuck);
     }
     void beginTransmission(uint8_t address) {
         meshemu_wire_begin_transmission(handle_, address);

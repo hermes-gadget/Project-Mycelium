@@ -218,6 +218,18 @@ impl VirtualSdCard {
         fs::write(full_path, data)
     }
 
+    pub fn create_dir(&self, path: &str) -> Result<(), io::Error> {
+        fs::create_dir_all(self.resolve(path)?)
+    }
+
+    pub fn exists(&self, path: &str) -> Result<bool, io::Error> {
+        Ok(self.resolve(path)?.exists())
+    }
+
+    pub fn remove_file(&self, path: &str) -> Result<(), io::Error> {
+        fs::remove_file(self.resolve(path)?)
+    }
+
     pub fn list_dir(&self, path: &str) -> Result<Vec<String>, io::Error> {
         let mut files = Vec::new();
         for entry in fs::read_dir(self.resolve(path)?)? {
