@@ -7,9 +7,17 @@
 extern "C" {
 #endif
 
-// Create an SDL2-backed LVGL display. Maps to lv_sdl_window_create() internally.
-// Returns lv_display_t* that the firmware uses like a real display.
+// LVGL version the firmware expects.
+#define MYCELIUM_LVGL_V9 9
+#define MYCELIUM_LVGL_V8 8
+
+// Create an SDL2-backed display with an explicit LVGL ABI.
+// Returns an opaque display handle, or NULL when initialization fails.
 // Set window_title = NULL for auto-generated title.
+void* meshemu_display_create_v(int width, int height, const char* window_title,
+                               int lvgl_version);
+
+// Legacy wrapper. Creates an LVGL v9 display.
 void* meshemu_display_create(int width, int height, const char* window_title);
 
 // Capture current framebuffer as RGB565 data. Caller frees the buffer.

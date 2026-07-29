@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use anyhow::{bail, Result};
 use sdl2::{EventPump, Sdl};
 
-use crate::window::{event_for_window, DisplayConfig, DisplayEvent, DisplayWindow, Rect};
+use crate::window::{event_for_window, DisplayEvent, DisplayWindow, Rect};
+use crate::DisplayConfig;
 
 pub struct DisplayManager {
     windows: HashMap<String, DisplayWindow>,
@@ -128,10 +129,11 @@ mod tests {
             width: 4,
             height: 3,
             scale: 1,
+            ..DisplayConfig::default()
         };
 
-        manager.create_window("node2", config).unwrap();
-        manager.create_window("node1", config).unwrap();
+        manager.create_window("node2", config.clone()).unwrap();
+        manager.create_window("node1", config.clone()).unwrap();
         assert_eq!(manager.list_windows(), ["node1", "node2"]);
         assert!(manager.create_window("node1", config).is_err());
 

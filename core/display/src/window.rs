@@ -8,23 +8,6 @@ use sdl2::video::{Window, WindowContext};
 use sdl2::{Sdl, VideoSubsystem};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DisplayConfig {
-    pub width: u32,
-    pub height: u32,
-    pub scale: u32,
-}
-
-impl Default for DisplayConfig {
-    fn default() -> Self {
-        Self {
-            width: 320,
-            height: 240,
-            scale: 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,

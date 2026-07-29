@@ -82,13 +82,19 @@ pub unsafe extern "C" fn meshemu_display_capture(
     if display.is_null() || size_out.is_null() {
         return ptr::null_mut();
     }
-    let Some(pixels) = (unsafe { mycelium_display::lvgl_v9::capture_lvgl_rgb565(display) }) else {
+    let pixels = unsafe { mycelium_display::capture_managed_rgb565(display) }
+        .or_else(|| unsafe { mycelium_display::lvgl_v9::capture_lvgl_rgb565(display) });
+    let Some(pixels) = pixels else {
         return ptr::null_mut();
     };
-    let mut pixels = pixels.into_boxed_slice();
     let len = pixels.len();
-    let data = pixels.as_mut_ptr();
-    std::mem::forget(pixels);
+    let data = unsafe { libc::malloc(len) }.cast::<u8>();
+    if data.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(pixels.as_ptr(), data, len);
+    }
     unsafe { *size_out = len };
     data
 }
@@ -101,12 +107,8 @@ pub unsafe extern "C" fn meshemu_display_capture(
 /// the exact corresponding `size`.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_display_capture_free(data: *mut u8, size: usize) {
-    if data.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(data, size)));
-    }
+    let _ = size;
+    unsafe { libc::free(data.cast()) };
 }
 
 /// Creates a radio and registers its node with the process-wide radio bus.
