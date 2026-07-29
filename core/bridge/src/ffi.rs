@@ -3,13 +3,13 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use mycelium_board::{BoardConfig, VirtualBoard};
+use mycelium_board::{peripherals_powered, BoardConfig, Tp4054State, VirtualBoard};
 use mycelium_gps::GpsManager;
 use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
 use mycelium_input::{get_input_manager, register_input_manager, SharedInputManager};
 use mycelium_storage::StorageManager;
-use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, Sx1262State, TxEvent};
+use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, TxEvent};
 use sdl2::keyboard::Keycode;
 
 struct BusState {
@@ -30,9 +30,15 @@ impl BusState {
 
 struct RadioHandle {
     node_id: String,
-    radio: Sx1262State,
+    channel: RadioChannel,
+    tx_power_dbm: f64,
     pending: Mutex<VecDeque<RxPacket>>,
     last_rx: Mutex<Option<(f32, f32)>>,
+}
+
+struct GpsHandle {
+    instance_id: String,
+    manager: GpsManager,
 }
 
 static BUS: LazyLock<Mutex<BusState>> = LazyLock::new(|| Mutex::new(BusState::new()));
@@ -91,8 +97,8 @@ fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
     output
 }
 
-unsafe fn gps_mut<'a>(gps: *mut c_void) -> Option<&'a mut GpsManager> {
-    unsafe { (gps as *mut GpsManager).as_mut() }
+unsafe fn gps_mut<'a>(gps: *mut c_void) -> Option<&'a mut GpsHandle> {
+    unsafe { (gps as *mut GpsHandle).as_mut() }
 }
 
 unsafe fn board_ref<'a>(board: *mut c_void) -> Option<&'a VirtualBoard> {
@@ -118,18 +124,23 @@ fn valid_position(lat: f64, lon: f64) -> bool {
         && (-180.0..=180.0).contains(&lon)
 }
 
-fn sx1262_state(
+fn valid_radio_config(
     freq_mhz: f64,
     bandwidth_khz: u16,
     spreading_factor: u8,
     coding_rate: u8,
     tx_power_dbm: f64,
-) -> Option<Sx1262State> {
+) -> bool {
     // SX1262 operating limits and the LoRa modulation settings supported by
     // the bridge. Reject rather than passing unchecked values into airtime
     // arithmetic across the FFI boundary.
-    let channel = RadioChannel::new(freq_mhz, bandwidth_khz, spreading_factor, coding_rate)?;
-    Sx1262State::new(channel, tx_power_dbm)
+    freq_mhz.is_finite()
+        && (150.0..=960.0).contains(&freq_mhz)
+        && matches!(bandwidth_khz, 125 | 250 | 500)
+        && (7..=12).contains(&spreading_factor)
+        && (5..=8).contains(&coding_rate)
+        && tx_power_dbm.is_finite()
+        && (-17.0..=22.0).contains(&tx_power_dbm)
 }
 
 /// Mounts the virtual SPIFFS partition for an emulator instance.
@@ -220,6 +231,9 @@ pub unsafe extern "C" fn meshemu_sdcard_init(instance_id: *const c_char) -> bool
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return false;
     };
+    if !peripherals_powered(instance_id) {
+        return false;
+    }
     let mut storage = lock(&STORAGE);
     storage
         .entry(instance_id.to_owned())
@@ -249,6 +263,9 @@ pub unsafe extern "C" fn meshemu_sdcard_read(
     let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
         return ptr::null_mut();
     };
+    if !peripherals_powered(instance_id) {
+        return ptr::null_mut();
+    }
     let storage = lock(&STORAGE);
     let Some(data) = storage
         .get(instance_id)
@@ -275,6 +292,9 @@ pub unsafe extern "C" fn meshemu_sdcard_write(
     let Some((instance_id, path)) = (unsafe { storage_file_args(instance_id, path) }) else {
         return false;
     };
+    if !peripherals_powered(instance_id) {
+        return false;
+    }
     if data.is_null() && len != 0 {
         return false;
     }
@@ -328,10 +348,17 @@ pub unsafe extern "C" fn meshemu_gps_create(
     lat: f64,
     lon: f64,
 ) -> *mut c_void {
-    if (unsafe { self::instance_id(instance_id) }).is_none() || !valid_position(lat, lon) {
+    let Some(instance_id) = (unsafe { self::instance_id(instance_id) }) else {
+        return ptr::null_mut();
+    };
+    if !valid_position(lat, lon) {
         return ptr::null_mut();
     }
-    Box::into_raw(Box::new(GpsManager::new(lat, lon))).cast()
+    Box::into_raw(Box::new(GpsHandle {
+        instance_id,
+        manager: GpsManager::new(lat, lon),
+    }))
+    .cast()
 }
 
 /// Updates a virtual GPS position and altitude.
@@ -345,9 +372,9 @@ pub unsafe extern "C" fn meshemu_gps_set_position(gps: *mut c_void, lat: f64, lo
         return;
     };
     if valid_position(lat, lon) && alt.is_finite() {
-        gps.state_mut().latitude = lat;
-        gps.state_mut().longitude = lon;
-        gps.state_mut().altitude_m = alt;
+        gps.manager.state_mut().latitude = lat;
+        gps.manager.state_mut().longitude = lon;
+        gps.manager.state_mut().altitude_m = alt;
     }
 }
 
@@ -362,23 +389,11 @@ pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_le
     let Some(gps) = (unsafe { gps_mut(gps) }) else {
         return 0;
     };
-    if buf.is_null() || max_len <= 0 {
+    if buf.is_null() || max_len <= 0 || !peripherals_powered(&gps.instance_id) {
         return 0;
     }
     let output = unsafe { std::slice::from_raw_parts_mut(buf, max_len as usize) };
-    gps.read(output).min(i32::MAX as usize) as i32
-}
-
-/// Advances the virtual GPS clock and movement model.
-///
-/// # Safety
-///
-/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
-#[no_mangle]
-pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
-    if let Some(gps) = unsafe { gps_mut(gps) } {
-        gps.tick(delta_ms);
-    }
+    gps.manager.read(output).min(i32::MAX as usize) as i32
 }
 
 /// Enables or disables NMEA output.
@@ -389,7 +404,7 @@ pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool) {
     if let Some(gps) = unsafe { gps_mut(gps) } {
-        gps.set_enabled(enabled);
+        gps.manager.state_mut().enabled = enabled;
     }
 }
 
@@ -401,7 +416,7 @@ pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_destroy(gps: *mut c_void) {
     if !gps.is_null() {
-        unsafe { drop(Box::from_raw(gps.cast::<GpsManager>())) };
+        unsafe { drop(Box::from_raw(gps.cast::<GpsHandle>())) };
     }
 }
 
@@ -440,6 +455,18 @@ pub unsafe extern "C" fn meshemu_board_get_battery(board: *mut c_void) -> u16 {
         .unwrap_or(0)
 }
 
+/// Reads a raw 12-bit ADC count from a board GPIO.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_adc(board: *mut c_void, gpio: u8) -> u16 {
+    unsafe { board_ref(board) }
+        .map(|board| board.get_adc(gpio))
+        .unwrap_or(0)
+}
+
 /// # Safety
 ///
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
@@ -458,6 +485,70 @@ pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) 
     if let Some(board) = unsafe { board_mut(board) } {
         board.set_battery(mv);
     }
+}
+
+/// Drives one board GPIO. GPIO10 is the active-HIGH peripheral power rail.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_digital_write(board: *mut c_void, gpio: u8, high: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.digital_write(gpio, high);
+    }
+}
+
+/// Attaches a GPIO to an emulated LEDC channel.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_ledc_attach(board: *mut c_void, channel: u8, gpio: u8) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.ledc_attach(channel, gpio);
+    }
+}
+
+/// Writes a PWM period and HIGH time to an emulated LEDC channel.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_ledc_write(
+    board: *mut c_void,
+    channel: u8,
+    period_us: u32,
+    high_time_us: u32,
+) -> bool {
+    unsafe { board_mut(board) }
+        .is_some_and(|board| board.ledc_write(channel, period_us, high_time_us))
+}
+
+/// Updates external-power detection for the TP4054 charger.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_external_power(board: *mut c_void, powered: bool) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.set_external_power(powered);
+    }
+}
+
+/// Returns the current TP4054 state as a `MESHEMU_TP4054_*` value.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_charger_state(board: *mut c_void) -> u8 {
+    unsafe { board_ref(board) }
+        .map(|board| board.charger_state() as u8)
+        .unwrap_or(Tp4054State::NoBattery as u8)
 }
 
 /// Destroys a board handle.
@@ -935,16 +1026,16 @@ pub unsafe extern "C" fn meshemu_radio_create(
     lat: f64,
     lon: f64,
 ) -> *mut c_void {
-    let Some(radio_state) = sx1262_state(
-        freq_mhz,
-        bandwidth_khz,
-        spreading_factor,
-        coding_rate,
-        tx_power_dbm,
-    ) else {
-        return ptr::null_mut();
-    };
-    if instance_id.is_null() || !valid_position(lat, lon) {
+    if instance_id.is_null()
+        || !valid_radio_config(
+            freq_mhz,
+            bandwidth_khz,
+            spreading_factor,
+            coding_rate,
+            tx_power_dbm,
+        )
+        || !valid_position(lat, lon)
+    {
         return ptr::null_mut();
     }
 
@@ -955,21 +1046,25 @@ pub unsafe extern "C" fn meshemu_radio_create(
         return ptr::null_mut();
     }
 
+    let channel = RadioChannel {
+        freq_mhz,
+        bandwidth_khz,
+        spreading_factor,
+        coding_rate,
+    };
     let mut state = lock(&BUS);
     if !state.node_ids.insert(node_id.clone()) {
         return ptr::null_mut();
     }
-    state.bus.register_node(
-        node_id.clone(),
-        (lat, lon),
-        radio_state.tx_power_dbm,
-        radio_state.channel.clone(),
-    );
+    state
+        .bus
+        .register_node(node_id.clone(), (lat, lon), tx_power_dbm, channel.clone());
     drop(state);
 
     Box::into_raw(Box::new(RadioHandle {
         node_id,
-        radio: radio_state,
+        channel,
+        tx_power_dbm,
         pending: Mutex::new(VecDeque::new()),
         last_rx: Mutex::new(None),
     })) as *mut c_void
@@ -1001,9 +1096,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     };
     let airtime_ms = propagation::airtime_ms(
         bytes.len(),
-        handle.radio.channel.spreading_factor,
-        handle.radio.channel.bandwidth_khz,
-        handle.radio.channel.coding_rate,
+        handle.channel.spreading_factor,
+        handle.channel.bandwidth_khz,
+        handle.channel.coding_rate,
         8,
         true,
     );
@@ -1011,9 +1106,9 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
     let timestamp_ms = state.now_ms;
     state.bus.broadcast(TxEvent {
         node_id: handle.node_id.clone(),
-        channel: handle.radio.channel.clone(),
+        channel: handle.channel.clone(),
         data: bytes.to_vec(),
-        tx_power_dbm: handle.radio.tx_power_dbm,
+        tx_power_dbm: handle.tx_power_dbm,
         airtime_ms,
         position: (0.0, 0.0),
         timestamp_ms,
@@ -1022,24 +1117,19 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
 
 /// Copies one queued packet into `buffer`, returning zero when none is ready.
 ///
-/// If the buffer is too small, `truncated` is set, the packet remains queued,
-/// and its required length is returned as a negative value.
+/// If the buffer is too small, the packet remains queued and its required
+/// length is returned as a negative value.
 ///
 /// # Safety
 ///
 /// `radio` must be a live bridge handle, and `buffer` must reference at least
-/// `max_len` writable bytes when `max_len` is positive. When non-null,
-/// `truncated` must point to writable storage.
+/// `max_len` writable bytes when `max_len` is positive.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_radio_recv_raw(
     radio: *mut c_void,
     buffer: *mut u8,
     max_len: i32,
-    truncated: *mut bool,
 ) -> i32 {
-    if !truncated.is_null() {
-        unsafe { *truncated = false };
-    }
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0;
     };
@@ -1056,9 +1146,6 @@ pub unsafe extern "C" fn meshemu_radio_recv_raw(
         return 0;
     };
     if packet.data.len() > max_len as usize {
-        if !truncated.is_null() {
-            unsafe { *truncated = true };
-        }
         return -(packet.data.len().min(i32::MAX as usize) as i32);
     }
     let packet = pending.pop_front().expect("front was checked above");
@@ -1083,9 +1170,9 @@ pub unsafe extern "C" fn meshemu_radio_get_est_airtime(radio: *mut c_void, len: 
     }
     propagation::airtime_ms(
         len as usize,
-        handle.radio.channel.spreading_factor,
-        handle.radio.channel.bandwidth_khz,
-        handle.radio.channel.coding_rate,
+        handle.channel.spreading_factor,
+        handle.channel.bandwidth_khz,
+        handle.channel.coding_rate,
         8,
         true,
     )
@@ -1160,19 +1247,11 @@ pub unsafe extern "C" fn meshemu_radio_destroy(radio: *mut c_void) {
 #[no_mangle]
 pub extern "C" fn meshemu_bus_tick(now_ms: u64) {
     let mut state = lock(&BUS);
-    // Host clocks can be reset or sampled out of order. Radio airtime and
-    // overlap decisions use a monotonic timeline, so clamp backward jumps.
-    let monotonic_now_ms = state.now_ms.max(now_ms);
-    state.now_ms = monotonic_now_ms;
-    state.bus.tick(monotonic_now_ms);
+    state.now_ms = now_ms;
+    state.bus.tick(now_ms);
 }
 
 #[cfg(test)]
 pub(crate) fn reset_bus() {
     *lock(&BUS) = BusState::new();
-}
-
-#[cfg(test)]
-pub(crate) unsafe fn radio_state(radio: *mut c_void) -> Option<Sx1262State> {
-    Some((unsafe { handle_ref(radio) })?.radio.clone())
 }

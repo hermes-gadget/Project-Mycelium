@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 use std::ffi::{c_char, CStr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
 use tracing::{info, warn};
+
+use crate::peripherals_powered;
 
 pub type SharedVirtualBuzzer = Arc<Mutex<VirtualBuzzer>>;
 
@@ -24,22 +27,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Audio initialization is best-effort so the emulator remains usable on
 /// headless systems. Tone lifecycle state is maintained even without audio.
 pub struct VirtualBuzzer {
-    playing: bool,
+    playing: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     frequency_hz: u32,
-    start_time: Instant,
     duration_ms: u64,
+    duty_cycle: f32,
     audio_enabled: bool,
     audio_tx: Option<Sender<AudioCommand>>,
 }
 
 enum AudioCommand {
-    Beep { frequency_hz: u32 },
+    Beep { frequency_hz: u32, duty_cycle: f32 },
     Stop,
 }
 
 #[derive(Default)]
 struct ToneState {
     frequency_hz: u32,
+    duty_cycle: f32,
     playing: bool,
 }
 
@@ -60,7 +65,7 @@ impl AudioCallback for SineCallback {
         }
         let phase_step = TAU * state.frequency_hz as f32 / self.sample_rate;
         for sample in output {
-            *sample = self.phase.sin() * 0.20;
+            *sample = self.phase.sin() * state.duty_cycle;
             self.phase = (self.phase + phase_step) % TAU;
         }
     }
@@ -103,8 +108,12 @@ fn start_audio_worker() -> Option<Sender<AudioCommand>> {
             while let Ok(command) = command_rx.recv() {
                 let mut state = lock(&state);
                 match command {
-                    AudioCommand::Beep { frequency_hz } => {
+                    AudioCommand::Beep {
+                        frequency_hz,
+                        duty_cycle,
+                    } => {
                         state.frequency_hz = frequency_hz;
+                        state.duty_cycle = duty_cycle;
                         state.playing = true;
                     }
                     AudioCommand::Stop => state.playing = false,
@@ -128,10 +137,11 @@ impl VirtualBuzzer {
         }
 
         Self {
-            playing: false,
+            playing: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
             frequency_hz: 0,
-            start_time: Instant::now(),
             duration_ms: 0,
+            duty_cycle: 0.0,
             audio_enabled: audio_tx.is_some(),
             audio_tx,
         }
@@ -139,45 +149,82 @@ impl VirtualBuzzer {
 
     /// Starts a sine-wave tone, replacing any tone already in progress.
     pub fn beep(&mut self, frequency_hz: u32, duration_ms: u64) {
+        self.start_tone(frequency_hz, 0.5, Some(duration_ms));
+    }
+
+    /// Drives the buzzer from a PWM waveform. A zero or full duty cycle has no
+    /// transitions and therefore produces no tone.
+    pub fn drive_pwm(&mut self, frequency_hz: u32, duty_cycle: f32) {
+        self.start_tone(frequency_hz, duty_cycle, None);
+    }
+
+    fn start_tone(&mut self, frequency_hz: u32, duty_cycle: f32, duration_ms: Option<u64>) {
         self.stop();
         self.frequency_hz = frequency_hz;
-        self.duration_ms = duration_ms;
-        self.start_time = Instant::now();
-        self.playing = frequency_hz > 0 && duration_ms > 0;
+        self.duration_ms = duration_ms.unwrap_or(0);
+        self.duty_cycle = duty_cycle.clamp(0.0, 1.0);
+        let has_transitions = self.duty_cycle > 0.0 && self.duty_cycle < 1.0;
+        let has_duration = duration_ms.is_none_or(|duration| duration > 0);
+        let playing = frequency_hz > 0 && has_transitions && has_duration;
+        self.playing.store(playing, Ordering::Release);
 
         info!(
-            "🔊 BUZZER: {}Hz for {}ms",
-            self.frequency_hz, self.duration_ms
+            "🔊 BUZZER: {}Hz at {:.1}% duty{}",
+            self.frequency_hz,
+            self.duty_cycle * 100.0,
+            duration_ms.map_or_else(String::new, |duration| format!(" for {duration}ms"))
         );
 
-        if !self.playing || !self.audio_enabled {
+        if !playing {
             return;
         }
 
-        let Some(audio_tx) = self.audio_tx.as_ref() else {
-            return;
-        };
-        if audio_tx.send(AudioCommand::Beep { frequency_hz }).is_err() {
-            self.audio_enabled = false;
-            self.audio_tx = None;
-            warn!("host buzzer audio worker stopped; using trace-only mode");
+        if self.audio_enabled {
+            let Some(audio_tx) = self.audio_tx.as_ref() else {
+                return;
+            };
+            if audio_tx
+                .send(AudioCommand::Beep {
+                    frequency_hz,
+                    duty_cycle: self.duty_cycle,
+                })
+                .is_err()
+            {
+                self.audio_enabled = false;
+                self.audio_tx = None;
+                warn!("host buzzer audio worker stopped; using trace-only mode");
+            }
+        }
+
+        if let Some(duration_ms) = duration_ms {
+            let playing = Arc::clone(&self.playing);
+            let generation = Arc::clone(&self.generation);
+            let tone_generation = self.generation.load(Ordering::Acquire);
+            let audio_tx = self.audio_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(duration_ms));
+                if generation.load(Ordering::Acquire) == tone_generation {
+                    playing.store(false, Ordering::Release);
+                    if let Some(audio_tx) = audio_tx {
+                        let _ = audio_tx.send(AudioCommand::Stop);
+                    }
+                }
+            });
         }
     }
 
     /// Stops any currently playing tone.
     pub fn stop(&mut self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         if let Some(audio_tx) = self.audio_tx.as_ref() {
             let _ = audio_tx.send(AudioCommand::Stop);
         }
-        self.playing = false;
+        self.playing.store(false, Ordering::Release);
     }
 
-    /// Updates elapsed-time state and reports whether a tone is active.
-    pub fn is_playing(&mut self) -> bool {
-        if self.playing && self.start_time.elapsed() >= Duration::from_millis(self.duration_ms) {
-            self.stop();
-        }
-        self.playing
+    /// Reports whether a tone is active. Timed tones stop independently.
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::Acquire)
     }
 
     pub fn frequency_hz(&self) -> u32 {
@@ -186,6 +233,10 @@ impl VirtualBuzzer {
 
     pub fn duration_ms(&self) -> u64 {
         self.duration_ms
+    }
+
+    pub fn duty_cycle(&self) -> f32 {
+        self.duty_cycle
     }
 }
 
@@ -231,6 +282,9 @@ pub unsafe extern "C" fn meshemu_buzzer_beep(
     let Some(id) = (unsafe { parse_instance_id(instance_id) }) else {
         return;
     };
+    if !peripherals_powered(&id) {
+        return;
+    }
     if let Some(buzzer) = get_buzzer(&id) {
         lock(&buzzer).beep(frequency_hz, u64::from(duration_ms));
     }
@@ -284,9 +338,22 @@ mod tests {
     #[test]
     fn tone_auto_stops_after_duration() {
         let mut buzzer = VirtualBuzzer::new();
-        buzzer.beep(880, 1);
-        std::thread::sleep(Duration::from_millis(5));
+        buzzer.beep(880, 10);
+        std::thread::sleep(Duration::from_millis(30));
 
+        assert!(!buzzer.is_playing());
+    }
+
+    #[test]
+    fn pwm_frequency_and_volume_follow_period_and_duty() {
+        let mut buzzer = VirtualBuzzer::new();
+        buzzer.drive_pwm(2_000, 0.25);
+
+        assert!(buzzer.is_playing());
+        assert_eq!(buzzer.frequency_hz(), 2_000);
+        assert_eq!(buzzer.duty_cycle(), 0.25);
+
+        buzzer.drive_pwm(2_000, 1.0);
         assert!(!buzzer.is_playing());
     }
 

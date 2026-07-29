@@ -131,11 +131,9 @@ impl Instance {
 
     fn tick(&mut self, delta_ms: u64) {
         self.firmware.tick();
-        self.gps.tick(delta_ms);
-        self.buzzer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_playing();
+        if self.board.periph_pwr_enabled {
+            self.gps.tick(delta_ms);
+        }
     }
 
     pub fn name(&self) -> &str {
