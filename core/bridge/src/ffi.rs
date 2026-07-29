@@ -510,6 +510,96 @@ pub unsafe extern "C" fn meshemu_board_get_temp(board: *mut c_void) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Sets the value returned by the emulated ESP32 `temperatureRead()`.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_mcu_temperature(board: *mut c_void, celsius: f32) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.set_temperature(celsius);
+    }
+}
+
+/// Returns the emulated ESP32 MCU temperature.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_mcu_temperature(board: *mut c_void) -> f32 {
+    unsafe { board_ref(board) }
+        .map(VirtualBoard::get_temperature)
+        .unwrap_or(0.0)
+}
+
+/// Writes bytes into per-instance RTC memory retained across board recreation.
+///
+/// # Safety
+///
+/// `instance_id` must be a valid C string. For nonzero `len`, `data` must
+/// reference at least `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_rtc_noinit(
+    instance_id: *const c_char,
+    offset: usize,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    if data.is_null() && len != 0 {
+        return false;
+    }
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    mycelium_board::set_rtc_noinit(instance_id, offset, bytes)
+}
+
+/// Reads bytes from per-instance RTC memory retained across board recreation.
+///
+/// # Safety
+///
+/// `instance_id` must be a valid C string. For nonzero `len`, `data` must
+/// reference at least `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_rtc_noinit(
+    instance_id: *const c_char,
+    offset: usize,
+    data: *mut u8,
+    len: usize,
+) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    if data.is_null() && len != 0 {
+        return false;
+    }
+    let bytes = if len == 0 {
+        &mut []
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(data, len) }
+    };
+    mycelium_board::get_rtc_noinit(instance_id, offset, bytes)
+}
+
+/// Clears all retained RTC memory for an instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_clear_rtc_noinit(instance_id: *const c_char) {
+    if let Some(instance_id) = unsafe { ffi_string(instance_id) } {
+        mycelium_board::clear_rtc_noinit(instance_id);
+    }
+}
+
 /// Reports whether external PSRAM is installed.
 ///
 /// # Safety
@@ -674,6 +764,95 @@ pub unsafe extern "C" fn meshemu_board_rtc_gpio_hold(board: *mut c_void, gpio: u
     }
 }
 
+/// Sets the reset cause reported for this emulated ESP32.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_reset_reason(board: *mut c_void, reason: u8) -> bool {
+    unsafe { board_mut(board) }.is_some_and(|board| board.set_reset_reason(reason))
+}
+
+/// Returns the reset cause reported for this emulated ESP32.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_reset_reason(board: *mut c_void) -> u8 {
+    unsafe { board_ref(board) }
+        .map(VirtualBoard::reset_reason)
+        .unwrap_or(mycelium_board::RESET_REASON_UNKNOWN)
+}
+
+/// Configures the emulated task watchdog.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_wdt_init(
+    board: *mut c_void,
+    timeout_sec: u32,
+    panic_on_timeout: bool,
+) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.wdt_init(timeout_sec, panic_on_timeout);
+    }
+}
+
+/// Feeds the task watchdog, returning false when disabled or already expired.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_wdt_feed(board: *mut c_void) -> bool {
+    unsafe { board_mut(board) }.is_some_and(VirtualBoard::wdt_feed)
+}
+
+/// Returns `MESHEMU_WDT_*` for the task watchdog.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_wdt_get_status(board: *mut c_void) -> u8 {
+    unsafe { board_mut(board) }
+        .map(VirtualBoard::wdt_status)
+        .unwrap_or(mycelium_board::WDT_STATUS_DISABLED)
+}
+
+/// Disables the task watchdog.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_wdt_disable(board: *mut c_void) {
+    if let Some(board) = unsafe { board_mut(board) } {
+        board.wdt_disable();
+    }
+}
+
+/// Runs the T-Deck peripheral shutdown sequence and latches GPIO10 LOW.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_quiesce_peripherals(board: *mut c_void) -> bool {
+    let Some(board) = (unsafe { board_mut(board) }) else {
+        return false;
+    };
+    if let Some(storage) = lock(&STORAGE).get_mut(&board.instance_id) {
+        storage.sdcard.unmount();
+    }
+    board.quiesce_peripherals();
+    true
+}
+
 /// Enters and completes one synchronous virtual deep-sleep interval.
 ///
 /// Bus time advances by `sleep_secs`; the instance radio drops packets that
@@ -693,6 +872,7 @@ pub unsafe extern "C" fn meshemu_board_deep_sleep(
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return lock(&BUS).now_ms;
     };
+    mycelium_board::set_reset_reason(instance_id, mycelium_board::RESET_REASON_DEEPSLEEP);
 
     let wake_cause = if sleep_secs > 0 {
         SLEEP_WAKE_CAUSE_TIMER

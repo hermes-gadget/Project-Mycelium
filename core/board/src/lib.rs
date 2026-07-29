@@ -4,9 +4,10 @@ mod buzzer;
 pub mod nvs;
 pub mod partition;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub use buzzer::{
     get_buzzer, meshemu_buzzer_beep, meshemu_buzzer_is_playing, meshemu_buzzer_stop,
@@ -33,6 +34,14 @@ pub const BATTERY_MV_PER_ADC_COUNT: f64 =
     ADC_REFERENCE_MV * BATTERY_DIVIDER_RATIO / (ADC_MAX_COUNT as f64 + 1.0);
 pub const TP4054_FULL_MV: u16 = 4_200;
 pub const DEFAULT_PSRAM_SIZE_BYTES: u32 = 8_388_608;
+pub const RTC_NOINIT_SIZE_BYTES: usize = 8_192;
+pub const RESET_REASON_UNKNOWN: u8 = 0;
+pub const RESET_REASON_DEEPSLEEP: u8 = 5;
+pub const RESET_REASON_TASK_WDT: u8 = 9;
+pub const RESET_REASON_SW: u8 = 12;
+pub const WDT_STATUS_DISABLED: u8 = 0;
+pub const WDT_STATUS_ENABLED: u8 = 1;
+pub const WDT_STATUS_TIMED_OUT: u8 = 2;
 pub const SLEEP_WAKE_CAUSE_UNKNOWN: u8 = 0;
 pub const SLEEP_WAKE_CAUSE_TIMER: u8 = 1;
 pub const SLEEP_WAKE_CAUSE_EXT1: u8 = 2;
@@ -49,6 +58,14 @@ const ADC_EFUSE_CAL_RAW_COUNT: f64 = 929.0;
 
 static PERIPHERAL_POWER: LazyLock<Mutex<HashMap<String, bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static RTC_NOINIT: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RESET_REASONS: LazyLock<Mutex<HashMap<String, u8>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RTC_GPIO_HOLDS: LazyLock<Mutex<HashMap<String, HashMap<u8, bool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub const ESP32_S3_MAX_GPIO: u8 = 48;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -61,6 +78,52 @@ pub fn peripherals_powered(instance_id: &str) -> bool {
         .get(instance_id)
         .copied()
         .unwrap_or(true)
+}
+
+pub fn set_rtc_noinit(instance_id: &str, offset: usize, data: &[u8]) -> bool {
+    let Some(end) = offset.checked_add(data.len()) else {
+        return false;
+    };
+    if end > RTC_NOINIT_SIZE_BYTES {
+        return false;
+    }
+    let mut regions = lock(&RTC_NOINIT);
+    let region = regions
+        .entry(instance_id.to_owned())
+        .or_insert_with(|| vec![0; RTC_NOINIT_SIZE_BYTES]);
+    region[offset..end].copy_from_slice(data);
+    true
+}
+
+pub fn get_rtc_noinit(instance_id: &str, offset: usize, data: &mut [u8]) -> bool {
+    let Some(end) = offset.checked_add(data.len()) else {
+        return false;
+    };
+    if end > RTC_NOINIT_SIZE_BYTES {
+        return false;
+    }
+    let regions = lock(&RTC_NOINIT);
+    if let Some(region) = regions.get(instance_id) {
+        data.copy_from_slice(&region[offset..end]);
+    } else {
+        data.fill(0);
+    }
+    true
+}
+
+pub fn clear_rtc_noinit(instance_id: &str) {
+    lock(&RTC_NOINIT).remove(instance_id);
+}
+
+pub fn set_reset_reason(instance_id: &str, reason: u8) {
+    lock(&RESET_REASONS).insert(instance_id.to_owned(), reason);
+}
+
+pub fn reset_reason(instance_id: &str) -> u8 {
+    lock(&RESET_REASONS)
+        .get(instance_id)
+        .copied()
+        .unwrap_or(RESET_REASON_UNKNOWN)
 }
 
 pub fn set_boot_phase(phase: u8) {
@@ -87,6 +150,14 @@ struct LedcChannel {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct TaskWatchdog {
+    timeout: Duration,
+    panic_on_timeout: bool,
+    last_feed: Instant,
+    timed_out: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VirtualBoard {
     pub battery_mv: u16,
     pub mcu_temperature: f32,
@@ -101,11 +172,26 @@ pub struct VirtualBoard {
     psram_region: Vec<u8>,
     rtc_gpio_holds: HashMap<u8, bool>,
     ledc_channels: HashMap<u8, LedcChannel>,
+    high_impedance_gpios: HashSet<u8>,
+    sd_active: bool,
+    wire_active: bool,
+    spi_active: bool,
+    serial1_active: bool,
+    chip_selects_deasserted: bool,
+    watchdog: Option<TaskWatchdog>,
 }
 
 impl VirtualBoard {
     pub fn new(instance_id: &str, config: BoardConfig) -> Self {
-        lock(&PERIPHERAL_POWER).insert(instance_id.to_owned(), config.periph_pwr_enabled);
+        let rtc_gpio_holds = lock(&RTC_GPIO_HOLDS)
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_default();
+        let periph_pwr_enabled = rtc_gpio_holds
+            .get(&PERIPH_PWR_EN_GPIO)
+            .copied()
+            .unwrap_or(config.periph_pwr_enabled);
+        lock(&PERIPHERAL_POWER).insert(instance_id.to_owned(), periph_pwr_enabled);
         Self {
             battery_mv: config.battery_mv,
             mcu_temperature: config.mcu_temperature,
@@ -113,13 +199,20 @@ impl VirtualBoard {
             manufacturer: config.manufacturer,
             startup_reason: config.startup_reason,
             external_powered: config.external_powered,
-            periph_pwr_enabled: config.periph_pwr_enabled,
+            periph_pwr_enabled,
             adc_calibrated: config.adc_calibrated,
             instance_id: instance_id.to_owned(),
             psram_used_bytes: 0,
             psram_region: Vec::new(),
-            rtc_gpio_holds: HashMap::new(),
+            rtc_gpio_holds,
             ledc_channels: HashMap::new(),
+            high_impedance_gpios: HashSet::new(),
+            sd_active: true,
+            wire_active: true,
+            spi_active: true,
+            serial1_active: true,
+            chip_selects_deasserted: false,
+            watchdog: None,
         }
     }
 
@@ -153,6 +246,14 @@ impl VirtualBoard {
 
     pub fn get_temperature(&self) -> f32 {
         self.mcu_temperature
+    }
+
+    pub fn set_temperature(&mut self, celsius: f32) -> bool {
+        if !celsius.is_finite() {
+            return false;
+        }
+        self.mcu_temperature = celsius;
+        true
     }
 
     pub fn set_battery(&mut self, mv: u16) {
@@ -218,6 +319,10 @@ impl VirtualBoard {
 
     pub fn rtc_gpio_hold(&mut self, gpio: u8, level: bool) {
         self.rtc_gpio_holds.insert(gpio, level);
+        lock(&RTC_GPIO_HOLDS)
+            .entry(self.instance_id.clone())
+            .or_default()
+            .insert(gpio, level);
     }
 
     pub fn rtc_gpio_hold_level(&self, gpio: u8) -> Option<bool> {
@@ -226,6 +331,93 @@ impl VirtualBoard {
 
     pub fn set_adc_calibration(&mut self, calibrated: bool) {
         self.adc_calibrated = calibrated;
+    }
+
+    pub fn set_reset_reason(&mut self, reason: u8) -> bool {
+        set_reset_reason(&self.instance_id, reason);
+        true
+    }
+
+    pub fn reset_reason(&self) -> u8 {
+        reset_reason(&self.instance_id)
+    }
+
+    pub fn wdt_init(&mut self, timeout_sec: u32, panic_on_timeout: bool) {
+        self.watchdog = Some(TaskWatchdog {
+            timeout: Duration::from_secs(u64::from(timeout_sec)),
+            panic_on_timeout,
+            last_feed: Instant::now(),
+            timed_out: false,
+        });
+    }
+
+    pub fn wdt_feed(&mut self) -> bool {
+        if self.watchdog.is_none() {
+            return false;
+        }
+        self.refresh_watchdog();
+        let Some(watchdog) = self.watchdog.as_mut() else {
+            return false;
+        };
+        if watchdog.timed_out {
+            return false;
+        }
+        watchdog.last_feed = Instant::now();
+        true
+    }
+
+    pub fn wdt_status(&mut self) -> u8 {
+        self.refresh_watchdog();
+        match self.watchdog.as_ref() {
+            None => WDT_STATUS_DISABLED,
+            Some(watchdog) if watchdog.timed_out => WDT_STATUS_TIMED_OUT,
+            Some(_) => WDT_STATUS_ENABLED,
+        }
+    }
+
+    pub fn wdt_disable(&mut self) {
+        self.watchdog = None;
+    }
+
+    fn refresh_watchdog(&mut self) {
+        let Some(watchdog) = self.watchdog.as_mut() else {
+            return;
+        };
+        if watchdog.timed_out || watchdog.last_feed.elapsed() < watchdog.timeout {
+            return;
+        }
+        watchdog.timed_out = true;
+        if watchdog.panic_on_timeout {
+            set_reset_reason(&self.instance_id, RESET_REASON_TASK_WDT);
+        }
+    }
+
+    /// Models the complete peripheral-rail shutdown before deep sleep.
+    pub fn quiesce_peripherals(&mut self) {
+        // Silence outputs, deassert chip selects, and stop buses in the same
+        // order as SigurdOS's quiescePeripheralRail().
+        self.ledc_channels.clear();
+        self.chip_selects_deasserted = true;
+        self.sd_active = false;
+        self.wire_active = false;
+        self.serial1_active = false;
+        self.spi_active = false;
+        self.high_impedance_gpios
+            .extend((0..=ESP32_S3_MAX_GPIO).filter(|gpio| *gpio != PERIPH_PWR_EN_GPIO));
+        self.digital_write(PERIPH_PWR_EN_GPIO, false);
+        self.rtc_gpio_hold(PERIPH_PWR_EN_GPIO, false);
+    }
+
+    pub fn peripherals_quiesced(&self) -> bool {
+        !self.sd_active
+            && !self.wire_active
+            && !self.spi_active
+            && !self.serial1_active
+            && self.chip_selects_deasserted
+            && !self.periph_pwr_enabled
+            && self.rtc_gpio_hold_level(PERIPH_PWR_EN_GPIO) == Some(false)
+            && (0..=ESP32_S3_MAX_GPIO)
+                .all(|gpio| gpio == PERIPH_PWR_EN_GPIO || self.high_impedance_gpios.contains(&gpio))
     }
 
     pub fn set_external_power(&mut self, powered: bool) {
@@ -258,6 +450,9 @@ impl VirtualBoard {
 
     pub fn digital_write(&mut self, gpio: u8, high: bool) {
         if gpio != PERIPH_PWR_EN_GPIO {
+            return;
+        }
+        if high && !self.wire_active {
             return;
         }
         self.periph_pwr_enabled = high;
@@ -402,6 +597,81 @@ mod tests {
         assert_eq!(board.get_adc(BATTERY_ADC_GPIO), 2_327);
         assert_eq!(board.get_adc(5), 0);
         assert_eq!(board.get_temperature(), 35.0);
+        assert!(board.set_temperature(42.25));
+        assert_eq!(board.get_temperature(), 42.25);
+        assert!(!board.set_temperature(f32::NAN));
+        assert_eq!(board.get_temperature(), 42.25);
+    }
+
+    #[test]
+    fn rtc_noinit_is_zero_filled_persistent_and_bounds_checked() {
+        let id = "rtc-noinit-board-test";
+        clear_rtc_noinit(id);
+        let mut initial = [0xff; 4];
+        assert!(get_rtc_noinit(id, 20, &mut initial));
+        assert_eq!(initial, [0; 4]);
+        assert!(set_rtc_noinit(id, 21, &[1, 2, 3]));
+
+        drop(VirtualBoard::new(id, BoardConfig::default()));
+        let _restarted = VirtualBoard::new(id, BoardConfig::default());
+        let mut retained = [0; 4];
+        assert!(get_rtc_noinit(id, 20, &mut retained));
+        assert_eq!(retained, [0, 1, 2, 3]);
+        assert!(!set_rtc_noinit(id, RTC_NOINIT_SIZE_BYTES, &[1]));
+        assert!(!get_rtc_noinit(id, RTC_NOINIT_SIZE_BYTES - 1, &mut [0; 2]));
+
+        clear_rtc_noinit(id);
+        assert!(get_rtc_noinit(id, 20, &mut retained));
+        assert_eq!(retained, [0; 4]);
+    }
+
+    #[test]
+    fn reset_reason_and_watchdog_model_boot_failure_state() {
+        let id = "reset-wdt-board-test";
+        lock(&RESET_REASONS).remove(id);
+        let mut board = VirtualBoard::new(id, BoardConfig::default());
+        assert_eq!(board.reset_reason(), RESET_REASON_UNKNOWN);
+        assert!(board.set_reset_reason(0xff));
+        assert_eq!(board.reset_reason(), 0xff);
+        assert!(board.set_reset_reason(RESET_REASON_SW));
+        assert_eq!(board.reset_reason(), RESET_REASON_SW);
+
+        assert_eq!(board.wdt_status(), WDT_STATUS_DISABLED);
+        assert!(!board.wdt_feed());
+        board.wdt_init(30, true);
+        assert_eq!(board.wdt_status(), WDT_STATUS_ENABLED);
+        assert!(board.wdt_feed());
+        board.wdt_disable();
+        assert_eq!(board.wdt_status(), WDT_STATUS_DISABLED);
+
+        board.wdt_init(0, true);
+        assert_eq!(board.wdt_status(), WDT_STATUS_TIMED_OUT);
+        assert_eq!(board.reset_reason(), RESET_REASON_TASK_WDT);
+        assert!(!board.wdt_feed());
+
+        drop(board);
+        let restarted = VirtualBoard::new(id, BoardConfig::default());
+        assert_eq!(restarted.reset_reason(), RESET_REASON_TASK_WDT);
+    }
+
+    #[test]
+    fn quiesce_stops_buses_high_zs_signals_and_holds_gpio10_low() {
+        let id = "quiesce-board-test";
+        lock(&RTC_GPIO_HOLDS).remove(id);
+        let mut board = VirtualBoard::new(id, BoardConfig::default());
+        assert!(peripherals_powered(id));
+
+        board.quiesce_peripherals();
+
+        assert!(board.peripherals_quiesced());
+        assert!(!peripherals_powered(id));
+        drop(board);
+        let restarted = VirtualBoard::new(id, BoardConfig::default());
+        assert!(!restarted.periph_pwr_enabled);
+        assert_eq!(
+            restarted.rtc_gpio_hold_level(PERIPH_PWR_EN_GPIO),
+            Some(false)
+        );
     }
 
     #[test]
