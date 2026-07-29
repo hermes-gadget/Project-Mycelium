@@ -12,16 +12,18 @@ pub use ffi::{
     meshemu_input_poll_touch, meshemu_radio_create, meshemu_radio_destroy,
     meshemu_radio_get_est_airtime, meshemu_radio_get_rssi, meshemu_radio_get_snr,
     meshemu_radio_is_send_complete, meshemu_radio_recv_raw, meshemu_radio_set_position,
-    meshemu_radio_start_send, meshemu_wire_available, meshemu_wire_begin_transmission,
-    meshemu_wire_end_transmission, meshemu_wire_read, meshemu_wire_request_from,
-    meshemu_wire_shim_create, meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard,
-    meshemu_wire_write,
+    meshemu_radio_start_send, meshemu_sdcard_init, meshemu_sdcard_read, meshemu_sdcard_write,
+    meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write, meshemu_storage_data_free,
+    meshemu_wire_available, meshemu_wire_begin_transmission, meshemu_wire_end_transmission,
+    meshemu_wire_read, meshemu_wire_request_from, meshemu_wire_shim_create,
+    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_void, CString};
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -199,6 +201,62 @@ mod tests {
             assert_eq!(meshemu_wire_request_from(wire, 0x42, 1), 0);
             assert_eq!(meshemu_wire_available(wire), 0);
             meshemu_wire_shim_destroy(wire);
+        }
+    }
+
+    #[test]
+    fn storage_ffi_round_trips_spiffs_and_sdcard_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = CString::new(format!("ffi-storage-{}-{nonce}", std::process::id())).unwrap();
+        let path = CString::new("/nested/data.bin").unwrap();
+        let spiffs_data = b"spiffs";
+        let sdcard_data = b"sdcard";
+
+        unsafe {
+            assert!(meshemu_spiffs_init(id.as_ptr()));
+            assert!(meshemu_spiffs_write(
+                id.as_ptr(),
+                path.as_ptr(),
+                spiffs_data.as_ptr(),
+                spiffs_data.len()
+            ));
+            let mut len = usize::MAX;
+            let data = meshemu_spiffs_read(id.as_ptr(), path.as_ptr(), &mut len);
+            assert!(!data.is_null());
+            assert_eq!(std::slice::from_raw_parts(data, len), spiffs_data);
+            meshemu_storage_data_free(data);
+
+            assert!(meshemu_sdcard_init(id.as_ptr()));
+            assert!(meshemu_sdcard_write(
+                id.as_ptr(),
+                path.as_ptr(),
+                sdcard_data.as_ptr(),
+                sdcard_data.len()
+            ));
+            let data = meshemu_sdcard_read(id.as_ptr(), path.as_ptr(), &mut len);
+            assert!(!data.is_null());
+            assert_eq!(std::slice::from_raw_parts(data, len), sdcard_data);
+            meshemu_storage_data_free(data);
+        }
+    }
+
+    #[test]
+    fn storage_ffi_rejects_null_arguments() {
+        let mut len = usize::MAX;
+        unsafe {
+            assert!(!meshemu_spiffs_init(std::ptr::null()));
+            assert!(meshemu_spiffs_read(std::ptr::null(), std::ptr::null(), &mut len).is_null());
+            assert_eq!(len, 0);
+            assert!(!meshemu_spiffs_write(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1
+            ));
+            meshemu_storage_data_free(std::ptr::null_mut());
         }
     }
 
