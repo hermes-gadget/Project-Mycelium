@@ -9,14 +9,25 @@ const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const MPS_TO_KNOTS: f64 = 1.943_844_492_440_6;
 const EPOCH_MS: u64 = 1_000;
 
-/// L76K UART baud rate.
+/// L76K UART baud rate used by default.
 pub const GPS_BAUD_RATE: u32 = 9_600;
+/// Alternate L76K baud rate used by the real receiver's baud cycling.
+pub const GPS_BAUD_RATE_FAST: u32 = 38_400;
+/// Lowest baud rate accepted by [`GpsManager::set_baud_rate`].
+pub const MIN_GPS_BAUD_RATE: u32 = 4_800;
+/// Highest baud rate accepted by [`GpsManager::set_baud_rate`].
+pub const MAX_GPS_BAUD_RATE: u32 = 115_200;
 /// L76K UART TX pin on the emulated board.
 pub const GPS_TX_PIN: u8 = 43;
 /// L76K UART RX pin on the emulated board.
 pub const GPS_RX_PIN: u8 = 44;
 /// 9600 baud with 8N1 framing transfers approximately 960 bytes per second.
 pub const UART_BYTES_PER_SECOND: usize = GPS_BAUD_RATE as usize / 10;
+
+/// Bytes transferred per second at `baud_rate` with 8N1 framing.
+pub fn uart_bytes_per_second(baud_rate: u32) -> usize {
+    (baud_rate / 10) as usize
+}
 
 /// A GPX track sample with an optional source timestamp.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +69,7 @@ pub struct GpsManager {
     replay_progress: f64,
     epoch_elapsed_ms: u64,
     uart_bytes_remaining: usize,
+    baud_rate: u32,
     output_enabled: bool,
 }
 
@@ -70,6 +82,7 @@ impl GpsManager {
             replay_progress: 0.0,
             epoch_elapsed_ms: 0,
             uart_bytes_remaining: 0,
+            baud_rate: GPS_BAUD_RATE,
             output_enabled: true,
         }
     }
@@ -80,6 +93,27 @@ impl GpsManager {
 
     pub fn state_mut(&mut self) -> &mut GpsState {
         &mut self.state
+    }
+
+    /// Configure the virtual UART baud rate.
+    ///
+    /// The real L76K cycles between 9600 and 38400 baud. Returns `false` for
+    /// rates the receiver cannot use; the current rate is left unchanged.
+    /// Reconfiguring restarts output at a sentence boundary, matching a
+    /// receiver restart.
+    pub fn set_baud_rate(&mut self, baud_rate: u32) -> bool {
+        if !(MIN_GPS_BAUD_RATE..=MAX_GPS_BAUD_RATE).contains(&baud_rate) {
+            return false;
+        }
+        if self.baud_rate != baud_rate {
+            self.baud_rate = baud_rate;
+            self.reset_output();
+        }
+        true
+    }
+
+    pub fn baud_rate(&self) -> u32 {
+        self.baud_rate
     }
 
     pub fn movement(&self) -> &MovementModel {
@@ -228,7 +262,7 @@ impl GpsManager {
         }
         self.uart_bytes_remaining = usize::try_from(elapsed_epochs)
             .unwrap_or(usize::MAX)
-            .saturating_mul(UART_BYTES_PER_SECOND);
+            .saturating_mul(uart_bytes_per_second(self.baud_rate));
     }
 
     /// Read bytes already emitted during the current NMEA epoch.
@@ -523,6 +557,39 @@ mod tests {
 
         assert_eq!(manager.read(&mut buffer), UART_BYTES_PER_SECOND);
         assert_eq!(manager.read(&mut buffer), 0);
+    }
+
+    #[test]
+    fn set_baud_rate_accepts_l76k_rates_and_rejects_absurd_ones() {
+        let mut manager = GpsManager::new(51.5, -0.1);
+        assert_eq!(manager.baud_rate(), GPS_BAUD_RATE);
+
+        assert!(manager.set_baud_rate(GPS_BAUD_RATE_FAST));
+        assert_eq!(manager.baud_rate(), GPS_BAUD_RATE_FAST);
+        assert!(manager.set_baud_rate(GPS_BAUD_RATE));
+        assert!(!manager.set_baud_rate(0));
+        assert!(!manager.set_baud_rate(1_000_000));
+        assert_eq!(manager.baud_rate(), GPS_BAUD_RATE);
+    }
+
+    #[test]
+    fn read_enforces_the_configured_baud_allowance() {
+        let mut manager = GpsManager::new(51.5, -0.1);
+        manager.state_mut().satellites = u8::MAX;
+        manager.set_baud_rate(GPS_BAUD_RATE_FAST);
+        manager.tick(1_000);
+        let fast_allowance = uart_bytes_per_second(GPS_BAUD_RATE_FAST);
+        let mut buffer = vec![0_u8; fast_allowance * 2];
+
+        assert_eq!(manager.read(&mut buffer), fast_allowance);
+        assert_eq!(manager.read(&mut buffer), 0);
+
+        // Reconfiguring to a slower rate restarts output at a sentence
+        // boundary and applies the new allowance.
+        manager.set_baud_rate(GPS_BAUD_RATE);
+        assert_eq!(manager.read(&mut buffer), 0);
+        manager.tick(1_000);
+        assert_eq!(manager.read(&mut buffer), UART_BYTES_PER_SECOND);
     }
 
     #[test]

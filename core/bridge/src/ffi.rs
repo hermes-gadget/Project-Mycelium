@@ -845,6 +845,20 @@ pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool
     }
 }
 
+/// Configures the virtual UART baud rate.
+///
+/// The real L76K cycles between 9600 and 38400 baud. Returns `false` for
+/// rates the receiver cannot use, leaving the current rate unchanged.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_baud_rate(gps: *mut c_void, baud_rate: u32) -> bool {
+    unsafe { gps_mut(gps) }
+        .is_some_and(|gps| gps.manager.set_baud_rate(baud_rate))
+}
+
 /// Destroys a GPS handle.
 ///
 /// # Safety
