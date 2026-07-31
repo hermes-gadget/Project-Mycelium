@@ -15,6 +15,7 @@ use mycelium_input::{get_input_manager, register_input_manager, SharedInputManag
 use mycelium_storage::StorageManager;
 use radio_bus::{propagation, RadioBus, RadioChannel, RxPacket, Sx1262State, TxEvent};
 use sdl2::keyboard::Keycode;
+use tracing::warn;
 
 struct BusState {
     bus: RadioBus,
@@ -70,70 +71,130 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[track_caller]
 unsafe fn handle_ref<'a>(radio: *mut c_void) -> Option<&'a RadioHandle> {
-    (radio as *const RadioHandle).as_ref()
+    let Some(handle) = (radio as *const RadioHandle).as_ref() else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling radio handle");
+        return None;
+    };
+    Some(handle)
 }
 
+#[track_caller]
 unsafe fn keyboard_ref<'a>(keyboard: *mut c_void) -> Option<&'a SharedI2cKeyboard> {
-    unsafe { (keyboard as *const SharedI2cKeyboard).as_ref() }
+    let Some(keyboard) = (unsafe { (keyboard as *const SharedI2cKeyboard).as_ref() }) else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling keyboard handle");
+        return None;
+    };
+    Some(keyboard)
 }
 
+#[track_caller]
 unsafe fn wire_mut<'a>(wire: *mut c_void) -> Option<&'a mut WireShim> {
-    unsafe { (wire as *mut WireShim).as_mut() }
+    let Some(wire) = (unsafe { (wire as *mut WireShim).as_mut() }) else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling Wire shim handle");
+        return None;
+    };
+    Some(wire)
 }
 
+#[track_caller]
 unsafe fn ffi_string<'a>(value: *const c_char) -> Option<&'a str> {
     if value.is_null() {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is NULL");
         return None;
     }
-    let value = unsafe { CStr::from_ptr(value) }.to_str().ok()?;
-    (!value.is_empty()).then_some(value)
+    let Ok(value) = (unsafe { CStr::from_ptr(value) }).to_str() else {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is not valid UTF-8");
+        return None;
+    };
+    if value.is_empty() {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is empty");
+        return None;
+    }
+    Some(value)
 }
 
+#[track_caller]
 unsafe fn storage_file_args<'a>(
     instance_id: *const c_char,
     path: *const c_char,
 ) -> Option<(&'a str, &'a str)> {
-    Some((unsafe { ffi_string(instance_id) }?, unsafe {
-        ffi_string(path)
-    }?))
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or invalid instance_id");
+        return None;
+    };
+    let Some(path) = (unsafe { ffi_string(path) }) else {
+        warn!(caller = %std::panic::Location::caller(), %instance_id, "FFI call with NULL or invalid path");
+        return None;
+    };
+    Some((instance_id, path))
 }
+
+/// Static sentinel handed to callers for empty reads. Returning a stable
+/// non-null pointer with `*out_len = 0` avoids a wasted `malloc(1)` while
+/// still satisfying callers that treat null as an error.
+static EMPTY_READ_SENTINEL: [u8; 1] = [0];
 
 fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
     if out_len.is_null() {
         return ptr::null_mut();
     }
     unsafe { *out_len = 0 };
-    let allocation_len = data.len().max(1);
-    let output = unsafe { libc::malloc(allocation_len) }.cast::<u8>();
+    if data.is_empty() {
+        return EMPTY_READ_SENTINEL.as_ptr().cast_mut();
+    }
+    let output = unsafe { libc::malloc(data.len()) }.cast::<u8>();
     if output.is_null() {
         return ptr::null_mut();
     }
-    if !data.is_empty() {
-        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), output, data.len()) };
-    }
+    unsafe { ptr::copy_nonoverlapping(data.as_ptr(), output, data.len()) };
     unsafe { *out_len = data.len() };
     output
 }
 
+#[track_caller]
 unsafe fn gps_mut<'a>(gps: *mut c_void) -> Option<&'a mut GpsHandle> {
-    unsafe { (gps as *mut GpsHandle).as_mut() }
+    let Some(gps) = (unsafe { (gps as *mut GpsHandle).as_mut() }) else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling GPS handle");
+        return None;
+    };
+    Some(gps)
 }
 
+#[track_caller]
 unsafe fn board_ref<'a>(board: *mut c_void) -> Option<&'a VirtualBoard> {
-    unsafe { (board as *const VirtualBoard).as_ref() }
+    let Some(board) = (unsafe { (board as *const VirtualBoard).as_ref() }) else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling board handle");
+        return None;
+    };
+    Some(board)
 }
 
+#[track_caller]
 unsafe fn board_mut<'a>(board: *mut c_void) -> Option<&'a mut VirtualBoard> {
-    unsafe { (board as *mut VirtualBoard).as_mut() }
+    let Some(board) = (unsafe { (board as *mut VirtualBoard).as_mut() }) else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling board handle");
+        return None;
+    };
+    Some(board)
 }
 
+#[track_caller]
 unsafe fn instance_id(instance_id: *const c_char) -> Option<String> {
     if instance_id.is_null() {
+        warn!(caller = %std::panic::Location::caller(), "FFI instance_id argument is NULL");
         return None;
     }
-    let instance_id = unsafe { CStr::from_ptr(instance_id) }.to_str().ok()?;
-    (!instance_id.is_empty()).then(|| instance_id.to_owned())
+    let Ok(instance_id) = (unsafe { CStr::from_ptr(instance_id) }).to_str() else {
+        warn!(caller = %std::panic::Location::caller(), "FFI instance_id argument is not valid UTF-8");
+        return None;
+    };
+    if instance_id.is_empty() {
+        warn!(caller = %std::panic::Location::caller(), "FFI instance_id argument is empty");
+        return None;
+    }
+    Some(instance_id.to_owned())
 }
 
 fn valid_position(lat: f64, lon: f64) -> bool {
@@ -168,12 +229,16 @@ pub unsafe extern "C" fn meshemu_spiffs_init(instance_id: *const c_char) -> bool
         return false;
     };
     let mut storage = lock(&STORAGE);
-    storage
+    let mounted = storage
         .entry(instance_id.to_owned())
         .or_insert_with(|| StorageManager::new(instance_id))
         .spiffs
         .mount()
-        .is_ok()
+        .is_ok();
+    if !mounted {
+        warn!(%instance_id, "SPIFFS mount failed");
+    }
+    mounted
 }
 
 /// Reads a SPIFFS file into a caller-owned allocation.
@@ -201,6 +266,7 @@ pub unsafe extern "C" fn meshemu_spiffs_read(
         .get(instance_id)
         .and_then(|manager| manager.spiffs.read_file(path).ok())
     else {
+        warn!(%instance_id, %path, "SPIFFS read failed: instance missing or file unreadable");
         return ptr::null_mut();
     };
     copy_for_caller(&data, out_len)
@@ -223,6 +289,7 @@ pub unsafe extern "C" fn meshemu_spiffs_write(
         return false;
     };
     if data.is_null() && len != 0 {
+        warn!(%instance_id, %path, "SPIFFS write rejected: NULL data with nonzero length");
         return false;
     }
     let bytes = if len == 0 {
@@ -230,9 +297,13 @@ pub unsafe extern "C" fn meshemu_spiffs_write(
     } else {
         unsafe { std::slice::from_raw_parts(data, len) }
     };
-    lock(&STORAGE)
+    let written = lock(&STORAGE)
         .get_mut(instance_id)
-        .is_some_and(|manager| manager.spiffs.write_file(path, bytes).is_ok())
+        .is_some_and(|manager| manager.spiffs.write_file(path, bytes).is_ok());
+    if !written {
+        warn!(%instance_id, %path, "SPIFFS write failed: instance missing or write rejected");
+    }
+    written
 }
 
 /// Mounts the virtual SD card for an emulator instance.
@@ -246,6 +317,7 @@ pub unsafe extern "C" fn meshemu_sdcard_init(instance_id: *const c_char) -> bool
         return false;
     };
     if !peripherals_powered(instance_id) {
+        warn!(%instance_id, "SD card init skipped: peripheral power rail is off");
         return false;
     }
     let requires_slow_init = SDCARD_REQUIRES_SLOW_INIT.load(Ordering::Relaxed);
@@ -256,7 +328,11 @@ pub unsafe extern "C" fn meshemu_sdcard_init(instance_id: *const c_char) -> bool
         .or_insert_with(|| StorageManager::new(instance_id))
         .sdcard;
     sdcard.set_behavior(requires_slow_init, wake_delay_ms);
-    sdcard.mount_with_retry_ladder().unwrap_or(false)
+    let mounted = sdcard.mount_with_retry_ladder().unwrap_or(false);
+    if !mounted {
+        warn!(%instance_id, "SD card mount failed");
+    }
+    mounted
 }
 
 /// Configures the process-wide virtual SD-card personality.
@@ -425,7 +501,10 @@ pub unsafe extern "C" fn meshemu_sdcard_open(
                 };
                 (position, true, true)
             }
-            _ => return 0,
+            _ => {
+                warn!(%instance_id, %path, mode, "SD card open rejected: unknown mode");
+                return 0;
+            }
         }
     };
 
@@ -655,6 +734,7 @@ pub unsafe extern "C" fn meshemu_storage_destroy(instance_id: *const c_char) -> 
     };
     lock(&SD_FILE_HANDLES).retain(|_, file| file.instance_id != instance_id);
     let Some(mut manager) = lock(&STORAGE).remove(instance_id) else {
+        warn!(%instance_id, "storage_destroy: no storage state for instance");
         return false;
     };
     manager.unmount_all();
@@ -663,11 +743,19 @@ pub unsafe extern "C" fn meshemu_storage_destroy(instance_id: *const c_char) -> 
 
 /// Releases a buffer returned by a storage read function.
 ///
+/// The empty-read sentinel from [`copy_for_caller`] and null are accepted as
+/// no-ops; every other pointer must have been returned by a storage read
+/// function.
+///
 /// # Safety
 ///
-/// `data` must be null or a pointer returned by a storage read function.
+/// `data` must be null, the empty-read sentinel, or a pointer returned by a
+/// storage read function.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_storage_data_free(data: *mut u8) {
+    if data.is_null() || std::ptr::eq(data, EMPTY_READ_SENTINEL.as_ptr().cast_mut()) {
+        return;
+    }
     unsafe { libc::free(data.cast()) };
 }
 
@@ -686,6 +774,7 @@ pub unsafe extern "C" fn meshemu_gps_create(
         return ptr::null_mut();
     };
     if !valid_position(lat, lon) {
+        warn!(%instance_id, lat, lon, "GPS create rejected: position out of range");
         return ptr::null_mut();
     }
     Box::into_raw(Box::new(GpsHandle {
@@ -756,6 +845,35 @@ pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool
     }
 }
 
+/// Configures the virtual UART baud rate.
+///
+/// The real L76K cycles between 9600 and 38400 baud. Returns `false` for
+/// rates the receiver cannot use, leaving the current rate unchanged.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_baud_rate(gps: *mut c_void, baud_rate: u32) -> bool {
+    unsafe { gps_mut(gps) }.is_some_and(|gps| gps.manager.set_baud_rate(baud_rate))
+}
+
+/// Pins the GPS clock to a Unix timestamp for deterministic NMEA replay.
+///
+/// Pass `unix_seconds > 0` to lock the clock; pass `0` to fall back to
+/// the system clock.  Useful for reproducible integration tests.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_time(gps: *mut c_void, unix_seconds: i64) {
+    if let Some(gps) = unsafe { gps_mut(gps) } {
+        gps.manager
+            .set_time((unix_seconds > 0).then_some(unix_seconds));
+    }
+}
+
 /// Destroys a GPS handle.
 ///
 /// # Safety
@@ -783,6 +901,7 @@ pub unsafe extern "C" fn meshemu_board_create(
         return ptr::null_mut();
     };
     if !temp.is_finite() {
+        warn!(%instance_id, "Board create rejected: non-finite temperature");
         return ptr::null_mut();
     }
     let config = BoardConfig {
@@ -1534,12 +1653,18 @@ pub unsafe extern "C" fn meshemu_wire_shim_destroy(wire: *mut c_void) {
     }
 }
 
+#[track_caller]
 unsafe fn input_manager(instance_id: *const c_char, create: bool) -> Option<SharedInputManager> {
     if instance_id.is_null() {
+        warn!(caller = %std::panic::Location::caller(), "FFI instance_id argument is NULL");
         return None;
     }
-    let instance_id = unsafe { CStr::from_ptr(instance_id) }.to_str().ok()?;
+    let Ok(instance_id) = (unsafe { CStr::from_ptr(instance_id) }).to_str() else {
+        warn!(caller = %std::panic::Location::caller(), "FFI instance_id argument is not valid UTF-8");
+        return None;
+    };
     if instance_id.is_empty() {
+        warn!(caller = %std::panic::Location::caller(), "FFI instance_id argument is empty");
         return None;
     }
     get_input_manager(instance_id)
@@ -1806,6 +1931,10 @@ pub unsafe extern "C" fn meshemu_display_create_v(
     lvgl_version: i32,
 ) -> *mut c_void {
     if !matches!(lvgl_version, 8 | 9) {
+        warn!(
+            lvgl_version,
+            "Display create rejected: unsupported LVGL version"
+        );
         return ptr::null_mut();
     }
     unsafe { mycelium_display::meshemu_display_create_v(width, height, window_title, lvgl_version) }
@@ -1935,9 +2064,21 @@ pub unsafe extern "C" fn meshemu_radio_create(
         coding_rate,
         tx_power_dbm,
     ) else {
+        warn!(
+            freq_mhz,
+            bandwidth_khz,
+            spreading_factor,
+            coding_rate,
+            tx_power_dbm,
+            "Radio create rejected: invalid SX1262 configuration"
+        );
         return ptr::null_mut();
     };
     if instance_id.is_null() || !valid_position(lat, lon) {
+        warn!(
+            lat,
+            lon, "Radio create rejected: NULL instance_id or position out of range"
+        );
         return ptr::null_mut();
     }
 
@@ -1945,11 +2086,13 @@ pub unsafe extern "C" fn meshemu_radio_create(
         .to_string_lossy()
         .into_owned();
     if node_id.is_empty() {
+        warn!("Radio create rejected: empty instance_id");
         return ptr::null_mut();
     }
 
     let mut state = lock(&BUS);
     if !state.node_ids.insert(node_id.clone()) {
+        warn!(%node_id, "Radio create rejected: instance_id already registered");
         return ptr::null_mut();
     }
     state.bus.register_node(
@@ -1984,6 +2127,7 @@ pub unsafe extern "C" fn meshemu_radio_start_send(
         return false;
     };
     if (data.is_null() && len != 0) || len > 255 {
+        warn!(node_id = %handle.node_id, len, "Radio start_send rejected: NULL data or oversized packet");
         return false;
     }
 

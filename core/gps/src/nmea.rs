@@ -13,6 +13,9 @@ pub struct GpsState {
     /// 0 = no fix, 1 = GPS, 2 = DGPS.
     pub fix_quality: u8,
     pub enabled: bool,
+    /// When set, NMEA sentences use this timestamp instead of `Utc::now()`.
+    /// Enables deterministic scenario replay.
+    fixed_time: Option<DateTime<Utc>>,
 }
 
 impl GpsState {
@@ -27,17 +30,31 @@ impl GpsState {
             hdop: 0.9,
             fix_quality: 1,
             enabled: true,
+            fixed_time: None,
         }
+    }
+
+    /// Pin the GPS clock to a specific Unix timestamp for deterministic replay.
+    ///
+    /// Pass `seconds == 0` to clear the pin and fall back to `Utc::now()`.
+    pub fn set_fixed_time(&mut self, unix_seconds: Option<i64>) {
+        self.fixed_time = unix_seconds
+            .filter(|&s| s != 0)
+            .and_then(|s| DateTime::from_timestamp(s, 0));
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.fixed_time.unwrap_or_else(Utc::now)
     }
 
     /// Generate a `$GPGGA` fix-data sentence.
     pub fn generate_gga(&self) -> String {
-        self.generate_gga_at(Utc::now())
+        self.generate_gga_at(self.now())
     }
 
     /// Generate a `$GPRMC` recommended-minimum-data sentence.
     pub fn generate_rmc(&self) -> String {
-        self.generate_rmc_at(Utc::now())
+        self.generate_rmc_at(self.now())
     }
 
     /// Generate a `$GPGSA` dilution-of-precision sentence.

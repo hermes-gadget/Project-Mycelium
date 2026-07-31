@@ -19,12 +19,12 @@ pub use ffi::{
     meshemu_board_wdt_feed, meshemu_board_wdt_get_status, meshemu_board_wdt_init, meshemu_bus_tick,
     meshemu_display_capture, meshemu_display_capture_free, meshemu_display_create,
     meshemu_display_create_ex, meshemu_display_create_v, meshemu_display_destroy,
-    meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read, meshemu_gps_set_enabled,
-    meshemu_gps_set_position, meshemu_gps_tick, meshemu_i2c_keyboard_create,
-    meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key_byte,
-    meshemu_i2c_keyboard_set_cross_reset, meshemu_input_digital_read,
-    meshemu_input_get_gpio_intr_enabled, meshemu_input_get_touch_mapped,
-    meshemu_input_get_touch_raw, meshemu_input_gt911_get_status,
+    meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read, meshemu_gps_set_baud_rate,
+    meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_set_time, meshemu_gps_tick,
+    meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
+    meshemu_i2c_keyboard_inject_key_byte, meshemu_i2c_keyboard_set_cross_reset,
+    meshemu_input_digital_read, meshemu_input_get_gpio_intr_enabled,
+    meshemu_input_get_touch_mapped, meshemu_input_get_touch_raw, meshemu_input_gt911_get_status,
     meshemu_input_gt911_set_failure_mode, meshemu_input_inject_key, meshemu_input_inject_touch,
     meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_input_set_gpio_intr_enabled,
     meshemu_input_take_falling_edges, meshemu_radio_create, meshemu_radio_destroy,
@@ -727,6 +727,22 @@ mod tests {
                 meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32),
                 0
             );
+            meshemu_gps_destroy(gps);
+        }
+    }
+
+    #[test]
+    fn gps_ffi_accepts_l76k_baud_rates_only() {
+        let id = CString::new("ffi-gps-baud").unwrap();
+        let gps = unsafe { meshemu_gps_create(id.as_ptr(), 51.5074, -0.1278) };
+        assert!(!gps.is_null());
+
+        unsafe {
+            assert!(meshemu_gps_set_baud_rate(gps, 38_400));
+            assert!(meshemu_gps_set_baud_rate(gps, 9_600));
+            assert!(!meshemu_gps_set_baud_rate(gps, 0));
+            assert!(!meshemu_gps_set_baud_rate(gps, 921_600));
+            assert!(!meshemu_gps_set_baud_rate(std::ptr::null_mut(), 38_400));
             meshemu_gps_destroy(gps);
         }
     }

@@ -591,6 +591,7 @@ dependencies = [
  "mycelium-storage",
  "radio_bus",
  "sdl2",
+ "tracing",
 ]
 
 [[package]]

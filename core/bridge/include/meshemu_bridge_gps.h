@@ -14,6 +14,8 @@ void meshemu_gps_set_position(void* gps, double lat, double lon,
 int32_t meshemu_gps_read(void* gps, uint8_t* buffer, int32_t max_len);
 void meshemu_gps_tick(void* gps, uint64_t delta_ms);
 void meshemu_gps_set_enabled(void* gps, bool enabled);
+bool meshemu_gps_set_baud_rate(void* gps, uint32_t baud_rate);
+void meshemu_gps_set_time(void* gps, int64_t unix_seconds);
 void meshemu_gps_destroy(void* gps);
 
 #ifdef __cplusplus

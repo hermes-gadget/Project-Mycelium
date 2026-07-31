@@ -235,7 +235,10 @@ pub fn airtime_ms(
         preamble_len,
         explicit_header,
     );
-    microseconds.div_ceil(1_000).min(u64::from(u32::MAX)) as u32
+    // Saturate rather than truncate: a `as u32` cast would silently wrap for
+    // absurd packet sizes, reporting a near-zero airtime for a multi-day
+    // transmission and corrupting collision windows.
+    u32::try_from(microseconds.div_ceil(1_000)).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -330,6 +333,19 @@ mod tests {
 
         assert_eq!(airtime_ms(16, 7, 125, 5, 8, true), 52);
         assert_eq!(airtime_ms(16, 12, 125, 5, 8, true), 1_319);
+        assert_eq!(airtime_ms(255, 7, 125, 5, 8, true), 400);
+    }
+
+    #[test]
+    fn airtime_ms_saturates_instead_of_wrapping_past_u32() {
+        // Slowest modulation (SF12/BW125) with an absurd payload pushes airtime
+        // past u32::MAX milliseconds (~49 days). A raw `as u32` cast would wrap
+        // this to a small value; it must saturate instead.
+        let microseconds = airtime_us(100_000_000, 12, 125, 8, 8, true);
+        assert!(microseconds.div_ceil(1_000) > u64::from(u32::MAX));
+        assert_eq!(airtime_ms(100_000_000, 12, 125, 8, 8, true), u32::MAX);
+
+        // Just below the boundary the value still round-trips exactly.
         assert_eq!(airtime_ms(255, 7, 125, 5, 8, true), 400);
     }
 

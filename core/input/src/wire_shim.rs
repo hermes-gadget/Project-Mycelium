@@ -187,9 +187,16 @@ impl WireShim {
         }
 
         match address {
-            KEYBOARD_I2C_ADDRESS => self
-                .read_buffer
-                .push(lock(&self.keyboard_bus).read_key_byte()),
+            KEYBOARD_I2C_ADDRESS => {
+                // The real ESP32-C3 keyboard only responds reliably at
+                // 100 kHz; reads at faster clocks time out. Probes and
+                // writes still reach the address, matching the T-Deck.
+                if self.clock_hz > KEYBOARD_I2C_CLOCK_HZ {
+                    return 0;
+                }
+                self.read_buffer
+                    .push(lock(&self.keyboard_bus).read_key_byte())
+            }
             GT911_I2C_ADDRESS => {
                 self.read_buffer.resize(count as usize, 0);
                 let read = lock(&self.gt911).i2c_read(self.gt911_register, &mut self.read_buffer);
@@ -374,7 +381,42 @@ mod tests {
         wire.set_clock(1_000_000);
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
         wire.set_clock(FAST_I2C_CLOCK_HZ);
+        // The keyboard times out at 400 kHz; only 100 kHz reads succeed.
+        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
+        wire.set_clock(KEYBOARD_I2C_CLOCK_HZ);
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
+    }
+
+    #[test]
+    fn fast_clock_times_out_keyboard_reads_but_not_gt911() {
+        let keyboard = Arc::new(Mutex::new(I2cKeyboardBus::new()));
+        lock(&keyboard).inject_key_byte(b'q');
+        let mut wire = configured_wire(keyboard);
+        wire.set_clock(FAST_I2C_CLOCK_HZ);
+
+        // A 400 kHz keyboard read yields no data and nothing to read.
+        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
+        wire.write_byte(0x04);
+        assert_eq!(wire.end_transmission(), 0);
+        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 0);
+        assert_eq!(wire.read(), -1);
+
+        // The GT911 touch controller tolerates the fast clock.
+        lock(&wire.gt911()).inject_touch(10, 20, true);
+        wire.begin_transmission(GT911_I2C_ADDRESS);
+        for byte in GT911_STATUS_REGISTER.to_be_bytes() {
+            wire.write_byte(byte);
+        }
+        assert_eq!(wire.end_transmission(), 0);
+        assert_eq!(wire.request_from(GT911_I2C_ADDRESS, 9), 9);
+
+        // Dropping back to 100 kHz restores keyboard reads immediately.
+        wire.set_clock(KEYBOARD_I2C_CLOCK_HZ);
+        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
+        wire.write_byte(0x04);
+        assert_eq!(wire.end_transmission(), 0);
+        assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
+        assert_eq!(wire.read(), i32::from(b'q'));
     }
 
     #[test]

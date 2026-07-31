@@ -16,3 +16,4 @@ mycelium-input = { path = "../input" }
 mycelium-storage = { path = "../storage" }
 radio_bus = { path = "../radio_bus" }
 sdl2 = { version = "0.38", features = ["bundled"] }
+tracing = "0.1"

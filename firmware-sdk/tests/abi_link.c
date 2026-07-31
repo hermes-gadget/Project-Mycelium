@@ -73,6 +73,8 @@ int main(void)
     meshemu_gps_tick(gps, 1000);
     (void)meshemu_gps_read(gps, &byte, 1);
     meshemu_gps_set_enabled(gps, false);
+    meshemu_gps_set_baud_rate(gps, 38400);
+    meshemu_gps_set_time(gps, 0);
     meshemu_gps_destroy(gps);
 
     meshemu_input_inject_touch(id, 1, 2, true);
