@@ -111,12 +111,11 @@ fn verify_firmware_api_version(firmware: &PathBuf) -> Result<Option<u32>> {
     unsafe {
         let lib = libloading::Library::new(firmware)
             .with_context(|| format!("failed to open firmware: {}", firmware.display()))?;
-        let version_fn: libloading::Symbol<unsafe extern "C" fn() -> u32> = match lib
-            .get(b"meshemu_firmware_api_version\0")
-        {
-            Ok(sym) => sym,
-            Err(_) => return Ok(None), // symbol optional for backwards compat
-        };
+        let version_fn: libloading::Symbol<unsafe extern "C" fn() -> u32> =
+            match lib.get(b"meshemu_firmware_api_version\0") {
+                Ok(sym) => sym,
+                Err(_) => return Ok(None), // symbol optional for backwards compat
+            };
         let version = version_fn();
         if version != REQUIRED_FIRMWARE_API_VERSION {
             anyhow::bail!(

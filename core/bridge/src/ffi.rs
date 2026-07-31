@@ -855,8 +855,7 @@ pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool
 /// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_baud_rate(gps: *mut c_void, baud_rate: u32) -> bool {
-    unsafe { gps_mut(gps) }
-        .is_some_and(|gps| gps.manager.set_baud_rate(baud_rate))
+    unsafe { gps_mut(gps) }.is_some_and(|gps| gps.manager.set_baud_rate(baud_rate))
 }
 
 /// Pins the GPS clock to a Unix timestamp for deterministic NMEA replay.
@@ -870,7 +869,8 @@ pub unsafe extern "C" fn meshemu_gps_set_baud_rate(gps: *mut c_void, baud_rate: 
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_time(gps: *mut c_void, unix_seconds: i64) {
     if let Some(gps) = unsafe { gps_mut(gps) } {
-        gps.manager.set_time((unix_seconds > 0).then_some(unix_seconds));
+        gps.manager
+            .set_time((unix_seconds > 0).then_some(unix_seconds));
     }
 }
 
@@ -1931,7 +1931,10 @@ pub unsafe extern "C" fn meshemu_display_create_v(
     lvgl_version: i32,
 ) -> *mut c_void {
     if !matches!(lvgl_version, 8 | 9) {
-        warn!(lvgl_version, "Display create rejected: unsupported LVGL version");
+        warn!(
+            lvgl_version,
+            "Display create rejected: unsupported LVGL version"
+        );
         return ptr::null_mut();
     }
     unsafe { mycelium_display::meshemu_display_create_v(width, height, window_title, lvgl_version) }
@@ -2061,12 +2064,21 @@ pub unsafe extern "C" fn meshemu_radio_create(
         coding_rate,
         tx_power_dbm,
     ) else {
-        warn!(freq_mhz, bandwidth_khz, spreading_factor, coding_rate, tx_power_dbm,
-            "Radio create rejected: invalid SX1262 configuration");
+        warn!(
+            freq_mhz,
+            bandwidth_khz,
+            spreading_factor,
+            coding_rate,
+            tx_power_dbm,
+            "Radio create rejected: invalid SX1262 configuration"
+        );
         return ptr::null_mut();
     };
     if instance_id.is_null() || !valid_position(lat, lon) {
-        warn!(lat, lon, "Radio create rejected: NULL instance_id or position out of range");
+        warn!(
+            lat,
+            lon, "Radio create rejected: NULL instance_id or position out of range"
+        );
         return ptr::null_mut();
     }
 
