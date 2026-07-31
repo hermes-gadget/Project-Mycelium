@@ -45,6 +45,12 @@ void meshemu_input_get_touch_mapped(
  */
 void meshemu_input_gt911_set_failure_mode(uint8_t mode, uint32_t value);
 uint64_t meshemu_input_gt911_get_status(void);
+bool meshemu_input_gt911_save_calibration(
+    const char *instance_id,
+    uint16_t max_x,
+    uint16_t max_y,
+    uint16_t contact_size);
+bool meshemu_input_gt911_load_calibration(const char *instance_id);
 
 /* Keyboard packing: row[0..7], col[8..15], pressed[16]. */
 uint64_t meshemu_input_poll_key(const char *instance_id);

@@ -86,6 +86,8 @@ int main(void)
     meshemu_input_get_touch_mapped(id, &touch_x, &touch_y);
     meshemu_input_gt911_set_failure_mode(MESHEMU_GT911_FAILURE_BUS, 0);
     (void)meshemu_input_gt911_get_status();
+    (void)meshemu_input_gt911_save_calibration(id, 320, 240, 50);
+    (void)meshemu_input_gt911_load_calibration(id);
     (void)meshemu_input_poll_key(id);
     void* keyboard = meshemu_i2c_keyboard_create();
     meshemu_i2c_keyboard_inject_key_byte(keyboard, 'q');

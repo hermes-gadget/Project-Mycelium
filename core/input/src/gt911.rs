@@ -122,6 +122,21 @@ impl Gt911Controller {
         (self.max_x, self.max_y)
     }
 
+    /// Serialise the calibration state for NVS persistence.
+    ///
+    /// Returns `(max_x, max_y, contact_size)` — everything needed to restore
+    /// the touch controller after a virtual restart.
+    pub fn calibration(&self) -> (u16, u16, u16) {
+        (self.max_x, self.max_y, self.contact_size)
+    }
+
+    /// Restore calibration from previously-saved NVS data.
+    pub fn apply_calibration(&mut self, max_x: u16, max_y: u16, contact_size: u16) {
+        self.max_x = max_x;
+        self.max_y = max_y;
+        self.contact_size = contact_size;
+    }
+
     /// Make an exact percentage of status reads fail using a deterministic
     /// accumulator. Reconfiguring the mode clears its sticky fired bit.
     pub fn set_i2c_failure_rate(&mut self, pct: u8) {
