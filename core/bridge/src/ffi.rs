@@ -99,19 +99,24 @@ unsafe fn storage_file_args<'a>(
     }?))
 }
 
+/// Static sentinel handed to callers for empty reads. Returning a stable
+/// non-null pointer with `*out_len = 0` avoids a wasted `malloc(1)` while
+/// still satisfying callers that treat null as an error.
+static EMPTY_READ_SENTINEL: [u8; 1] = [0];
+
 fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
     if out_len.is_null() {
         return ptr::null_mut();
     }
     unsafe { *out_len = 0 };
-    let allocation_len = data.len().max(1);
-    let output = unsafe { libc::malloc(allocation_len) }.cast::<u8>();
+    if data.is_empty() {
+        return EMPTY_READ_SENTINEL.as_ptr().cast_mut();
+    }
+    let output = unsafe { libc::malloc(data.len()) }.cast::<u8>();
     if output.is_null() {
         return ptr::null_mut();
     }
-    if !data.is_empty() {
-        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), output, data.len()) };
-    }
+    unsafe { ptr::copy_nonoverlapping(data.as_ptr(), output, data.len()) };
     unsafe { *out_len = data.len() };
     output
 }
@@ -663,11 +668,19 @@ pub unsafe extern "C" fn meshemu_storage_destroy(instance_id: *const c_char) -> 
 
 /// Releases a buffer returned by a storage read function.
 ///
+/// The empty-read sentinel from [`copy_for_caller`] and null are accepted as
+/// no-ops; every other pointer must have been returned by a storage read
+/// function.
+///
 /// # Safety
 ///
-/// `data` must be null or a pointer returned by a storage read function.
+/// `data` must be null, the empty-read sentinel, or a pointer returned by a
+/// storage read function.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_storage_data_free(data: *mut u8) {
+    if data.is_null() || std::ptr::eq(data, EMPTY_READ_SENTINEL.as_ptr().cast_mut()) {
+        return;
+    }
     unsafe { libc::free(data.cast()) };
 }
 
