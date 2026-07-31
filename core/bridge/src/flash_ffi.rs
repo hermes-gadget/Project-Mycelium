@@ -6,6 +6,7 @@ use mycelium_board::partition::{
     active_partition_table, get_partition_table, register_partition_table,
 };
 use mycelium_board::{get_nvs, register_nvs, remove_nvs, LAUNCHER_NVS_SIZE, STANDALONE_NVS_SIZE};
+use tracing::warn;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -13,31 +14,55 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[track_caller]
 unsafe fn ffi_string<'a>(value: *const c_char) -> Option<&'a str> {
     if value.is_null() {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is NULL");
         return None;
     }
-    let value = unsafe { CStr::from_ptr(value) }.to_str().ok()?;
-    (!value.is_empty()).then_some(value)
+    let Ok(value) = (unsafe { CStr::from_ptr(value) }).to_str() else {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is not valid UTF-8");
+        return None;
+    };
+    if value.is_empty() {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is empty");
+        return None;
+    }
+    Some(value)
 }
 
+#[track_caller]
 unsafe fn ffi_string_allow_empty<'a>(value: *const c_char) -> Option<&'a str> {
     if value.is_null() {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is NULL");
         return None;
     }
-    unsafe { CStr::from_ptr(value) }.to_str().ok()
+    let Ok(value) = (unsafe { CStr::from_ptr(value) }).to_str() else {
+        warn!(caller = %std::panic::Location::caller(), "FFI string argument is not valid UTF-8");
+        return None;
+    };
+    Some(value)
 }
 
+#[track_caller]
 unsafe fn nvs_args<'a>(
     instance_id: *const c_char,
     namespace: *const c_char,
     key: *const c_char,
 ) -> Option<(&'a str, &'a str, &'a str)> {
-    Some((
-        unsafe { ffi_string(instance_id) }?,
-        unsafe { ffi_string(namespace) }?,
-        unsafe { ffi_string(key) }?,
-    ))
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or invalid instance_id");
+        return None;
+    };
+    let Some(namespace) = (unsafe { ffi_string(namespace) }) else {
+        warn!(caller = %std::panic::Location::caller(), %instance_id, "FFI call with NULL or invalid namespace");
+        return None;
+    };
+    let Some(key) = (unsafe { ffi_string(key) }) else {
+        warn!(caller = %std::panic::Location::caller(), %instance_id, "FFI call with NULL or invalid key");
+        return None;
+    };
+    Some((instance_id, namespace, key))
 }
 
 /// Opens or reconfigures persistent NVS for one emulator instance.
@@ -50,7 +75,11 @@ pub unsafe extern "C" fn meshemu_nvs_init(instance_id: *const c_char, size_bytes
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return false;
     };
-    register_nvs(instance_id, size_bytes).is_ok()
+    if let Err(error) = register_nvs(instance_id, size_bytes) {
+        warn!(%instance_id, size_bytes, %error, "NVS init failed");
+        return false;
+    }
+    true
 }
 
 /// Reports whether a key exists in an NVS namespace.
@@ -69,6 +98,7 @@ pub unsafe extern "C" fn meshemu_nvs_exists(
         return false;
     };
     let Some(nvs) = get_nvs(instance_id) else {
+        warn!(%instance_id, %namespace, %key, "NVS exists failed: instance not initialized");
         return false;
     };
     let mut nvs = lock(&nvs);
@@ -94,6 +124,7 @@ pub unsafe extern "C" fn meshemu_nvs_get_bool(
         return default_value;
     };
     let Some(nvs) = get_nvs(instance_id) else {
+        warn!(%instance_id, %namespace, %key, "NVS get_bool failed: instance not initialized");
         return default_value;
     };
     let mut nvs = lock(&nvs);
@@ -123,6 +154,7 @@ pub unsafe extern "C" fn meshemu_nvs_put_bool(
         return false;
     };
     let Some(nvs) = get_nvs(instance_id) else {
+        warn!(%instance_id, %namespace, %key, "NVS put_bool failed: instance not initialized");
         return false;
     };
     let mut nvs = lock(&nvs);
@@ -160,6 +192,7 @@ pub unsafe extern "C" fn meshemu_nvs_get_string(
         ""
     } else {
         let Ok(value) = (unsafe { CStr::from_ptr(default_value) }).to_str() else {
+            warn!("NVS get_string rejected: default_value is not valid UTF-8");
             return 0;
         };
         value
@@ -207,9 +240,11 @@ pub unsafe extern "C" fn meshemu_nvs_put_string(
         return false;
     };
     let Some(value) = (unsafe { ffi_string_allow_empty(value) }) else {
+        warn!(%instance_id, %namespace, %key, "NVS put_string rejected: NULL or invalid value");
         return false;
     };
     let Some(nvs) = get_nvs(instance_id) else {
+        warn!(%instance_id, %namespace, %key, "NVS put_string failed: instance not initialized");
         return false;
     };
     let mut nvs = lock(&nvs);
@@ -234,6 +269,7 @@ pub unsafe extern "C" fn meshemu_nvs_remove(
         return false;
     };
     let Some(nvs) = get_nvs(instance_id) else {
+        warn!(%instance_id, %namespace, %key, "NVS remove failed: instance not initialized");
         return false;
     };
     let mut nvs = lock(&nvs);
@@ -252,7 +288,11 @@ pub unsafe extern "C" fn meshemu_nvs_destroy(instance_id: *const c_char) -> bool
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return false;
     };
-    remove_nvs(instance_id).is_some()
+    if remove_nvs(instance_id).is_none() {
+        warn!(%instance_id, "NVS destroy failed: instance not initialized");
+        return false;
+    }
+    true
 }
 
 /// Switches one instance between standalone and Launcher flash geometry.
@@ -273,7 +313,8 @@ pub unsafe extern "C" fn meshemu_partition_set_launcher_mode(
     } else {
         STANDALONE_NVS_SIZE
     };
-    if register_nvs(instance_id, nvs_size).is_err() {
+    if let Err(error) = register_nvs(instance_id, nvs_size) {
+        warn!(%instance_id, enabled, %error, "Partition launcher-mode switch failed");
         return false;
     }
     register_partition_table(instance_id, enabled);
@@ -320,6 +361,7 @@ pub unsafe extern "C" fn meshemu_partition_find_first_for_instance(
         return false;
     };
     let Some(table) = get_partition_table(instance_id) else {
+        warn!(%instance_id, "Partition find_first_for_instance failed: instance not initialized");
         return false;
     };
     let table = lock(&table).clone();
