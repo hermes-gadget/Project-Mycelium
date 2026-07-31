@@ -25,6 +25,7 @@ pub use ffi::{
     meshemu_i2c_keyboard_inject_key_byte, meshemu_i2c_keyboard_set_cross_reset,
     meshemu_input_digital_read, meshemu_input_get_gpio_intr_enabled,
     meshemu_input_get_touch_mapped, meshemu_input_get_touch_raw, meshemu_input_gt911_get_status,
+    meshemu_input_gt911_load_calibration, meshemu_input_gt911_save_calibration,
     meshemu_input_gt911_set_failure_mode, meshemu_input_inject_key, meshemu_input_inject_touch,
     meshemu_input_poll_key, meshemu_input_poll_touch, meshemu_input_set_gpio_intr_enabled,
     meshemu_input_take_falling_edges, meshemu_radio_create, meshemu_radio_destroy,
@@ -35,13 +36,14 @@ pub use ffi::{
     meshemu_sdcard_init, meshemu_sdcard_mkdir, meshemu_sdcard_open, meshemu_sdcard_read,
     meshemu_sdcard_read_file, meshemu_sdcard_remove, meshemu_sdcard_set_behavior,
     meshemu_sdcard_total_bytes, meshemu_sdcard_used_bytes, meshemu_sdcard_write,
-    meshemu_sdcard_write_file, meshemu_spiffs_init, meshemu_spiffs_read, meshemu_spiffs_write,
-    meshemu_storage_data_free, meshemu_storage_destroy, meshemu_wire_available, meshemu_wire_begin,
-    meshemu_wire_begin_transmission, meshemu_wire_clock_out_recovery, meshemu_wire_emit_stop,
-    meshemu_wire_end_transmission, meshemu_wire_probe_address, meshemu_wire_read,
-    meshemu_wire_read_idle_levels, meshemu_wire_request_from, meshemu_wire_set_clock,
-    meshemu_wire_set_sda_stuck, meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance,
-    meshemu_wire_shim_destroy, meshemu_wire_shim_set_keyboard, meshemu_wire_write,
+    meshemu_sdcard_write_file, meshemu_spi_bus_owner, meshemu_spiffs_init, meshemu_spiffs_read,
+    meshemu_spiffs_write, meshemu_storage_data_free, meshemu_storage_destroy,
+    meshemu_wire_available, meshemu_wire_begin, meshemu_wire_begin_transmission,
+    meshemu_wire_clock_out_recovery, meshemu_wire_emit_stop, meshemu_wire_end_transmission,
+    meshemu_wire_probe_address, meshemu_wire_read, meshemu_wire_read_idle_levels,
+    meshemu_wire_request_from, meshemu_wire_set_clock, meshemu_wire_set_sda_stuck,
+    meshemu_wire_shim_create, meshemu_wire_shim_create_for_instance, meshemu_wire_shim_destroy,
+    meshemu_wire_shim_set_keyboard, meshemu_wire_write,
 };
 pub use flash_ffi::{
     meshemu_get_otadata_address, meshemu_is_under_launcher, meshemu_nvs_destroy,
@@ -1199,6 +1201,50 @@ mod tests {
             ));
             meshemu_gps_destroy(std::ptr::null_mut());
             meshemu_board_destroy(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn new_ffi_functions_reject_null_pointers() {
+        let id = CString::new("ffi-fuzz-null").unwrap();
+        unsafe {
+            // SPI bus owner is safe to call without arguments
+            let _owner = meshemu_spi_bus_owner();
+
+            // GT911 calibration — null instance_id
+            assert!(!meshemu_input_gt911_save_calibration(
+                std::ptr::null(),
+                320,
+                240,
+                50
+            ));
+            assert!(!meshemu_input_gt911_load_calibration(std::ptr::null()));
+
+            // GPS set_time — null gps handle
+            meshemu_gps_set_time(std::ptr::null_mut(), 0);
+
+            // Input digital_read — null instance_id (returns true = HIGH for safety)
+            assert!(meshemu_input_digital_read(std::ptr::null(), 3));
+
+            // Input set_gpio_intr_enabled — null instance_id should not crash
+            meshemu_input_set_gpio_intr_enabled(std::ptr::null(), 3, true);
+            assert!(!meshemu_input_get_gpio_intr_enabled(std::ptr::null(), 3));
+
+            // Radio create — null id
+            assert!(
+                meshemu_radio_create(std::ptr::null(), 915.0, 125, 7, 5, 14.0, 51.5, -0.1)
+                    .is_null()
+            );
+
+            // Radio create — invalid frequency
+            assert!(meshemu_radio_create(id.as_ptr(), 0.0, 125, 7, 5, 14.0, 51.5, -0.1).is_null());
+
+            // GPS set_time with valid handle
+            let gps = meshemu_gps_create(id.as_ptr(), 51.5, -0.1);
+            assert!(!gps.is_null());
+            meshemu_gps_set_time(gps, 764426119); // deterministic timestamp
+            meshemu_gps_set_time(gps, 0); // clear
+            meshemu_gps_destroy(gps);
         }
     }
 }

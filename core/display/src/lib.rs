@@ -22,6 +22,7 @@ pub use framebuffer::{host_rgb565_to_st7789_wire, st7789_wire_to_host_rgb565, Rg
 pub use lvgl_v8::lvgl_v8_init_sdl;
 pub use lvgl_v9::lvgl_v9_init_sdl;
 pub use manager::DisplayManager;
+pub use shared_spi::{global_spi_bus, SharedSpiBus, SpiDevice};
 pub use version::LvglVersion;
 pub use window::{DisplayEvent, DisplayWindow, Rect};
 

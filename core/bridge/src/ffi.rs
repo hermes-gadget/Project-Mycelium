@@ -1815,6 +1815,102 @@ pub extern "C" fn meshemu_input_gt911_get_status() -> u64 {
     mycelium_input::global_watchdog_status()
 }
 
+/// Persist the current GT911 calibration for an instance.
+///
+/// Stores `(max_x, max_y, contact_size)` into NVS under the "touch" namespace
+/// so the controller can be restored after a virtual restart.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_gt911_save_calibration(
+    instance_id: *const c_char,
+    max_x: u16,
+    max_y: u16,
+    contact_size: u16,
+) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    let Some(nvs) = mycelium_board::get_nvs(instance_id) else {
+        warn!(%instance_id, "GT911 save_calibration: NVS not initialized");
+        return false;
+    };
+    let mut nvs = nvs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !nvs.begin("touch", false) {
+        warn!(%instance_id, "GT911 save_calibration: could not open touch namespace");
+        return false;
+    }
+    let blob = format!("{max_x}:{max_y}:{contact_size}");
+    nvs.put_string("gt911_cal", &blob);
+    nvs.end();
+    true
+}
+
+/// Restore GT911 calibration from NVS for an instance.
+///
+/// Reads the calibration string written by `meshemu_input_gt911_save_calibration`
+/// and applies it to the instance's touch controller.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_gt911_load_calibration(instance_id: *const c_char) -> bool {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return false;
+    };
+    let Some(nvs) = mycelium_board::get_nvs(instance_id) else {
+        return false;
+    };
+    let mut nvs = nvs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !nvs.begin("touch", true) {
+        return false;
+    }
+    let cal = nvs.get_string("gt911_cal", "");
+    nvs.end();
+    let parts: Vec<&str> = cal.split(':').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let Ok(max_x) = parts[0].parse::<u16>() else {
+        return false;
+    };
+    let Ok(max_y) = parts[1].parse::<u16>() else {
+        return false;
+    };
+    let Ok(contact_size) = parts[2].parse::<u16>() else {
+        return false;
+    };
+    // Apply to live controller if present
+    if let Some(manager) = unsafe { input_manager(instance_id.as_ptr() as *const _, false) } {
+        let controller = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gt911();
+        let mut c = controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        c.set_resolution(max_x, max_y);
+        c.set_contact_size(contact_size);
+    }
+    true
+}
+
+/// Returns the device that currently owns the global shared SPI bus.
+///
+/// Returns 0=none, 1=Display, 2=Sx1262, 3=SdCard.
+#[no_mangle]
+pub extern "C" fn meshemu_spi_bus_owner() -> u8 {
+    match mycelium_display::shared_spi::global_spi_bus().owner() {
+        None => 0,
+        Some(mycelium_display::shared_spi::SpiDevice::Display) => 1,
+        Some(mycelium_display::shared_spi::SpiDevice::Sx1262) => 2,
+        Some(mycelium_display::shared_spi::SpiDevice::SdCard) => 3,
+    }
+}
+
 /// Polls one keyboard event, packed as row[0..7], col[8..15], pressed[16].
 ///
 /// Returns zero when no event is queued.

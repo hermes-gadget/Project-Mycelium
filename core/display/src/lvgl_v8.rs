@@ -11,7 +11,7 @@ use std::ptr;
 use libloading::Library;
 use sdl2::pixels::PixelFormatEnum;
 
-use crate::shared_spi::SharedSpiBus;
+use crate::shared_spi::global_spi_bus;
 use crate::st7789::{St7789Controller, ST7789_CASET, ST7789_RAMWR, ST7789_RASET};
 use crate::{framebuffer_size, host_rgb565_to_st7789_wire, DisplayBackendOptions, Rect};
 
@@ -405,7 +405,7 @@ unsafe fn lvgl_v8_init_sdl_with_api(
     let mut driver = Box::new(unsafe { std::mem::zeroed::<LvDispDrv>() });
     let controller = if options.st7789_fidelity {
         let mut controller =
-            St7789Controller::new(width as u16, height as u16, SharedSpiBus::default());
+            St7789Controller::new(width as u16, height as u16, global_spi_bus().clone());
         controller.set_reset(false);
         controller.set_reset(true);
         if controller.initialize_t_deck().is_err() {
