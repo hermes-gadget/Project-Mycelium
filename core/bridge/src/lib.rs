@@ -20,7 +20,7 @@ pub use ffi::{
     meshemu_display_capture, meshemu_display_capture_free, meshemu_display_create,
     meshemu_display_create_ex, meshemu_display_create_v, meshemu_display_destroy,
     meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read, meshemu_gps_set_baud_rate,
-    meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_tick,
+    meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_set_time, meshemu_gps_tick,
     meshemu_i2c_keyboard_create,
     meshemu_i2c_keyboard_destroy, meshemu_i2c_keyboard_inject_key_byte,
     meshemu_i2c_keyboard_set_cross_reset, meshemu_input_digital_read,

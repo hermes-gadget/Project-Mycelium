@@ -859,6 +859,21 @@ pub unsafe extern "C" fn meshemu_gps_set_baud_rate(gps: *mut c_void, baud_rate: 
         .is_some_and(|gps| gps.manager.set_baud_rate(baud_rate))
 }
 
+/// Pins the GPS clock to a Unix timestamp for deterministic NMEA replay.
+///
+/// Pass `unix_seconds > 0` to lock the clock; pass `0` to fall back to
+/// the system clock.  Useful for reproducible integration tests.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_time(gps: *mut c_void, unix_seconds: i64) {
+    if let Some(gps) = unsafe { gps_mut(gps) } {
+        gps.manager.set_time((unix_seconds > 0).then_some(unix_seconds));
+    }
+}
+
 /// Destroys a GPS handle.
 ///
 /// # Safety

@@ -9,6 +9,12 @@
  *   - firmware_get_display() returns the firmware's LVGL display, or NULL when
  *     the firmware has no display.
  *
+ * Optionally, firmware may also export:
+ *
+ *   - meshemu_firmware_api_version() returns the API version the firmware was
+ *     compiled against (currently 1).  Mycelium warns on mismatch but runs
+ *     older firmware for backwards compatibility.
+ *
  * Firmware calls the Host Services API to create and control virtual hardware.
  * Those declarations live in include/meshemu_*.h:
  *

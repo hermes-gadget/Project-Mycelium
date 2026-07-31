@@ -112,6 +112,14 @@ impl GpsManager {
         true
     }
 
+    /// Pin the GPS clock for deterministic NMEA replay.
+    ///
+    /// Pass `Some(unix_seconds)` to lock the timestamp, or `None` to
+    /// fall back to the system clock.  Useful for reproducible tests.
+    pub fn set_time(&mut self, unix_seconds: Option<i64>) {
+        self.state.set_fixed_time(unix_seconds);
+    }
+
     pub fn baud_rate(&self) -> u32 {
         self.baud_rate
     }

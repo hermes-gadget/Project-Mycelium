@@ -1,0 +1,6 @@
+# Ensure cmake compatibility for bundled SDL2 builds.
+# System cmake ≥ 4.0 dropped compatibility with cmake_minimum_required < 3.5,
+# but sdl2-sys v0.38.0 bundles CMakeLists.txt that uses cmake_minimum_required(VERSION 3.0).
+# This env var tells cmake 4+ to try configuring anyway.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
