@@ -1,11 +1,15 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use crate::gt911::SharedGt911;
-use crate::gt911::{new_shared_gt911, GT911_I2C_ADDRESS};
+use crate::gt911::{new_shared_gt911, new_shared_gt911_for_instance, GT911_I2C_ADDRESS};
 use crate::i2c_keyboard::{I2cKeyboardBus, KEYBOARD_I2C_ADDRESS};
 
 pub const KEYBOARD_I2C_CLOCK_HZ: u32 = 100_000;
 pub const FAST_I2C_CLOCK_HZ: u32 = 400_000;
+/// Arduino-ESP32's I2C transmit FIFO size.
+pub const WIRE_TX_BUFFER_CAPACITY: usize = 128;
+/// Keep the emulated receive FIFO finite as well.
+pub const WIRE_RX_BUFFER_CAPACITY: usize = 128;
 
 pub type SharedI2cKeyboard = Arc<Mutex<I2cKeyboardBus>>;
 type PeripheralPowerCheck = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -35,6 +39,14 @@ impl WireShim {
 
     pub fn with_keyboard(keyboard_bus: SharedI2cKeyboard) -> Self {
         Self::with_devices(keyboard_bus, new_shared_gt911())
+    }
+
+    /// Creates a Wire bus whose built-in peripherals belong to one instance.
+    pub fn new_for_instance(instance_id: &str) -> Self {
+        Self::with_devices(
+            Arc::new(Mutex::new(I2cKeyboardBus::new_for_instance(instance_id))),
+            new_shared_gt911_for_instance(instance_id),
+        )
     }
 
     pub fn with_devices(keyboard_bus: SharedI2cKeyboard, gt911: SharedGt911) -> Self {
@@ -134,6 +146,9 @@ impl WireShim {
         if self.transmit_address.is_none() || !self.peripherals_powered() || self.sda_stuck {
             return 0;
         }
+        if self.transmit_buffer.len() >= WIRE_TX_BUFFER_CAPACITY {
+            return 0;
+        }
         self.transmit_buffer.push(byte);
         1
     }
@@ -198,6 +213,9 @@ impl WireShim {
                     .push(lock(&self.keyboard_bus).read_key_byte())
             }
             GT911_I2C_ADDRESS => {
+                if usize::from(count) > WIRE_RX_BUFFER_CAPACITY {
+                    return 0;
+                }
                 self.read_buffer.resize(count as usize, 0);
                 let read = lock(&self.gt911).i2c_read(self.gt911_register, &mut self.read_buffer);
                 if read != usize::from(count) {
@@ -301,6 +319,17 @@ mod tests {
         assert_eq!(wire.end_transmission(), 0);
         assert_eq!(wire.request_from(KEYBOARD_I2C_ADDRESS, 1), 1);
         assert_eq!(wire.read(), i32::from(b'a'));
+    }
+
+    #[test]
+    fn transmit_fifo_rejects_bytes_after_hardware_capacity() {
+        let mut wire = configured_wire(Arc::new(Mutex::new(I2cKeyboardBus::new())));
+        wire.begin_transmission(KEYBOARD_I2C_ADDRESS);
+        for _ in 0..WIRE_TX_BUFFER_CAPACITY {
+            assert_eq!(wire.write_byte(0x04), 1);
+        }
+        assert_eq!(wire.write_byte(0x04), 0);
+        assert_eq!(wire.end_transmission(), 0);
     }
 
     #[test]

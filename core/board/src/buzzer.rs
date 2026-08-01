@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 use std::ffi::{c_char, CStr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
@@ -28,16 +28,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// headless systems. Tone lifecycle state is maintained even without audio.
 pub struct VirtualBuzzer {
     playing: Arc<AtomicBool>,
-    generation: Arc<AtomicU64>,
     frequency_hz: u32,
     duration_ms: u64,
     duty_cycle: f32,
-    audio_enabled: bool,
     audio_tx: Option<Sender<AudioCommand>>,
 }
 
 enum AudioCommand {
-    Beep { frequency_hz: u32, duty_cycle: f32 },
+    Beep {
+        frequency_hz: u32,
+        duty_cycle: f32,
+        duration_ms: Option<u64>,
+    },
     Stop,
 }
 
@@ -71,7 +73,7 @@ impl AudioCallback for SineCallback {
     }
 }
 
-fn start_audio_worker() -> Option<Sender<AudioCommand>> {
+fn start_audio_worker(playing: Arc<AtomicBool>) -> Option<(Sender<AudioCommand>, bool)> {
     let (command_tx, command_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(0);
 
@@ -96,53 +98,78 @@ fn start_audio_worker() -> Option<Sender<AudioCommand>> {
                 Ok((sdl, audio, device))
             })();
 
-            let Ok((_sdl, _audio, device)) = result else {
-                let _ = ready_tx.send(false);
-                return;
-            };
-            device.resume();
-            if ready_tx.send(true).is_err() {
-                return;
+            let audio_resources = result.ok();
+            let audio_enabled = audio_resources.is_some();
+            if let Some((_, _, device)) = audio_resources.as_ref() {
+                device.resume();
             }
+            // Keep the timer worker alive even when the caller timed out while
+            // host audio was initializing. The channel remains useful for
+            // lifecycle state in trace-only/headless mode.
+            let _ = ready_tx.send(audio_enabled);
 
-            while let Ok(command) = command_rx.recv() {
-                let mut state = lock(&state);
-                match command {
-                    AudioCommand::Beep {
+            let mut deadline: Option<std::time::Instant> = None;
+            loop {
+                let timeout = deadline.map_or(Duration::from_secs(3600), |deadline| {
+                    deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .unwrap_or_default()
+                });
+                match command_rx.recv_timeout(timeout) {
+                    Ok(AudioCommand::Beep {
                         frequency_hz,
                         duty_cycle,
-                    } => {
+                        duration_ms,
+                    }) => {
+                        let mut state = lock(&state);
                         state.frequency_hz = frequency_hz;
                         state.duty_cycle = duty_cycle;
                         state.playing = true;
+                        playing.store(true, Ordering::Release);
+                        deadline = duration_ms
+                            .filter(|duration| *duration > 0)
+                            .map(|duration| {
+                                std::time::Instant::now() + Duration::from_millis(duration)
+                            });
                     }
-                    AudioCommand::Stop => state.playing = false,
+                    Ok(AudioCommand::Stop) => {
+                        lock(&state).playing = false;
+                        deadline = None;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        lock(&state).playing = false;
+                        playing.store(false, Ordering::Release);
+                        deadline = None;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         })
         .ok()?;
 
-    ready_rx
+    let audio_enabled = ready_rx
         .recv_timeout(Duration::from_millis(500))
-        .ok()
-        .filter(|ready| *ready)
-        .map(|_| command_tx)
+        .unwrap_or(false);
+    Some((command_tx, audio_enabled))
 }
 
 impl VirtualBuzzer {
     pub fn new() -> Self {
-        let audio_tx = start_audio_worker();
-        if audio_tx.is_none() {
+        let playing = Arc::new(AtomicBool::new(false));
+        let worker = start_audio_worker(Arc::clone(&playing));
+        if worker.is_none() {
             warn!("host audio unavailable; buzzer will be trace-only");
         }
+        if worker.as_ref().is_some_and(|(_, enabled)| !enabled) {
+            warn!("host audio unavailable; buzzer will be trace-only");
+        }
+        let audio_tx = worker.map(|(sender, _)| sender);
 
         Self {
-            playing: Arc::new(AtomicBool::new(false)),
-            generation: Arc::new(AtomicU64::new(0)),
+            playing,
             frequency_hz: 0,
             duration_ms: 0,
             duty_cycle: 0.0,
-            audio_enabled: audio_tx.is_some(),
             audio_tx,
         }
     }
@@ -179,43 +206,24 @@ impl VirtualBuzzer {
             return;
         }
 
-        if self.audio_enabled {
-            let Some(audio_tx) = self.audio_tx.as_ref() else {
-                return;
-            };
+        if let Some(audio_tx) = self.audio_tx.as_ref() {
             if audio_tx
                 .send(AudioCommand::Beep {
                     frequency_hz,
                     duty_cycle: self.duty_cycle,
+                    duration_ms,
                 })
                 .is_err()
             {
-                self.audio_enabled = false;
                 self.audio_tx = None;
+                self.playing.store(false, Ordering::Release);
                 warn!("host buzzer audio worker stopped; using trace-only mode");
             }
-        }
-
-        if let Some(duration_ms) = duration_ms {
-            let playing = Arc::clone(&self.playing);
-            let generation = Arc::clone(&self.generation);
-            let tone_generation = self.generation.load(Ordering::Acquire);
-            let audio_tx = self.audio_tx.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(duration_ms));
-                if generation.load(Ordering::Acquire) == tone_generation {
-                    playing.store(false, Ordering::Release);
-                    if let Some(audio_tx) = audio_tx {
-                        let _ = audio_tx.send(AudioCommand::Stop);
-                    }
-                }
-            });
         }
     }
 
     /// Stops any currently playing tone.
     pub fn stop(&mut self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
         if let Some(audio_tx) = self.audio_tx.as_ref() {
             let _ = audio_tx.send(AudioCommand::Stop);
         }

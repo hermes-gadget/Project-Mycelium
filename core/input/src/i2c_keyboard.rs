@@ -1,11 +1,18 @@
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 pub const KEYBOARD_I2C_ADDRESS: u8 = 0x55;
 pub const KEYBOARD_BRIGHTNESS_COMMAND: u8 = 0x01;
 pub const KEYBOARD_KEY_MODE_COMMAND: u8 = 0x04;
 
-static PERSISTED_BACKLIGHT: AtomicU8 = AtomicU8::new(0);
+static PERSISTED_BACKLIGHT: LazyLock<Mutex<HashMap<String, u8>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Simulates the ESP32-C3 keyboard co-processor at I2C address `0x55`.
 ///
@@ -13,6 +20,7 @@ static PERSISTED_BACKLIGHT: AtomicU8 = AtomicU8::new(0);
 /// `0x00` indicating that no key is currently waiting.
 #[derive(Debug)]
 pub struct I2cKeyboardBus {
+    instance_id: String,
     /// Queue of key bytes waiting to be read (FIFO).
     key_queue: VecDeque<u8>,
     /// Whether key mode (`CMD 0x04`) has been sent.
@@ -27,11 +35,20 @@ pub struct I2cKeyboardBus {
 
 impl I2cKeyboardBus {
     pub fn new() -> Self {
+        Self::new_for_instance("__legacy__")
+    }
+
+    /// Creates a keyboard whose retained C3 state belongs only to `instance_id`.
+    pub fn new_for_instance(instance_id: &str) -> Self {
         Self {
+            instance_id: instance_id.to_owned(),
             key_queue: VecDeque::new(),
             key_mode_active: false,
             last_command: 0,
-            backlight: PERSISTED_BACKLIGHT.load(Ordering::SeqCst),
+            backlight: lock(&PERSISTED_BACKLIGHT)
+                .get(instance_id)
+                .copied()
+                .unwrap_or(0),
             cross_reset_persist: true,
         }
     }
@@ -59,7 +76,7 @@ impl I2cKeyboardBus {
             (KEYBOARD_BRIGHTNESS_COMMAND, Some(brightness)) => {
                 self.backlight = brightness;
                 if self.cross_reset_persist {
-                    PERSISTED_BACKLIGHT.store(brightness, Ordering::SeqCst);
+                    lock(&PERSISTED_BACKLIGHT).insert(self.instance_id.clone(), brightness);
                 }
             }
             (KEYBOARD_KEY_MODE_COMMAND, _) => self.key_mode_active = true,
@@ -75,11 +92,11 @@ impl I2cKeyboardBus {
     pub fn set_cross_reset_persist(&mut self, persist: bool) {
         self.cross_reset_persist = persist;
         if persist {
-            PERSISTED_BACKLIGHT.store(self.backlight, Ordering::SeqCst);
+            lock(&PERSISTED_BACKLIGHT).insert(self.instance_id.clone(), self.backlight);
         } else {
             // A non-persistent device presents power-on darkness after the next
             // host recreation, regardless of an older retained C3 value.
-            PERSISTED_BACKLIGHT.store(0, Ordering::SeqCst);
+            lock(&PERSISTED_BACKLIGHT).remove(&self.instance_id);
         }
     }
 
@@ -194,5 +211,25 @@ mod tests {
         assert_eq!(bus.backlight(), 200);
 
         assert_eq!(I2cKeyboardBus::new().backlight(), 0);
+    }
+
+    #[test]
+    fn retained_backlight_isolated_by_instance() {
+        let _serial = PERSISTENCE_TEST.lock().unwrap();
+        let mut first = I2cKeyboardBus::new_for_instance("keyboard-first");
+        first.write_transaction(&[KEYBOARD_BRIGHTNESS_COMMAND, 77]);
+        drop(first);
+
+        assert_eq!(
+            I2cKeyboardBus::new_for_instance("keyboard-first").backlight(),
+            77
+        );
+        assert_eq!(
+            I2cKeyboardBus::new_for_instance("keyboard-second").backlight(),
+            0
+        );
+
+        let mut cleanup = I2cKeyboardBus::new_for_instance("keyboard-first");
+        cleanup.set_cross_reset_persist(false);
     }
 }
