@@ -1,12 +1,4 @@
-#include "meshemu_board.h"
-#include "meshemu_buzzer.h"
-#include "meshemu_display.h"
-#include "meshemu_gps.h"
-#include "meshemu_input.h"
-#include "meshemu_nvs.h"
-#include "meshemu_partition.h"
-#include "meshemu_radio.h"
-#include "meshemu_storage.h"
+#include "../meshemu.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -93,8 +85,10 @@ int main(void)
     meshemu_i2c_keyboard_inject_key_byte(keyboard, 'q');
     meshemu_i2c_keyboard_set_cross_reset(keyboard, true);
     void* wire = meshemu_wire_shim_create();
+    void* instance_wire = meshemu_wire_shim_create_for_instance(id);
     meshemu_wire_shim_set_keyboard(wire, keyboard);
     (void)meshemu_wire_begin(wire);
+    meshemu_wire_set_clock(wire, 400000);
     (void)meshemu_wire_probe_address(wire, 0x55);
     uint8_t sda = 0;
     uint8_t scl = 0;
@@ -109,7 +103,9 @@ int main(void)
     (void)meshemu_wire_available(wire);
     (void)meshemu_wire_read(wire);
     meshemu_wire_shim_destroy(wire);
+    meshemu_wire_shim_destroy(instance_wire);
     meshemu_i2c_keyboard_destroy(keyboard);
+    (void)meshemu_input_digital_read(id, 3);
     meshemu_input_set_gpio_intr_enabled(id, 3, true);
     (void)meshemu_input_get_gpio_intr_enabled(id, 3);
     (void)meshemu_input_take_falling_edges(id, 3);
@@ -126,6 +122,7 @@ int main(void)
     (void)meshemu_radio_get_dio2_config(radio);
     meshemu_radio_set_position(radio, 51.5, -0.1);
     meshemu_bus_tick(1);
+    (void)meshemu_spi_bus_owner();
     meshemu_radio_destroy(radio);
 
     (void)meshemu_spiffs_init(id);

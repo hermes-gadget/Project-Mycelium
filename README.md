@@ -4,6 +4,10 @@
 
 A Rust desktop application that emulates the LilyGo T-Deck (ESP32-S3, ST7789 320×240, SX1262 LoRa, GT911 touch, I2C keyboard). Firmware compiled as a dynamic library links against Mycelium's C FFI bridge, and multiple instances share a virtual RadioBus with simulated propagation, range, and collisions — just like real LoRa.
 
+The desktop and headless `run` modes are available today. The web control
+panel, map/fleet/inspector views, and browser-driven scenarios are planned;
+`serve` currently reports that roadmap status.
+
 **[Full FFI Reference →](firmware-sdk/meshemu.h)** | **[Parity Report →](docs/parity-2026-07-29.md)**
 
 ## Quick Start
@@ -15,14 +19,20 @@ cd Project-Mycelium
 # Build the desktop emulator (requires SDL2)
 cargo build --release
 
-# Run with a test firmware
-cargo run --release -- --firmware ./target/release/libmycelium_example.so
+# Validate a firmware shared library
+cargo run --release -- test --firmware ./path/to/libfirmware.so
 
-# Run all tests (189 tests, 0 failures)
+# Run firmware with the desktop display
+cargo run --release -- run --firmware ./path/to/libfirmware.so
+
+# Run firmware without opening SDL2 windows (for CI or servers)
+cargo run --release -- run --firmware ./path/to/libfirmware.so --headless
+
+# Run all tests (205 tests, 0 failures)
 cargo test --workspace
 
-# Open the web control panel
-open http://localhost:9170
+# Check the SDK headers, ABI calls, and built export inventory
+make test-sdk-headers
 ```
 
 ## Architecture
@@ -54,13 +64,13 @@ open http://localhost:9170
 │             └───────┬────────┘                           │
 │                     │                                    │
 │  ┌──────────────────▼──────────────────────────────┐    │
-│  │          Web Control Panel (:9170)                │    │
-│  │  Map │ Fleet │ Inspector │ Scenarios             │    │
+│  │     Planned Web Control Panel (not implemented)   │    │
+│  │  Map │ Fleet │ Inspector │ Scenarios (roadmap)   │    │
 │  └──────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────┘
 
 core/
-├── bridge/src/          Rust FFI bridge (114 C functions)
+├── bridge/src/          Rust FFI bridge (133 C exports)
 │   ├── ffi.rs           Main FFI — all subsystem exports
 │   └── flash_ffi.rs     NVS + partition + launcher FFI
 ├── board/src/           Virtual T-Deck board, battery, power, PSRAM, NVS
@@ -73,17 +83,16 @@ core/
 
 firmware-sdk/
 ├── meshemu.h            Master C header (all subsystems)
-├── include/              Individual subsystem headers
+├── include/              Host Services headers (also included by meshemu.h)
 └── tests/                ABI link test (C binary calls every FFI function)
 
-gui/                     Web control panel (map, fleet, inspector, scenarios)
-cli/                     Headless CLI for CI/CD
+gui/                     Planned web control panel (see gui/README.md)
 docs/                    Design docs, parity reports, API reference
 ```
 
 ## Hardware Emulation Coverage
 
-**114 C FFI functions across 9 subsystems.** Full parity with physical T-Deck + SigurdOS + Wadamesh.
+**133 C FFI exports across the bridge.** Core peripheral behavior is tracked against the physical T-Deck, SigurdOS, and Wadamesh in the parity report.
 
 | Subsystem | Physical Hardware | Mycelium FFI | Failure Modes | Key Capabilities |
 |-----------|-------------------|--------------|---------------|------------------|
@@ -116,8 +125,9 @@ int main(void) {
     void* gps = meshemu_gps_create("my-instance", 51.5, -0.1);
 
     // Main loop
+    uint64_t now_ms = 0;
     while (1) {
-        meshemu_bus_tick(1);  // advance time by 1ms
+        meshemu_bus_tick(++now_ms);  // provide a cumulative monotonic timestamp
 
         // Poll keyboard
         meshemu_input_inject_key("my-instance", 'a', true);
@@ -140,7 +150,7 @@ See `firmware-sdk/meshemu.h` for the complete FFI reference and `firmware-sdk/in
 ## Built-In Test Patterns
 
 ```bash
-# Run all 189 tests (covers every FFI function with failure-modes)
+# Run all 205 tests
 cargo test --workspace
 
 # Test specific subsystems
@@ -148,15 +158,16 @@ cargo test -p mycelium_board
 cargo test -p meshemu_bridge
 cargo test -p radio_bus
 
-# ABI link test — compiles a C binary that calls every FFI function
-cd firmware-sdk && make test-abi
+# ABI/header/export inventory and link test
+make test-sdk-headers
 ```
 
 ## Project Status
 
-- **FFI surface:** 114 C functions, complete
-- **Subsystems covered:** 9/9 (display, keyboard, touch, trackball, radio, storage, GPS, board, NVS)
-- **Test coverage:** 189 tests, 0 failures
+- **FFI surface:** 133 C exports; canonical headers and ABI calls are inventory-checked
+- **CLI:** `run`, `test`, and `run --headless` are available
+- **Web control panel:** planned; `serve` is currently a stub
+- **Test coverage:** 205 tests, 0 failures
 - **Parity targets:** Physical T-Deck ✅ | SigurdOS ✅ | Wadamesh ✅
 - **Failure-mode resilience:** GT911 phantoms ✅ | C3 cross-reset ✅ | DIO2 RF loss ✅ | SD mount ladder ✅ | NVS migration ✅
 - **PRs merged:** 18 (audit fixes + peripheral + medium + gap closure)

@@ -1,4 +1,4 @@
-# Mycelium Web GUI (planned)
+# Mycelium Web GUI (roadmap)
 
 This directory will hold the **web control panel** for Project Mycelium: a
 browser-based view into the virtual radio bus that lets you inspect and drive
@@ -17,11 +17,11 @@ emulated T-Deck nodes without touching the CLI.
 
 ## Status
 
-Not yet implemented. The `meshemu serve` CLI command that would host this
-panel is currently a stub, and `gui/` exists in the repository layout so the
-planned component has a home. The web server will be added as a new crate or
-module under `core/` (axum is already a workspace dependency), serving this
-directory's static assets.
+Not yet implemented. The `meshemu serve` CLI command is intentionally a stub
+that reports this roadmap status; it does not start an HTTP server. The
+headless `meshemu run --headless` mode is available for non-GUI execution, but
+it does not host this directory's assets. A future web server can be added as
+a new crate or module under `core/` (axum is already a workspace dependency).
 
 Contributions that implement any of the planned views are welcome — see
 `../AGENTS.md` for contribution conventions and `../plan.md` for the design

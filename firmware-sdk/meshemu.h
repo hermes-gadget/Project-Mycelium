@@ -16,7 +16,7 @@
  *     older firmware for backwards compatibility.
  *
  * Firmware calls the Host Services API to create and control virtual hardware.
- * Those declarations live in include/meshemu_*.h:
+ * This umbrella includes every SDK Host Services header:
  *
  *   include/meshemu_radio.h    - RadioBus-backed radio
  *   include/meshemu_board.h    - virtual MainBoard
@@ -26,6 +26,7 @@
  *   include/meshemu_partition.h - ESP32 partition table and Launcher mode
  *   include/meshemu_gps.h      - GPS and NMEA data
  *   include/meshemu_input.h    - T-Deck keyboard
+ *   include/meshemu_spi.h      - shared-SPI ownership diagnostics
  *   include/meshemu_buzzer.h   - host audio
  *
  * Add firmware-sdk/, firmware-sdk/include/, and core/bridge/include/ to the
@@ -36,6 +37,17 @@
 #pragma once
 
 #include <stddef.h>
+
+#include "include/meshemu_board.h"
+#include "include/meshemu_buzzer.h"
+#include "include/meshemu_display.h"
+#include "include/meshemu_gps.h"
+#include "include/meshemu_input.h"
+#include "include/meshemu_nvs.h"
+#include "include/meshemu_partition.h"
+#include "include/meshemu_radio.h"
+#include "include/meshemu_spi.h"
+#include "include/meshemu_storage.h"
 
 #ifdef __cplusplus
 extern "C" {
