@@ -16,6 +16,12 @@ void meshemu_gps_tick(void* gps, uint64_t delta_ms);
 void meshemu_gps_set_enabled(void* gps, bool enabled);
 bool meshemu_gps_set_baud_rate(void* gps, uint32_t baud_rate);
 void meshemu_gps_set_time(void* gps, int64_t unix_seconds);
+bool meshemu_gps_set_static(void* gps);
+bool meshemu_gps_set_linear(void* gps, double speed_mps, double heading_deg);
+bool meshemu_gps_set_waypoints(void* gps, const double* lat_lon_pairs,
+                               uint32_t point_count, double speed_mps);
+bool meshemu_gps_set_gpx(void* gps, const char* gpx_xml,
+                         double speed_multiplier);
 void meshemu_gps_destroy(void* gps);
 
 #ifdef __cplusplus

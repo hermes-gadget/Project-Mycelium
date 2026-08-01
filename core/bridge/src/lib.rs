@@ -20,7 +20,8 @@ pub use ffi::{
     meshemu_display_capture, meshemu_display_capture_free, meshemu_display_create,
     meshemu_display_create_ex, meshemu_display_create_v, meshemu_display_destroy,
     meshemu_gps_create, meshemu_gps_destroy, meshemu_gps_read, meshemu_gps_set_baud_rate,
-    meshemu_gps_set_enabled, meshemu_gps_set_position, meshemu_gps_set_time, meshemu_gps_tick,
+    meshemu_gps_set_enabled, meshemu_gps_set_gpx, meshemu_gps_set_linear, meshemu_gps_set_position,
+    meshemu_gps_set_static, meshemu_gps_set_time, meshemu_gps_set_waypoints, meshemu_gps_tick,
     meshemu_i2c_keyboard_create, meshemu_i2c_keyboard_destroy,
     meshemu_i2c_keyboard_inject_key_byte, meshemu_i2c_keyboard_set_cross_reset,
     meshemu_input_digital_read, meshemu_input_get_gpio_intr_enabled,
@@ -716,11 +717,20 @@ mod tests {
         assert!(!gps.is_null());
         let mut buffer = [0_u8; 256];
 
-        unsafe { meshemu_gps_tick(gps, 1_000) };
+        unsafe {
+            meshemu_gps_set_time(gps, 764_426_119);
+            meshemu_gps_tick(gps, 1_000);
+        }
         let len = unsafe { meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32) };
         let sentence = std::str::from_utf8(&buffer[..len as usize]).unwrap();
         assert!(sentence.starts_with("$GPGGA,"));
         assert!(sentence.contains(",5130.4440,N,00007.6680,W,"));
+        let mut lines = sentence.lines();
+        let gga = lines.next().unwrap();
+        let rmc = lines.next().unwrap();
+        assert_eq!(gga.split(',').nth(1), Some("123519"));
+        assert_eq!(rmc.split(',').nth(1), Some("123519"));
+        assert_eq!(rmc.split(',').nth(9), Some("230394"));
 
         unsafe {
             meshemu_gps_set_position(gps, -33.8688, 151.2093, 58.0);
@@ -740,11 +750,80 @@ mod tests {
         assert!(!gps.is_null());
 
         unsafe {
-            assert!(meshemu_gps_set_baud_rate(gps, 38_400));
-            assert!(meshemu_gps_set_baud_rate(gps, 9_600));
-            assert!(!meshemu_gps_set_baud_rate(gps, 0));
-            assert!(!meshemu_gps_set_baud_rate(gps, 921_600));
+            for (baud_rate, accepted) in [
+                (9_600, true),
+                (38_400, true),
+                (4_800, false),
+                (19_200, false),
+                (115_200, false),
+                (0, false),
+                (921_600, false),
+            ] {
+                assert_eq!(
+                    meshemu_gps_set_baud_rate(gps, baud_rate),
+                    accepted,
+                    "{baud_rate}"
+                );
+            }
             assert!(!meshemu_gps_set_baud_rate(std::ptr::null_mut(), 38_400));
+            meshemu_gps_destroy(gps);
+        }
+    }
+
+    #[test]
+    fn gps_ffi_coalesces_an_extreme_tick_into_one_bounded_epoch() {
+        let id = CString::new("ffi-gps-extreme-tick").unwrap();
+        let gps = unsafe { meshemu_gps_create(id.as_ptr(), 51.5074, -0.1278) };
+        assert!(!gps.is_null());
+        let mut buffer = [0_u8; 4096];
+
+        unsafe {
+            meshemu_gps_tick(gps, u64::MAX);
+            let len = meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32);
+            assert!(len > 0);
+            let output = std::str::from_utf8(&buffer[..len as usize]).unwrap();
+            assert_eq!(output.matches("$GPGGA,").count(), 1);
+            assert_eq!(output.matches("$GPRMC,").count(), 1);
+            assert_eq!(
+                meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32),
+                0
+            );
+            meshemu_gps_destroy(gps);
+        }
+    }
+
+    #[test]
+    fn gps_ffi_exposes_validated_movement_and_gpx_configuration() {
+        let id = CString::new("ffi-gps-movement").unwrap();
+        let gps = unsafe { meshemu_gps_create(id.as_ptr(), 51.5, -0.1) };
+        assert!(!gps.is_null());
+        let waypoints = [51.5, -0.1, 51.5, -0.2];
+        let gpx = CString::new(
+            r#"<gpx version="1.1"><trk><trkseg>
+                <trkpt lat="51.5" lon="-0.1"><time>1994-03-23T12:35:19Z</time></trkpt>
+                <trkpt lat="51.5" lon="-0.2"><time>1994-03-23T12:35:20Z</time></trkpt>
+            </trkseg></trk></gpx>"#,
+        )
+        .unwrap();
+        let invalid_gpx = CString::new("<gpx><trkpt lat=\"bad\" lon=\"0\"/></gpx>").unwrap();
+
+        unsafe {
+            assert!(meshemu_gps_set_static(gps));
+            assert!(meshemu_gps_set_linear(gps, 10.0, 90.0));
+            assert!(!meshemu_gps_set_linear(gps, -1.0, 90.0));
+            assert!(!meshemu_gps_set_linear(gps, 1.0, f64::NAN));
+            assert!(meshemu_gps_set_waypoints(gps, waypoints.as_ptr(), 2, 20.0));
+            assert!(!meshemu_gps_set_waypoints(gps, std::ptr::null(), 2, 20.0));
+            assert!(!meshemu_gps_set_gpx(gps, invalid_gpx.as_ptr(), 1.0));
+            assert!(!meshemu_gps_set_gpx(gps, gpx.as_ptr(), 0.0));
+            assert!(meshemu_gps_set_gpx(gps, gpx.as_ptr(), 1.0));
+            meshemu_gps_set_time(gps, 764_426_119);
+            meshemu_gps_tick(gps, 1_000);
+
+            let mut buffer = [0_u8; 4096];
+            let len = meshemu_gps_read(gps, buffer.as_mut_ptr(), buffer.len() as i32);
+            let output = std::str::from_utf8(&buffer[..len as usize]).unwrap();
+            assert!(output.contains(",00012.0000,W,"));
             meshemu_gps_destroy(gps);
         }
     }

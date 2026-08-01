@@ -8,6 +8,7 @@ use mycelium_board::{
     peripherals_powered, BoardConfig, Tp4054State, VirtualBoard, SLEEP_WAKE_CAUSE_EXT1,
     SLEEP_WAKE_CAUSE_TIMER, SLEEP_WAKE_CAUSE_UNKNOWN,
 };
+use mycelium_gps::manager::MAX_GPX_TRACK_POINTS;
 use mycelium_gps::GpsManager;
 use mycelium_input::i2c_keyboard::I2cKeyboardBus;
 use mycelium_input::wire_shim::{SharedI2cKeyboard, WireShim};
@@ -872,6 +873,85 @@ pub unsafe extern "C" fn meshemu_gps_set_time(gps: *mut c_void, unix_seconds: i6
         gps.manager
             .set_time((unix_seconds > 0).then_some(unix_seconds));
     }
+}
+
+/// Selects the static GPS movement model.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_static(gps: *mut c_void) -> bool {
+    unsafe { gps_mut(gps) }.is_some_and(|gps| {
+        gps.manager.set_static();
+        true
+    })
+}
+
+/// Configures validated constant-speed movement in metres per second.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_linear(
+    gps: *mut c_void,
+    speed_mps: f64,
+    heading_deg: f64,
+) -> bool {
+    unsafe { gps_mut(gps) }.is_some_and(|gps| gps.manager.set_linear(speed_mps, heading_deg))
+}
+
+/// Configures validated, non-looping waypoints from a flattened latitude /
+/// longitude array (`lat_lon_pairs[point_count * 2]`).
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle. When `point_count` is positive,
+/// `lat_lon_pairs` must point to at least `point_count * 2` readable `double`s
+/// for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_waypoints(
+    gps: *mut c_void,
+    lat_lon_pairs: *const f64,
+    point_count: u32,
+    speed_mps: f64,
+) -> bool {
+    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+        return false;
+    };
+    let point_count = point_count as usize;
+    if lat_lon_pairs.is_null() || point_count == 0 || point_count > MAX_GPX_TRACK_POINTS {
+        return false;
+    }
+    let values = unsafe { std::slice::from_raw_parts(lat_lon_pairs, point_count * 2) };
+    let points = values
+        .chunks_exact(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
+    gps.manager.set_waypoints(points, speed_mps)
+}
+
+/// Parses and configures a validated GPX track replay. The document is read
+/// from a NUL-terminated UTF-8 string and is bounded by the GPS manager.
+///
+/// # Safety
+///
+/// `gps` must be a live GPS handle and `gpx_xml` must point to a valid
+/// NUL-terminated UTF-8 string for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_gps_set_gpx(
+    gps: *mut c_void,
+    gpx_xml: *const c_char,
+    speed_multiplier: f64,
+) -> bool {
+    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+        return false;
+    };
+    let Some(gpx_xml) = (unsafe { ffi_string(gpx_xml) }) else {
+        return false;
+    };
+    gps.manager.set_gpx_replay_xml(gpx_xml, speed_multiplier)
 }
 
 /// Destroys a GPS handle.
