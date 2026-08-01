@@ -1018,7 +1018,7 @@ pub unsafe extern "C" fn meshemu_gps_set_time(gps: *mut c_void, unix_seconds: i6
 /// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_static(gps: *mut c_void) -> bool {
-    unsafe { gps_mut(gps) }.is_some_and(|gps| {
+    unsafe { gps_mut(gps) }.is_some_and(|mut gps| {
         gps.manager.set_static();
         true
     })
@@ -1035,7 +1035,7 @@ pub unsafe extern "C" fn meshemu_gps_set_linear(
     speed_mps: f64,
     heading_deg: f64,
 ) -> bool {
-    unsafe { gps_mut(gps) }.is_some_and(|gps| gps.manager.set_linear(speed_mps, heading_deg))
+    unsafe { gps_mut(gps) }.is_some_and(|mut gps| gps.manager.set_linear(speed_mps, heading_deg))
 }
 
 /// Configures validated, non-looping waypoints from a flattened latitude /
@@ -1053,7 +1053,7 @@ pub unsafe extern "C" fn meshemu_gps_set_waypoints(
     point_count: u32,
     speed_mps: f64,
 ) -> bool {
-    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+    let Some(mut gps) = (unsafe { gps_mut(gps) }) else {
         return false;
     };
     let point_count = point_count as usize;
@@ -1081,7 +1081,7 @@ pub unsafe extern "C" fn meshemu_gps_set_gpx(
     gpx_xml: *const c_char,
     speed_multiplier: f64,
 ) -> bool {
-    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+    let Some(mut gps) = (unsafe { gps_mut(gps) }) else {
         return false;
     };
     let Some(gpx_xml) = (unsafe { ffi_string(gpx_xml) }) else {
@@ -1315,7 +1315,7 @@ pub unsafe extern "C" fn meshemu_board_set_psram_size(
     board: *mut c_void,
     psram_size_bytes: u32,
 ) -> bool {
-    unsafe { board_mut(board) }.is_some_and(|board| board.set_psram_size(psram_size_bytes))
+    unsafe { board_mut(board) }.is_some_and(|mut board| board.set_psram_size(psram_size_bytes))
 }
 
 /// Writes and verifies a deterministic pattern in simulated PSRAM.
@@ -2933,7 +2933,7 @@ mod input_ffi_tests {
         let second_keyboard =
             unsafe { meshemu_i2c_keyboard_create_for_instance(second_id.as_ptr()) };
         let second_keyboard_ref = unsafe { keyboard_ref(second_keyboard) }.unwrap();
-        assert_eq!(lock(second_keyboard_ref).backlight(), 0);
+        assert_eq!(second_keyboard_ref.lock().unwrap().backlight(), 0);
 
         unsafe {
             meshemu_i2c_keyboard_destroy(second_keyboard);
