@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::spiffs::{instance_directory, safe_join};
+use crate::spiffs::{instance_directory, reject_symlink_components, safe_join};
 
 pub const TDECK_LORA_CS_PIN: u8 = 9;
 pub const TDECK_SDCARD_CS_PIN: u8 = 39;
@@ -167,6 +167,7 @@ impl VirtualSdCard {
             self.mounted = false;
             return Ok(false);
         }
+        reject_symlink_components(&self.base_path, Path::new(""))?;
         fs::create_dir_all(&self.base_path)?;
         self.mounted = true;
         Ok(true)
@@ -234,6 +235,12 @@ impl VirtualSdCard {
         let mut files = Vec::new();
         for entry in fs::read_dir(self.resolve(path)?)? {
             let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SD backing directories must not contain symlinks",
+                ));
+            }
             if let Some(name) = entry.file_name().to_str() {
                 files.push(name.to_owned());
             }
@@ -316,10 +323,17 @@ fn validate_file_size(size: u64) -> Result<(), io::Error> {
 fn directory_size(path: &Path) -> Result<u64, io::Error> {
     fs::read_dir(path)?.try_fold(0_u64, |used, entry| {
         let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD backing directories must not contain symlinks",
+            ));
+        }
         let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             Ok(used.saturating_add(directory_size(&entry.path())?))
-        } else if metadata.is_file() {
+        } else if file_type.is_file() {
             Ok(used.saturating_add(metadata.len()))
         } else {
             Ok(used)
@@ -329,7 +343,12 @@ fn directory_size(path: &Path) -> Result<u64, io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_file_size, FAT32_MAX_FILE_SIZE};
+    use super::{validate_file_size, VirtualSdCard, FAT32_MAX_FILE_SIZE};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn fat32_rejects_files_larger_than_four_gibibytes_minus_one() {
@@ -340,5 +359,42 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidInput
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sdcard_rejects_symlinked_path_components_and_accounting_entries() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mycelium-sd-symlink-{nonce}"));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), b"outside").unwrap();
+        let link = root.join("escape");
+        symlink(&outside, &link).unwrap();
+
+        let mut sdcard = VirtualSdCard::at_path("symlink", root.clone());
+        sdcard.mount().unwrap();
+        assert_eq!(
+            sdcard.read_file("escape/secret").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            sdcard
+                .write_file("escape/new", b"blocked")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            sdcard.info().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

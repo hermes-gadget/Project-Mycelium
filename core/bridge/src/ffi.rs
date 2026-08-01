@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
@@ -23,7 +24,7 @@ struct BusState {
     node_ids: HashSet<String>,
     now_ms: u64,
     sleep_requests: HashMap<String, (u64, u64, u32, u64, bool)>,
-    last_wake_cause: u8,
+    last_wake_causes: HashMap<String, u8>,
 }
 
 impl BusState {
@@ -33,7 +34,7 @@ impl BusState {
             node_ids: HashSet::new(),
             now_ms: 0,
             sleep_requests: HashMap::new(),
-            last_wake_cause: SLEEP_WAKE_CAUSE_UNKNOWN,
+            last_wake_causes: HashMap::new(),
         }
     }
 }
@@ -66,10 +67,27 @@ static SD_FILE_HANDLES: LazyLock<Mutex<HashMap<u32, SdFileHandle>>> =
 static SDCARD_REQUIRES_SLOW_INIT: AtomicBool = AtomicBool::new(false);
 static SDCARD_WAKE_DELAY_MS: AtomicU32 = AtomicU32::new(0);
 
+thread_local! {
+    /// Compatibility context for legacy no-ID board/input APIs. The actual
+    /// retained state is always stored in an instance-keyed registry.
+    static CURRENT_INSTANCE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn set_current_instance(instance_id: &str) {
+    CURRENT_INSTANCE.with(|current| {
+        *current.borrow_mut() = Some(instance_id.to_owned());
+    });
+    mycelium_display::shared_spi::set_current_instance(instance_id);
+}
+
+fn current_instance() -> Option<String> {
+    CURRENT_INSTANCE.with(|current| current.borrow().clone())
 }
 
 #[track_caller]
@@ -129,7 +147,18 @@ unsafe fn storage_file_args<'a>(
         warn!(caller = %std::panic::Location::caller(), %instance_id, "FFI call with NULL or invalid path");
         return None;
     };
+    set_current_instance(instance_id);
     Some((instance_id, path))
+}
+
+/// Runs one SD transaction on the arbiter belonging to the virtual instance.
+/// The display and SD paths therefore cannot silently drive the same instance
+/// SPI pins at the same time.
+fn with_sd_spi<T>(instance_id: &str, operation: impl FnOnce() -> T) -> Option<T> {
+    mycelium_display::shared_spi::spi_bus_for_instance(instance_id)
+        .transaction(mycelium_display::shared_spi::SpiDevice::SdCard, operation)
+        .map_err(|error| warn!(%instance_id, %error, "SD SPI transaction rejected"))
+        .ok()
 }
 
 /// Static sentinel handed to callers for empty reads. Returning a stable
@@ -317,19 +346,24 @@ pub unsafe extern "C" fn meshemu_sdcard_init(instance_id: *const c_char) -> bool
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return false;
     };
+    set_current_instance(instance_id);
     if !peripherals_powered(instance_id) {
         warn!(%instance_id, "SD card init skipped: peripheral power rail is off");
         return false;
     }
     let requires_slow_init = SDCARD_REQUIRES_SLOW_INIT.load(Ordering::Relaxed);
     let wake_delay_ms = SDCARD_WAKE_DELAY_MS.load(Ordering::Relaxed);
-    let mut storage = lock(&STORAGE);
-    let sdcard = &mut storage
-        .entry(instance_id.to_owned())
-        .or_insert_with(|| StorageManager::new(instance_id))
-        .sdcard;
-    sdcard.set_behavior(requires_slow_init, wake_delay_ms);
-    let mounted = sdcard.mount_with_retry_ladder().unwrap_or(false);
+    let Some(mounted) = with_sd_spi(instance_id, || {
+        let mut storage = lock(&STORAGE);
+        let sdcard = &mut storage
+            .entry(instance_id.to_owned())
+            .or_insert_with(|| StorageManager::new(instance_id))
+            .sdcard;
+        sdcard.set_behavior(requires_slow_init, wake_delay_ms);
+        sdcard.mount_with_retry_ladder().unwrap_or(false)
+    }) else {
+        return false;
+    };
     if !mounted {
         warn!(%instance_id, "SD card mount failed");
     }
@@ -359,12 +393,16 @@ pub unsafe extern "C" fn meshemu_sdcard_card_type(instance_id: *const c_char) ->
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return 0;
     };
+    set_current_instance(instance_id);
     if !peripherals_powered(instance_id) {
         return 0;
     }
-    if lock(&STORAGE)
-        .get(instance_id)
-        .is_some_and(|manager| manager.sdcard.is_mounted())
+    if with_sd_spi(instance_id, || {
+        lock(&STORAGE)
+            .get(instance_id)
+            .is_some_and(|manager| manager.sdcard.is_mounted())
+    })
+    .unwrap_or(false)
     {
         3
     } else {
@@ -398,12 +436,16 @@ pub unsafe extern "C" fn meshemu_sdcard_used_bytes(instance_id: *const c_char) -
 
 unsafe fn sdcard_info(instance_id: *const c_char) -> Option<mycelium_storage::SdCardInfo> {
     let instance_id = unsafe { ffi_string(instance_id) }?;
+    set_current_instance(instance_id);
     if !peripherals_powered(instance_id) {
         return None;
     }
-    lock(&STORAGE)
-        .get(instance_id)
-        .and_then(|manager| manager.sdcard.info().ok())
+    with_sd_spi(instance_id, || {
+        lock(&STORAGE)
+            .get(instance_id)
+            .and_then(|manager| manager.sdcard.info().ok())
+    })
+    .flatten()
 }
 
 /// Creates a directory, including missing parent directories.
@@ -422,9 +464,12 @@ pub unsafe extern "C" fn meshemu_sdcard_mkdir(
     if !peripherals_powered(instance_id) {
         return false;
     }
-    lock(&STORAGE)
-        .get(instance_id)
-        .is_some_and(|manager| manager.sdcard.create_dir(path).is_ok())
+    with_sd_spi(instance_id, || {
+        lock(&STORAGE)
+            .get(instance_id)
+            .is_some_and(|manager| manager.sdcard.create_dir(path).is_ok())
+    })
+    .unwrap_or(false)
 }
 
 /// Returns whether a file or directory exists on a mounted card.
@@ -443,10 +488,13 @@ pub unsafe extern "C" fn meshemu_sdcard_exists(
     if !peripherals_powered(instance_id) {
         return false;
     }
-    lock(&STORAGE)
-        .get(instance_id)
-        .and_then(|manager| manager.sdcard.exists(path).ok())
-        .unwrap_or(false)
+    with_sd_spi(instance_id, || {
+        lock(&STORAGE)
+            .get(instance_id)
+            .and_then(|manager| manager.sdcard.exists(path).ok())
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// Opens a file and returns a handle in the range 1..=255.
@@ -473,19 +521,17 @@ pub unsafe extern "C" fn meshemu_sdcard_open(
     let Some(handle) = (1..=255).find(|candidate| !handles.contains_key(candidate)) else {
         return 0;
     };
-    let (position, writable, append) = {
+    let Some((position, writable, append)) = with_sd_spi(instance_id, || {
         let storage = lock(&STORAGE);
-        let Some(sdcard) = storage.get(instance_id).map(|manager| &manager.sdcard) else {
-            return 0;
-        };
-        match mode {
+        let sdcard = storage.get(instance_id).map(|manager| &manager.sdcard)?;
+        let result = match mode {
             0 => match sdcard.read_file(path) {
                 Ok(_) => (0, false, false),
-                Err(_) => return 0,
+                Err(_) => return None,
             },
             1 => {
                 if sdcard.write_file(path, &[]).is_err() {
-                    return 0;
+                    return None;
                 }
                 (0, true, false)
             }
@@ -494,19 +540,23 @@ pub unsafe extern "C" fn meshemu_sdcard_open(
                     Ok(data) => data.len(),
                     Err(_) if !sdcard.exists(path).unwrap_or(false) => {
                         if sdcard.write_file(path, &[]).is_err() {
-                            return 0;
+                            return None;
                         }
                         0
                     }
-                    Err(_) => return 0,
+                    Err(_) => return None,
                 };
                 (position, true, true)
             }
             _ => {
                 warn!(%instance_id, %path, mode, "SD card open rejected: unknown mode");
-                return 0;
+                return None;
             }
-        }
+        };
+        Some(result)
+    })
+    .flatten() else {
+        return 0;
     };
 
     handles.insert(
@@ -548,34 +598,37 @@ pub unsafe extern "C" fn meshemu_sdcard_write_file(handle: u32, data: *const u8,
     if !file.writable || !peripherals_powered(&file.instance_id) {
         return -1;
     }
-    let mut storage = lock(&STORAGE);
-    let Some(sdcard) = storage
-        .get_mut(&file.instance_id)
-        .map(|manager| &mut manager.sdcard)
-    else {
-        return -1;
-    };
-    let Ok(mut contents) = sdcard.read_file(&file.path) else {
-        return -1;
-    };
-    if file.append {
-        file.position = contents.len();
-    }
-    if file.position > contents.len() {
-        return -1;
-    }
-    let Some(end) = file.position.checked_add(bytes.len()) else {
-        return -1;
-    };
-    if end > contents.len() {
-        contents.resize(end, 0);
-    }
-    contents[file.position..end].copy_from_slice(bytes);
-    if sdcard.write_file(&file.path, &contents).is_err() {
-        return -1;
-    }
-    file.position = end;
-    len as i32
+    with_sd_spi(&file.instance_id, || {
+        let mut storage = lock(&STORAGE);
+        let Some(sdcard) = storage
+            .get_mut(&file.instance_id)
+            .map(|manager| &mut manager.sdcard)
+        else {
+            return -1;
+        };
+        let Ok(mut contents) = sdcard.read_file(&file.path) else {
+            return -1;
+        };
+        if file.append {
+            file.position = contents.len();
+        }
+        if file.position > contents.len() {
+            return -1;
+        }
+        let Some(end) = file.position.checked_add(bytes.len()) else {
+            return -1;
+        };
+        if end > contents.len() {
+            contents.resize(end, 0);
+        }
+        contents[file.position..end].copy_from_slice(bytes);
+        if sdcard.write_file(&file.path, &contents).is_err() {
+            return -1;
+        }
+        file.position = end;
+        len as i32
+    })
+    .unwrap_or(-1)
 }
 
 /// Reads up to `max_len` bytes from the current file position.
@@ -596,21 +649,24 @@ pub unsafe extern "C" fn meshemu_sdcard_read_file(handle: u32, buf: *mut u8, max
     if file.writable || !peripherals_powered(&file.instance_id) {
         return -1;
     }
-    let storage = lock(&STORAGE);
-    let Some(contents) = storage
-        .get(&file.instance_id)
-        .and_then(|manager| manager.sdcard.read_file(&file.path).ok())
-    else {
-        return -1;
-    };
-    let read_len = (contents.len().saturating_sub(file.position)).min(max_len as usize);
-    if read_len != 0 {
-        unsafe {
-            ptr::copy_nonoverlapping(contents[file.position..].as_ptr(), buf, read_len);
+    with_sd_spi(&file.instance_id, || {
+        let storage = lock(&STORAGE);
+        let Some(contents) = storage
+            .get(&file.instance_id)
+            .and_then(|manager| manager.sdcard.read_file(&file.path).ok())
+        else {
+            return -1;
+        };
+        let read_len = (contents.len().saturating_sub(file.position)).min(max_len as usize);
+        if read_len != 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(contents[file.position..].as_ptr(), buf, read_len);
+            }
         }
-    }
-    file.position += read_len;
-    read_len as i32
+        file.position += read_len;
+        read_len as i32
+    })
+    .unwrap_or(-1)
 }
 
 /// Closes an open SD file handle.
@@ -635,9 +691,12 @@ pub unsafe extern "C" fn meshemu_sdcard_remove(
     if !peripherals_powered(instance_id) {
         return false;
     }
-    lock(&STORAGE)
-        .get(instance_id)
-        .is_some_and(|manager| manager.sdcard.remove_file(path).is_ok())
+    with_sd_spi(instance_id, || {
+        lock(&STORAGE)
+            .get(instance_id)
+            .is_some_and(|manager| manager.sdcard.remove_file(path).is_ok())
+    })
+    .unwrap_or(false)
 }
 
 /// Closes instance file handles and unmounts its SD card.
@@ -650,10 +709,13 @@ pub unsafe extern "C" fn meshemu_sdcard_end(instance_id: *const c_char) {
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return;
     };
+    set_current_instance(instance_id);
     lock(&SD_FILE_HANDLES).retain(|_, file| file.instance_id != instance_id);
-    if let Some(manager) = lock(&STORAGE).get_mut(instance_id) {
-        manager.sdcard.unmount();
-    }
+    let _ = with_sd_spi(instance_id, || {
+        if let Some(manager) = lock(&STORAGE).get_mut(instance_id) {
+            manager.sdcard.unmount();
+        }
+    });
 }
 
 /// Reads an SD card file into a caller-owned allocation.
@@ -679,11 +741,12 @@ pub unsafe extern "C" fn meshemu_sdcard_read(
     if !peripherals_powered(instance_id) {
         return ptr::null_mut();
     }
-    let storage = lock(&STORAGE);
-    let Some(data) = storage
-        .get(instance_id)
-        .and_then(|manager| manager.sdcard.read_file(path).ok())
-    else {
+    let Some(data) = with_sd_spi(instance_id, || {
+        lock(&STORAGE)
+            .get(instance_id)
+            .and_then(|manager| manager.sdcard.read_file(path).ok())
+    })
+    .flatten() else {
         return ptr::null_mut();
     };
     copy_for_caller(&data, out_len)
@@ -716,9 +779,12 @@ pub unsafe extern "C" fn meshemu_sdcard_write(
     } else {
         unsafe { std::slice::from_raw_parts(data, len) }
     };
-    lock(&STORAGE)
-        .get(instance_id)
-        .is_some_and(|manager| manager.sdcard.write_file(path, bytes).is_ok())
+    with_sd_spi(instance_id, || {
+        lock(&STORAGE)
+            .get(instance_id)
+            .is_some_and(|manager| manager.sdcard.write_file(path, bytes).is_ok())
+    })
+    .unwrap_or(false)
 }
 
 /// Unmounts and removes all storage state for an emulator instance.
@@ -739,6 +805,7 @@ pub unsafe extern "C" fn meshemu_storage_destroy(instance_id: *const c_char) -> 
         return false;
     };
     manager.unmount_all();
+    mycelium_display::shared_spi::remove_instance(instance_id);
     true
 }
 
@@ -980,6 +1047,7 @@ pub unsafe extern "C" fn meshemu_board_create(
     let Some(instance_id) = (unsafe { self::instance_id(instance_id) }) else {
         return ptr::null_mut();
     };
+    set_current_instance(&instance_id);
     if !temp.is_finite() {
         warn!(%instance_id, "Board create rejected: non-finite temperature");
         return ptr::null_mut();
@@ -987,6 +1055,36 @@ pub unsafe extern "C" fn meshemu_board_create(
     let config = BoardConfig {
         battery_mv: mv,
         mcu_temperature: temp,
+        ..BoardConfig::default()
+    };
+    Box::into_raw(Box::new(VirtualBoard::new(&instance_id, config))).cast()
+}
+
+/// Creates a virtual T-Deck with an explicitly configured PSRAM size.
+/// A size of zero models a board without external PSRAM.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_create_ex(
+    instance_id: *const c_char,
+    mv: u16,
+    temp: f32,
+    psram_size_bytes: u32,
+) -> *mut c_void {
+    let Some(instance_id) = (unsafe { self::instance_id(instance_id) }) else {
+        return ptr::null_mut();
+    };
+    set_current_instance(&instance_id);
+    if !temp.is_finite() {
+        warn!(%instance_id, "Board create rejected: non-finite temperature");
+        return ptr::null_mut();
+    }
+    let config = BoardConfig {
+        battery_mv: mv,
+        mcu_temperature: temp,
+        psram_size_bytes,
         ..BoardConfig::default()
     };
     Box::into_raw(Box::new(VirtualBoard::new(&instance_id, config))).cast()
@@ -1134,6 +1232,21 @@ pub unsafe extern "C" fn meshemu_board_get_psram_free(board: *mut c_void) -> u32
     unsafe { board_ref(board) }
         .map(VirtualBoard::psram_free_bytes)
         .unwrap_or(0)
+}
+
+/// Changes the PSRAM capacity of a board handle. A zero size models absent
+/// PSRAM; shrinking below already-reserved memory is rejected.
+///
+/// # Safety
+///
+/// `board` must be a live board handle returned by [`meshemu_board_create`]
+/// or [`meshemu_board_create_ex`].
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_psram_size(
+    board: *mut c_void,
+    psram_size_bytes: u32,
+) -> bool {
+    unsafe { board_mut(board) }.is_some_and(|board| board.set_psram_size(psram_size_bytes))
 }
 
 /// Writes and verifies a deterministic pattern in simulated PSRAM.
@@ -1386,6 +1499,7 @@ pub unsafe extern "C" fn meshemu_board_deep_sleep(
     let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
         return lock(&BUS).now_ms;
     };
+    set_current_instance(instance_id);
     mycelium_board::set_reset_reason(instance_id, mycelium_board::RESET_REASON_DEEPSLEEP);
 
     let wake_cause = if sleep_secs > 0 {
@@ -1412,26 +1526,92 @@ pub unsafe extern "C" fn meshemu_board_deep_sleep(
     if let Some(request) = state.sleep_requests.get_mut(instance_id) {
         request.4 = false;
     }
-    state.last_wake_cause = wake_cause;
+    state
+        .last_wake_causes
+        .insert(instance_id.to_owned(), wake_cause);
     wake_at_ms
 }
 
 /// Returns the wake-cause flags from the most recently completed sleep.
 #[no_mangle]
 pub extern "C" fn meshemu_board_get_sleep_wake_cause() -> u8 {
-    lock(&BUS).last_wake_cause
+    let Some(instance_id) = current_instance() else {
+        return SLEEP_WAKE_CAUSE_UNKNOWN;
+    };
+    lock(&BUS)
+        .last_wake_causes
+        .get(&instance_id)
+        .copied()
+        .unwrap_or(SLEEP_WAKE_CAUSE_UNKNOWN)
+}
+
+/// Returns the wake-cause flags for one explicit virtual board instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_sleep_wake_cause_for_instance(
+    instance_id: *const c_char,
+) -> u8 {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return SLEEP_WAKE_CAUSE_UNKNOWN;
+    };
+    lock(&BUS)
+        .last_wake_causes
+        .get(instance_id)
+        .copied()
+        .unwrap_or(SLEEP_WAKE_CAUSE_UNKNOWN)
 }
 
 /// Persists the latest boot checkpoint across board-handle restarts.
 #[no_mangle]
 pub extern "C" fn meshemu_board_set_boot_phase(phase: u8) {
-    mycelium_board::set_boot_phase(phase);
+    if let Some(instance_id) = current_instance() {
+        mycelium_board::set_boot_phase_for_instance(&instance_id, phase);
+    } else {
+        mycelium_board::set_boot_phase(phase);
+    }
 }
 
 /// Returns the latest persistent boot checkpoint.
 #[no_mangle]
 pub extern "C" fn meshemu_board_get_last_boot_phase() -> u8 {
-    mycelium_board::last_boot_phase()
+    current_instance().map_or_else(mycelium_board::last_boot_phase, |instance_id| {
+        mycelium_board::last_boot_phase_for_instance(&instance_id)
+    })
+}
+
+/// Persists a boot checkpoint for one explicit virtual board instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_set_boot_phase_for_instance(
+    instance_id: *const c_char,
+    phase: u8,
+) {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return;
+    };
+    set_current_instance(instance_id);
+    mycelium_board::set_boot_phase_for_instance(instance_id, phase);
+}
+
+/// Returns the boot checkpoint for one explicit virtual board instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_board_get_last_boot_phase_for_instance(
+    instance_id: *const c_char,
+) -> u8 {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return mycelium_board::BD_STARTUP_NORMAL;
+    };
+    mycelium_board::last_boot_phase_for_instance(instance_id)
 }
 
 /// Destroys a board handle.
@@ -1450,6 +1630,23 @@ pub unsafe extern "C" fn meshemu_board_destroy(board: *mut c_void) {
 #[no_mangle]
 pub extern "C" fn meshemu_i2c_keyboard_create() -> *mut c_void {
     let keyboard = std::sync::Arc::new(Mutex::new(I2cKeyboardBus::new()));
+    Box::into_raw(Box::new(keyboard)).cast()
+}
+
+/// Creates a keyboard whose retained C3 backlight belongs to one instance.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_i2c_keyboard_create_for_instance(
+    instance_id: *const c_char,
+) -> *mut c_void {
+    let Some(instance_id) = (unsafe { ffi_string(instance_id) }) else {
+        return ptr::null_mut();
+    };
+    set_current_instance(instance_id);
+    let keyboard = std::sync::Arc::new(Mutex::new(I2cKeyboardBus::new_for_instance(instance_id)));
     Box::into_raw(Box::new(keyboard)).cast()
 }
 
@@ -1747,6 +1944,7 @@ unsafe fn input_manager(instance_id: *const c_char, create: bool) -> Option<Shar
         warn!(caller = %std::panic::Location::caller(), "FFI instance_id argument is empty");
         return None;
     }
+    set_current_instance(instance_id);
     get_input_manager(instance_id)
         .or_else(|| create.then(|| register_input_manager(instance_id, 1.0)))
 }
@@ -1893,6 +2091,45 @@ pub extern "C" fn meshemu_input_gt911_set_failure_mode(mode: u8, value: u32) {
 #[no_mangle]
 pub extern "C" fn meshemu_input_gt911_get_status() -> u64 {
     mycelium_input::global_watchdog_status()
+}
+
+/// Configure a GT911 failure mode for one input instance only.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_gt911_set_failure_mode_for_instance(
+    instance_id: *const c_char,
+    mode: u8,
+    value: u32,
+) {
+    let Some(manager) = (unsafe { input_manager(instance_id, true) }) else {
+        return;
+    };
+    manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_gt911_failure_mode(mode, value);
+}
+
+/// Return sticky GT911 watchdog flags for one input instance only.
+///
+/// # Safety
+///
+/// `instance_id` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn meshemu_input_gt911_get_status_for_instance(
+    instance_id: *const c_char,
+) -> u64 {
+    let Some(manager) = (unsafe { input_manager(instance_id, false) }) else {
+        return 0;
+    };
+    let status = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .gt911_watchdog_status();
+    status
 }
 
 /// Persist the current GT911 calibration for an instance.
@@ -2557,5 +2794,82 @@ mod input_ffi_tests {
             meshemu_i2c_keyboard_set_cross_reset(fresh, false);
             meshemu_i2c_keyboard_destroy(fresh);
         }
+    }
+
+    #[test]
+    fn instance_explicit_board_and_keyboard_apis_isolate_state() {
+        let first_id = std::ffi::CString::new("ffi-explicit-first").unwrap();
+        let second_id = std::ffi::CString::new("ffi-explicit-second").unwrap();
+        let first = unsafe { meshemu_board_create_ex(first_id.as_ptr(), 3_900, 35.0, 0) };
+        let second = unsafe { meshemu_board_create_ex(second_id.as_ptr(), 3_900, 35.0, 2_048) };
+        assert!(!unsafe { meshemu_board_psram_found(first) });
+        assert!(unsafe { meshemu_board_psram_found(second) });
+        assert!(unsafe { meshemu_board_set_psram_size(first, 512) });
+        assert_eq!(unsafe { meshemu_board_get_psram_free(first) }, 512);
+
+        let first_keyboard = unsafe { meshemu_i2c_keyboard_create_for_instance(first_id.as_ptr()) };
+        let first_wire = meshemu_wire_shim_create();
+        unsafe {
+            meshemu_wire_shim_set_keyboard(first_wire, first_keyboard);
+            assert!(meshemu_wire_begin(first_wire));
+            meshemu_wire_begin_transmission(first_wire, mycelium_input::KEYBOARD_I2C_ADDRESS);
+            meshemu_wire_write(first_wire, KEYBOARD_BRIGHTNESS_COMMAND);
+            meshemu_wire_write(first_wire, 99);
+            assert_eq!(meshemu_wire_end_transmission(first_wire), 0);
+            meshemu_wire_shim_destroy(first_wire);
+            meshemu_i2c_keyboard_destroy(first_keyboard);
+        }
+        let second_keyboard =
+            unsafe { meshemu_i2c_keyboard_create_for_instance(second_id.as_ptr()) };
+        let second_keyboard_ref = unsafe { keyboard_ref(second_keyboard) }.unwrap();
+        assert_eq!(lock(second_keyboard_ref).backlight(), 0);
+
+        unsafe {
+            meshemu_i2c_keyboard_destroy(second_keyboard);
+            meshemu_board_destroy(first);
+            meshemu_board_destroy(second);
+        }
+    }
+
+    #[test]
+    fn instance_explicit_gt911_failure_api_isolates_watchdog_status() {
+        let first_id = std::ffi::CString::new("ffi-gt911-first").unwrap();
+        let second_id = std::ffi::CString::new("ffi-gt911-second").unwrap();
+        unsafe {
+            meshemu_input_gt911_set_failure_mode_for_instance(
+                first_id.as_ptr(),
+                mycelium_input::GT911_FAILURE_MODE_BUS,
+                100,
+            );
+        }
+        let first = get_input_manager("ffi-gt911-first").unwrap();
+        let second = register_input_manager("ffi-gt911-second", 1.0);
+        let first_controller = first.lock().unwrap().gt911();
+        let second_controller = second.lock().unwrap().gt911();
+        lock(&first_controller).inject_touch(10, 20, true);
+        lock(&second_controller).inject_touch(10, 20, true);
+        let mut status = [0];
+        for _ in 0..8 {
+            assert_eq!(
+                lock(&first_controller)
+                    .i2c_read(mycelium_input::GT911_STATUS_REGISTER, &mut status),
+                0
+            );
+            assert_ne!(
+                lock(&second_controller)
+                    .i2c_read(mycelium_input::GT911_STATUS_REGISTER, &mut status),
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { meshemu_input_gt911_get_status_for_instance(first_id.as_ptr()) },
+            mycelium_input::GT911_STATUS_BUS_WATCHDOG_FIRED
+        );
+        assert_eq!(
+            unsafe { meshemu_input_gt911_get_status_for_instance(second_id.as_ptr()) },
+            0
+        );
+        mycelium_input::remove_input_manager("ffi-gt911-first");
+        mycelium_input::remove_input_manager("ffi-gt911-second");
     }
 }

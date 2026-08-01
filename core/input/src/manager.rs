@@ -6,7 +6,6 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
 use crate::{
-    gt911::new_shared_gt911,
     i2c_keyboard::I2cKeyboardBus,
     wire_shim::{SharedGt911, SharedI2cKeyboard, WireShim},
 };
@@ -17,6 +16,11 @@ use crate::{
 static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 static INPUT_MANAGERS: LazyLock<Mutex<HashMap<String, SharedInputManager>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Maximum number of pending events exposed by one emulated input FIFO.
+/// Hardware input producers must not be able to grow host memory without
+/// bound when firmware stops polling.
+pub const INPUT_EVENT_QUEUE_CAPACITY: usize = 64;
 
 pub type SharedInputManager = Arc<Mutex<InputManager>>;
 
@@ -46,13 +50,13 @@ impl InputManager {
             touch: TouchEmulator::new(320, 240, scale),
             keyboard: KeyboardEmulator::new(),
             trackball: TrackballEmulator::new(),
-            i2c_keyboard: Arc::new(Mutex::new(I2cKeyboardBus::new())),
-            gt911: new_shared_gt911(),
+            i2c_keyboard: Arc::new(Mutex::new(I2cKeyboardBus::new_for_instance(instance_id))),
+            gt911: crate::gt911::new_shared_gt911_for_instance(instance_id),
             instance_id: instance_id.to_owned(),
             last_activity_ms: monotonic_ms(),
-            touch_events: VecDeque::new(),
-            keyboard_events: VecDeque::new(),
-            trackball_events: VecDeque::new(),
+            touch_events: VecDeque::with_capacity(INPUT_EVENT_QUEUE_CAPACITY),
+            keyboard_events: VecDeque::with_capacity(INPUT_EVENT_QUEUE_CAPACITY),
+            trackball_events: VecDeque::with_capacity(INPUT_EVENT_QUEUE_CAPACITY),
         }
     }
 
@@ -67,7 +71,7 @@ impl InputManager {
             Event::MouseMotion { x, y, .. } => {
                 if let Some(event) = self.touch.handle_mouse_motion(x, y) {
                     self.update_gt911(true);
-                    self.touch_events.push_back(event);
+                    self.enqueue_touch_event(event);
                     events.push(InputEvent::Touch(event));
                 }
             }
@@ -76,7 +80,7 @@ impl InputManager {
             } => {
                 if let Some(event) = self.touch.handle_mouse_button_at(mouse_btn, true, x, y) {
                     self.update_gt911(true);
-                    self.touch_events.push_back(event);
+                    self.enqueue_touch_event(event);
                     events.push(InputEvent::Touch(event));
                 }
             }
@@ -85,7 +89,7 @@ impl InputManager {
             } => {
                 if let Some(event) = self.touch.handle_mouse_button_at(mouse_btn, false, x, y) {
                     self.update_gt911(false);
-                    self.touch_events.push_back(event);
+                    self.enqueue_touch_event(event);
                     events.push(InputEvent::Touch(event));
                 }
             }
@@ -114,7 +118,7 @@ impl InputManager {
             return false;
         };
         self.update_gt911(pressed);
-        self.touch_events.push_back(event);
+        self.enqueue_touch_event(event);
         self.wake();
         true
     }
@@ -147,6 +151,15 @@ impl InputManager {
 
     pub fn gt911(&self) -> SharedGt911 {
         Arc::clone(&self.gt911)
+    }
+
+    /// Configure failure injection for this manager's GT911 instance.
+    pub fn set_gt911_failure_mode(&mut self, mode: u8, value: u32) {
+        crate::gt911::set_failure_mode_for_instance(&self.instance_id, mode, value);
+    }
+
+    pub fn gt911_watchdog_status(&self) -> u64 {
+        crate::gt911::watchdog_status_for_instance(&self.instance_id)
     }
 
     pub fn touch_raw_position(&self) -> Option<(u16, u16)> {
@@ -225,12 +238,12 @@ impl InputManager {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .inject_key_byte(event.key_byte);
             }
-            self.keyboard_events.push_back(event);
+            self.enqueue_keyboard_event(event);
             events.push(InputEvent::Keyboard(event));
         }
         if let Some(mut event) = self.trackball.handle_key(keycode, pressed) {
             event.timestamp_ms = monotonic_ms();
-            self.trackball_events.push_back(event);
+            self.enqueue_trackball_event(event);
             events.push(InputEvent::Trackball(event));
         }
     }
@@ -244,6 +257,26 @@ impl InputManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .inject_touch(host_x, host_y, pressed);
     }
+
+    fn enqueue_touch_event(&mut self, event: Gt911TouchEvent) -> bool {
+        enqueue_bounded(&mut self.touch_events, event)
+    }
+
+    fn enqueue_keyboard_event(&mut self, event: KeyEvent) -> bool {
+        enqueue_bounded(&mut self.keyboard_events, event)
+    }
+
+    fn enqueue_trackball_event(&mut self, event: TrackballEvent) -> bool {
+        enqueue_bounded(&mut self.trackball_events, event)
+    }
+}
+
+fn enqueue_bounded<T>(queue: &mut VecDeque<T>, event: T) -> bool {
+    if queue.len() >= INPUT_EVENT_QUEUE_CAPACITY {
+        return false;
+    }
+    queue.push_back(event);
+    true
 }
 
 /// Register an instance route, or return its existing shared manager.
@@ -494,6 +527,49 @@ mod tests {
         manager.inject_key(Keycode::D, false);
         assert_eq!(wire.request_from(crate::KEYBOARD_I2C_ADDRESS, 1), 1);
         assert_eq!(wire.read(), 0);
+    }
+
+    #[test]
+    fn input_event_queues_drop_new_events_at_hardware_capacity() {
+        let mut manager = InputManager::new("bounded-input", 1.0);
+        for _ in 0..(INPUT_EVENT_QUEUE_CAPACITY * 2) {
+            manager.inject_key(Keycode::Q, true);
+            manager.inject_key(Keycode::Q, false);
+        }
+
+        let mut queued = 0;
+        while manager.poll_keyboard().is_some() {
+            queued += 1;
+        }
+        assert_eq!(queued, INPUT_EVENT_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn manager_keyboard_retention_is_scoped_to_the_input_instance() {
+        let first_id = "manager-keyboard-retention-first";
+        let second_id = "manager-keyboard-retention-second";
+        let first = InputManager::new(first_id, 1.0);
+        first
+            .i2c_keyboard()
+            .lock()
+            .unwrap()
+            .write_transaction(&[crate::KEYBOARD_BRIGHTNESS_COMMAND, 88]);
+
+        let recreated = InputManager::new(first_id, 1.0);
+        assert_eq!(recreated.i2c_keyboard().lock().unwrap().backlight(), 88);
+        assert_eq!(
+            InputManager::new(second_id, 1.0)
+                .i2c_keyboard()
+                .lock()
+                .unwrap()
+                .backlight(),
+            0
+        );
+        recreated
+            .i2c_keyboard()
+            .lock()
+            .unwrap()
+            .set_cross_reset_persist(false);
     }
 
     #[test]

@@ -113,6 +113,7 @@ impl VirtualSpiffs {
                 "SPIFFS partition and block sizes must be non-zero",
             ));
         }
+        reject_symlink_components(&self.base_path, Path::new(""))?;
         fs::create_dir_all(&self.base_path)?;
         self.mounted = true;
         Ok(true)
@@ -171,7 +172,14 @@ impl VirtualSpiffs {
         let mut files = Vec::new();
         for entry in fs::read_dir(&self.base_path)? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SPIFFS backing directories must not contain symlinks",
+                ));
+            }
+            if file_type.is_file() {
                 if let Some(name) = entry.file_name().to_str() {
                     files.push(name.to_owned());
                 }
@@ -205,6 +213,7 @@ impl VirtualSpiffs {
 
     /// Deletes all partition contents and resets wear counters.
     pub fn format(&mut self) -> Result<(), io::Error> {
+        reject_symlink_components(&self.base_path, Path::new(""))?;
         if self.base_path.exists() {
             fs::remove_dir_all(&self.base_path)?;
         }
@@ -244,6 +253,7 @@ impl VirtualSpiffs {
                 "SPIFFS filenames are limited to 32 characters",
             ));
         }
+        reject_symlink_components(&self.base_path, Path::new(filename))?;
         Ok((filename, self.base_path.join(filename)))
     }
 
@@ -251,8 +261,15 @@ impl VirtualSpiffs {
         self.ensure_mounted()?;
         fs::read_dir(&self.base_path)?.try_fold(0_u64, |used, entry| {
             let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SPIFFS backing directories must not contain symlinks",
+                ));
+            }
             let metadata = entry.metadata()?;
-            Ok(used.saturating_add(if metadata.is_file() {
+            Ok(used.saturating_add(if file_type.is_file() {
                 metadata.len()
             } else {
                 0
@@ -287,7 +304,52 @@ pub(crate) fn safe_join(base_path: &Path, path: &str) -> Result<PathBuf, io::Err
             "storage path must stay inside the instance directory",
         ));
     }
+    reject_symlink_components(base_path, path)?;
     Ok(base_path.join(path))
+}
+
+/// Rejects symlinked path components before a storage operation follows them.
+/// Missing components are allowed because callers may be creating them.
+pub(crate) fn reject_symlink_components(
+    base_path: &Path,
+    relative_path: &Path,
+) -> Result<(), io::Error> {
+    let mut current = PathBuf::new();
+    for component in base_path.components() {
+        if !matches!(component, Component::CurDir) {
+            current.push(component.as_os_str());
+            reject_existing_symlink(&current, "storage backing paths must not contain symlinks")?;
+        }
+    }
+
+    for component in relative_path.components() {
+        match component {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage path must stay inside the instance directory",
+                ));
+            }
+        }
+        reject_existing_symlink(
+            &current,
+            "storage paths must not contain symlink components",
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_existing_symlink(path: &Path, message: &str) -> Result<(), io::Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, message))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn instance_directory(instance_id: &str) -> String {
@@ -313,5 +375,44 @@ pub(crate) fn instance_directory(instance_id: &str) -> String {
         "%00".to_owned()
     } else {
         encoded
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VirtualSpiffs;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    #[test]
+    fn flat_spiffs_rejects_symlinked_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mycelium-spiffs-symlink-{nonce}"));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), b"outside").unwrap();
+        let link = root.join("escape");
+        symlink(outside.join("secret"), &link).unwrap();
+
+        let mut spiffs = VirtualSpiffs::at_path("symlink", root.clone());
+        spiffs.mount().unwrap();
+        for result in [
+            spiffs.read_file("escape"),
+            spiffs.write_file("escape", b"blocked").map(|_| Vec::new()),
+            spiffs.delete_file("escape").map(|_| Vec::new()),
+        ] {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

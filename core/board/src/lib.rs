@@ -5,7 +5,6 @@ pub mod nvs;
 pub mod partition;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -47,7 +46,8 @@ pub const SLEEP_WAKE_CAUSE_TIMER: u8 = 1;
 pub const SLEEP_WAKE_CAUSE_EXT1: u8 = 2;
 pub const SLEEP_WAKE_CAUSE_TIMER_EXT1: u8 = 3;
 
-static LAST_BOOT_PHASE: AtomicU8 = AtomicU8::new(0);
+static LAST_BOOT_PHASE: LazyLock<Mutex<HashMap<String, u8>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Representative ESP32-S3 ADC1 11 dB eFuse calibration point. Combined with
 // Espressif's curve-fit coefficients below, a 2.1 V GPIO4 divider input
@@ -126,12 +126,28 @@ pub fn reset_reason(instance_id: &str) -> u8 {
         .unwrap_or(RESET_REASON_UNKNOWN)
 }
 
-pub fn set_boot_phase(phase: u8) {
-    LAST_BOOT_PHASE.store(phase, Ordering::Release);
+/// Persists a boot checkpoint for one virtual board instance.
+pub fn set_boot_phase_for_instance(instance_id: &str, phase: u8) {
+    lock(&LAST_BOOT_PHASE).insert(instance_id.to_owned(), phase);
 }
 
+/// Returns the boot checkpoint for one virtual board instance.
+pub fn last_boot_phase_for_instance(instance_id: &str) -> u8 {
+    lock(&LAST_BOOT_PHASE)
+        .get(instance_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Compatibility checkpoint for callers that predate instance-explicit APIs.
+/// FFI callers should use the instance-explicit variants whenever possible.
+pub fn set_boot_phase(phase: u8) {
+    set_boot_phase_for_instance("__legacy__", phase);
+}
+
+/// Compatibility getter for callers that predate instance-explicit APIs.
 pub fn last_boot_phase() -> u8 {
-    LAST_BOOT_PHASE.load(Ordering::Acquire)
+    last_boot_phase_for_instance("__legacy__")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,7 +211,7 @@ impl VirtualBoard {
         Self {
             battery_mv: config.battery_mv,
             mcu_temperature: config.mcu_temperature,
-            psram_size_bytes: DEFAULT_PSRAM_SIZE_BYTES,
+            psram_size_bytes: config.psram_size_bytes,
             manufacturer: config.manufacturer,
             startup_reason: config.startup_reason,
             external_powered: config.external_powered,
@@ -271,6 +287,16 @@ impl VirtualBoard {
     pub fn psram_free_bytes(&self) -> u32 {
         self.psram_size_bytes
             .saturating_sub(self.psram_used_bytes())
+    }
+
+    /// Changes the simulated external RAM size while preserving existing
+    /// reservations. Shrinking below the currently used amount is rejected.
+    pub fn set_psram_size(&mut self, size_bytes: u32) -> bool {
+        if size_bytes < self.psram_used_bytes {
+            return false;
+        }
+        self.psram_size_bytes = size_bytes;
+        true
     }
 
     /// Reserves bytes from external RAM so host adapters can model firmware
@@ -523,6 +549,7 @@ pub struct BoardConfig {
     pub external_powered: bool,
     pub periph_pwr_enabled: bool,
     pub adc_calibrated: bool,
+    pub psram_size_bytes: u32,
 }
 
 impl Default for BoardConfig {
@@ -535,6 +562,7 @@ impl Default for BoardConfig {
             external_powered: false,
             periph_pwr_enabled: true,
             adc_calibrated: true,
+            psram_size_bytes: DEFAULT_PSRAM_SIZE_BYTES,
         }
     }
 }
@@ -733,6 +761,36 @@ mod tests {
         let _restarted = VirtualBoard::new("boot-phase-node", BoardConfig::default());
 
         assert_eq!(last_boot_phase(), 17);
+    }
+
+    #[test]
+    fn boot_phase_isolated_by_instance() {
+        set_boot_phase_for_instance("boot-phase-first", 11);
+        set_boot_phase_for_instance("boot-phase-second", 22);
+
+        assert_eq!(last_boot_phase_for_instance("boot-phase-first"), 11);
+        assert_eq!(last_boot_phase_for_instance("boot-phase-second"), 22);
+    }
+
+    #[test]
+    fn configured_psram_size_models_absent_and_small_ram_boards() {
+        let mut absent = VirtualBoard::new(
+            "psram-absent",
+            BoardConfig {
+                psram_size_bytes: 0,
+                ..BoardConfig::default()
+            },
+        );
+        assert!(!absent.psram_found());
+        assert_eq!(absent.psram_free_bytes(), 0);
+        assert!(!absent.psram_readback_test());
+
+        assert!(absent.set_psram_size(128));
+        assert!(absent.psram_found());
+        assert_eq!(absent.psram_free_bytes(), 128);
+        assert!(absent.reserve_psram(64));
+        assert!(!absent.set_psram_size(63));
+        assert!(absent.set_psram_size(64));
     }
 
     #[test]

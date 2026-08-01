@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
+use std::io::{self, Write as IoWrite};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -90,6 +92,9 @@ impl VirtualNvs {
             Err(error) if error.kind() == io::ErrorKind::NotFound => PersistedNvs::default(),
             Err(error) => return Err(error),
         };
+        if backing_path.starts_with(private_data_root()) && backing_path.is_file() {
+            set_private_file(&backing_path)?;
+        }
 
         Ok(Self {
             instance_id: instance_id.to_owned(),
@@ -304,14 +309,22 @@ impl VirtualNvs {
                 "NVS backing file must have a parent directory",
             ));
         };
-        fs::create_dir_all(parent)?;
+        ensure_private_parent(parent)?;
         let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp_path = parent.join(format!(".nvs-{}-{sequence}.tmp", std::process::id()));
-        fs::write(&temp_path, bytes)?;
+        let mut temporary = fs::OpenOptions::new();
+        temporary.write(true).create_new(true);
+        #[cfg(unix)]
+        temporary.mode(0o600);
+        let mut temporary = temporary.open(&temp_path)?;
+        temporary.write_all(&bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
         if let Err(error) = fs::rename(&temp_path, &self.backing_path) {
             let _ = fs::remove_file(&temp_path);
             return Err(error);
         }
+        set_private_file(&self.backing_path)?;
         Ok(())
     }
 }
@@ -350,11 +363,59 @@ fn valid_name(value: &str) -> bool {
 }
 
 fn default_path(instance_id: &str) -> PathBuf {
-    std::env::temp_dir()
-        .join("mycelium")
+    private_data_root()
         .join("instances")
         .join(instance_directory(instance_id))
         .join("nvs.json")
+}
+
+/// Returns a persistent per-user data root rather than a shared temporary
+/// directory. The final `mycelium` directory is made private before storing
+/// any NVS JSON, which may contain credentials or other preferences.
+fn private_data_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("XDG_DATA_HOME").filter(|root| !root.is_empty()) {
+        return PathBuf::from(root).join("mycelium");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("mycelium");
+    }
+    std::env::temp_dir().join("mycelium")
+}
+
+fn ensure_private_parent(parent: &Path) -> Result<(), io::Error> {
+    let private_root = private_data_root();
+    if parent.starts_with(&private_root) {
+        ensure_private_dir(&private_root)?;
+        let instances = private_root.join("instances");
+        ensure_private_dir(&instances)?;
+        ensure_private_dir(parent)
+    } else {
+        fs::create_dir_all(parent)
+    }
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), io::Error> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+fn set_private_file(path: &Path) -> Result<(), io::Error> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
 }
 
 fn instance_directory(instance_id: &str) -> String {
@@ -385,6 +446,8 @@ fn instance_directory(instance_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -520,5 +583,26 @@ mod tests {
     fn unsafe_instance_ids_cannot_escape_the_temp_root() {
         assert_eq!(instance_directory("../../node"), "%2E%2E%2F%2E%2E%2Fnode");
         assert_eq!(instance_directory("normal-node_1"), "normal-node_1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_nvs_storage_uses_private_directory_and_file_modes() {
+        let id = format!(
+            "nvs-private-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.load(Ordering::Relaxed)
+        );
+        let mut nvs = VirtualNvs::new(&id).unwrap();
+        assert!(nvs.begin("credentials", false));
+        assert_eq!(nvs.put_string("password", "secret"), 6);
+        let path = nvs.backing_path().to_owned();
+        let instance_dir = path.parent().unwrap().to_owned();
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let directory_mode = fs::metadata(&instance_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(directory_mode, 0o700);
+        drop(nvs);
+        fs::remove_dir_all(instance_dir).unwrap();
     }
 }

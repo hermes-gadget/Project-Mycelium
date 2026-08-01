@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -21,8 +22,17 @@ pub const LAUNCHER_OTADATA_ADDRESS: u32 = 0xD000;
 
 static PARTITION_TABLES: LazyLock<Mutex<HashMap<String, SharedVirtualPartitionTable>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static ACTIVE_PARTITION_TABLE: LazyLock<Mutex<VirtualPartitionTable>> =
-    LazyLock::new(|| Mutex::new(VirtualPartitionTable::standalone()));
+
+thread_local! {
+    /// Compatibility state for ESP-IDF APIs which do not carry an instance ID.
+    ///
+    /// The firmware loader activates the table immediately before entering a
+    /// firmware context. Keeping that selection in TLS prevents one concurrent
+    /// firmware call from changing the table observed by another thread. New
+    /// callers should use the instance-explicit APIs instead.
+    static ACTIVE_PARTITION_TABLE: RefCell<VirtualPartitionTable> =
+        RefCell::new(VirtualPartitionTable::standalone());
+}
 
 pub type SharedVirtualPartitionTable = Arc<Mutex<VirtualPartitionTable>>;
 
@@ -230,7 +240,7 @@ pub fn activate_partition_table(instance_id: &str) -> bool {
 }
 
 pub fn active_partition_table() -> VirtualPartitionTable {
-    lock(&ACTIVE_PARTITION_TABLE).clone()
+    ACTIVE_PARTITION_TABLE.with(|table| table.borrow().clone())
 }
 
 pub fn remove_partition_table(instance_id: &str) -> Option<SharedVirtualPartitionTable> {
@@ -238,7 +248,8 @@ pub fn remove_partition_table(instance_id: &str) -> Option<SharedVirtualPartitio
 }
 
 fn activate_table(table: &SharedVirtualPartitionTable) {
-    *lock(&ACTIVE_PARTITION_TABLE) = lock(table).clone();
+    let table = lock(table).clone();
+    ACTIVE_PARTITION_TABLE.with(|active| *active.borrow_mut() = table);
 }
 
 #[cfg(test)]
@@ -342,6 +353,31 @@ mod tests {
         );
         assert!(activate_partition_table(second));
         assert!(active_partition_table().is_under_launcher());
+
+        remove_partition_table(first);
+        remove_partition_table(second);
+    }
+
+    #[test]
+    fn active_table_selection_is_isolated_between_threads() {
+        let first = "partition-thread-standalone";
+        let second = "partition-thread-launcher";
+        register_partition_table(first, false);
+        register_partition_table(second, true);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert!(activate_partition_table(first));
+                assert_eq!(
+                    active_partition_table().otadata_address(),
+                    Some(STANDALONE_OTADATA_ADDRESS)
+                );
+            });
+            scope.spawn(|| {
+                assert!(activate_partition_table(second));
+                assert!(active_partition_table().is_under_launcher());
+            });
+        });
 
         remove_partition_table(first);
         remove_partition_table(second);

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 
 pub const GT911_I2C_ADDRESS: u8 = 0x5d;
@@ -34,10 +35,23 @@ struct FailureConfiguration {
     phantom_latch: bool,
 }
 
+impl FailureConfiguration {
+    fn set(&mut self, mode: u8, value: u32) -> bool {
+        match mode {
+            GT911_FAILURE_MODE_BUS => self.i2c_failure_rate = value.min(100) as u8,
+            GT911_FAILURE_MODE_FRAME_STALL => self.frame_stall_ms = value,
+            GT911_FAILURE_MODE_PHANTOM_LATCH => self.phantom_latch = value != 0,
+            _ => return false,
+        }
+        true
+    }
+}
+
 #[derive(Default)]
 struct ControllerRegistry {
-    configuration: FailureConfiguration,
-    controllers: Vec<Weak<Mutex<Gt911Controller>>>,
+    global_configuration: FailureConfiguration,
+    instance_configurations: HashMap<String, FailureConfiguration>,
+    controllers: Vec<(String, Weak<Mutex<Gt911Controller>>)>,
 }
 
 static CONTROLLERS: LazyLock<Mutex<ControllerRegistry>> =
@@ -447,36 +461,71 @@ impl Default for Gt911Controller {
     }
 }
 
-/// Construct and register a shared controller for global FFI failure controls.
+/// Construct a legacy controller for the broadcast compatibility API.
 pub fn new_shared_gt911() -> SharedGt911 {
+    new_shared_gt911_for_instance("__legacy__")
+}
+
+/// Construct and register a controller whose failure configuration belongs to
+/// one virtual input instance.
+pub fn new_shared_gt911_for_instance(instance_id: &str) -> SharedGt911 {
     let mut registry = lock(&CONTROLLERS);
-    let configuration = registry.configuration;
+    let configuration = registry
+        .instance_configurations
+        .get(instance_id)
+        .copied()
+        .unwrap_or(registry.global_configuration);
     let mut controller = Gt911Controller::new();
     controller.set_i2c_failure_rate(configuration.i2c_failure_rate);
     controller.set_frame_stall_ms(configuration.frame_stall_ms);
     controller.set_phantom_latch(configuration.phantom_latch);
     let controller = Arc::new(Mutex::new(controller));
-    registry.controllers.push(Arc::downgrade(&controller));
+    registry
+        .controllers
+        .push((instance_id.to_owned(), Arc::downgrade(&controller)));
     controller
+}
+
+/// Apply one failure mode only to one instance's live and future controllers.
+pub fn set_failure_mode_for_instance(instance_id: &str, mode: u8, value: u32) {
+    let controllers = {
+        let mut registry = lock(&CONTROLLERS);
+        let mut configuration = registry
+            .instance_configurations
+            .get(instance_id)
+            .copied()
+            .unwrap_or(registry.global_configuration);
+        if !configuration.set(mode, value) {
+            return;
+        }
+        registry
+            .instance_configurations
+            .insert(instance_id.to_owned(), configuration);
+        live_controllers(&mut registry)
+            .into_iter()
+            .filter_map(|(controller_instance, controller)| {
+                (controller_instance == instance_id).then_some(controller)
+            })
+            .collect::<Vec<_>>()
+    };
+    for controller in controllers {
+        lock(&controller).apply_failure_mode(mode, value);
+    }
 }
 
 /// Apply one failure mode to all live controllers and to future controllers.
 pub fn set_global_failure_mode(mode: u8, value: u32) {
     let controllers = {
         let mut registry = lock(&CONTROLLERS);
-        match mode {
-            GT911_FAILURE_MODE_BUS => {
-                registry.configuration.i2c_failure_rate = value.min(100) as u8;
-            }
-            GT911_FAILURE_MODE_FRAME_STALL => registry.configuration.frame_stall_ms = value,
-            GT911_FAILURE_MODE_PHANTOM_LATCH => {
-                registry.configuration.phantom_latch = value != 0;
-            }
-            _ => return,
+        if !registry.global_configuration.set(mode, value) {
+            return;
+        }
+        for configuration in registry.instance_configurations.values_mut() {
+            configuration.set(mode, value);
         }
         live_controllers(&mut registry)
     };
-    for controller in controllers {
+    for (_, controller) in controllers {
         lock(&controller).apply_failure_mode(mode, value);
     }
 }
@@ -486,6 +535,22 @@ pub fn global_watchdog_status() -> u64 {
     let controllers = {
         let mut registry = lock(&CONTROLLERS);
         live_controllers(&mut registry)
+    };
+    controllers.iter().fold(0, |status, (_, controller)| {
+        status | lock(controller).watchdog_status()
+    })
+}
+
+/// Return sticky watchdog flags for one instance only.
+pub fn watchdog_status_for_instance(instance_id: &str) -> u64 {
+    let controllers = {
+        let mut registry = lock(&CONTROLLERS);
+        live_controllers(&mut registry)
+            .into_iter()
+            .filter_map(|(controller_instance, controller)| {
+                (controller_instance == instance_id).then_some(controller)
+            })
+            .collect::<Vec<_>>()
     };
     controllers.iter().fold(0, |status, controller| {
         status | lock(controller).watchdog_status()
@@ -498,16 +563,16 @@ pub fn tick_all_gt911(now_ms: u64) {
         let mut registry = lock(&CONTROLLERS);
         live_controllers(&mut registry)
     };
-    for controller in controllers {
+    for (_, controller) in controllers {
         lock(&controller).tick(now_ms);
     }
 }
 
-fn live_controllers(registry: &mut ControllerRegistry) -> Vec<SharedGt911> {
+fn live_controllers(registry: &mut ControllerRegistry) -> Vec<(String, SharedGt911)> {
     let mut controllers = Vec::with_capacity(registry.controllers.len());
-    registry.controllers.retain(|controller| {
+    registry.controllers.retain(|(instance_id, controller)| {
         if let Some(controller) = controller.upgrade() {
-            controllers.push(controller);
+            controllers.push((instance_id.clone(), controller));
             true
         } else {
             false
@@ -710,5 +775,29 @@ mod tests {
         controller.i2c_read(GT911_STATUS_REGISTER, &mut status);
         assert_eq!(status[0], 0x80);
         assert_eq!(controller.watchdog_status(), 0);
+    }
+
+    #[test]
+    fn instance_failure_injection_does_not_affect_other_controllers() {
+        let first = new_shared_gt911_for_instance("gt911-failure-first");
+        let second = new_shared_gt911_for_instance("gt911-failure-second");
+        set_failure_mode_for_instance("gt911-failure-first", GT911_FAILURE_MODE_BUS, 100);
+
+        lock(&first).inject_touch(10, 20, true);
+        lock(&second).inject_touch(10, 20, true);
+        let mut status = [0];
+        for _ in 0..8 {
+            assert_eq!(lock(&first).i2c_read(GT911_STATUS_REGISTER, &mut status), 0);
+            assert_ne!(
+                lock(&second).i2c_read(GT911_STATUS_REGISTER, &mut status),
+                0
+            );
+        }
+
+        assert_eq!(
+            watchdog_status_for_instance("gt911-failure-first"),
+            GT911_STATUS_BUS_WATCHDOG_FIRED
+        );
+        assert_eq!(watchdog_status_for_instance("gt911-failure-second"), 0);
     }
 }
