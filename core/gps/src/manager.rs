@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::f64::consts::PI;
 
-use chrono::Utc;
+use chrono::DateTime;
 
 use crate::nmea::GpsState;
 
@@ -13,16 +13,21 @@ const EPOCH_MS: u64 = 1_000;
 pub const GPS_BAUD_RATE: u32 = 9_600;
 /// Alternate L76K baud rate used by the real receiver's baud cycling.
 pub const GPS_BAUD_RATE_FAST: u32 = 38_400;
-/// Lowest baud rate accepted by [`GpsManager::set_baud_rate`].
-pub const MIN_GPS_BAUD_RATE: u32 = 4_800;
-/// Highest baud rate accepted by [`GpsManager::set_baud_rate`].
-pub const MAX_GPS_BAUD_RATE: u32 = 115_200;
+/// The only UART rates accepted by the L76K model.
+pub const SUPPORTED_GPS_BAUD_RATES: [u32; 2] = [GPS_BAUD_RATE, GPS_BAUD_RATE_FAST];
 /// L76K UART TX pin on the emulated board.
 pub const GPS_TX_PIN: u8 = 43;
 /// L76K UART RX pin on the emulated board.
 pub const GPS_RX_PIN: u8 = 44;
 /// 9600 baud with 8N1 framing transfers approximately 960 bytes per second.
 pub const UART_BYTES_PER_SECOND: usize = GPS_BAUD_RATE as usize / 10;
+
+/// Maximum GPX document accepted by the public movement configuration API.
+pub const MAX_GPX_XML_BYTES: usize = 1_048_576;
+/// Maximum number of track points accepted by the public movement configuration API.
+pub const MAX_GPX_TRACK_POINTS: usize = 100_000;
+
+const MAX_NMEA_BUFFER_BYTES: usize = 8 * 1024;
 
 /// Bytes transferred per second at `baud_rate` with 8N1 framing.
 pub fn uart_bytes_per_second(baud_rate: u32) -> usize {
@@ -102,7 +107,7 @@ impl GpsManager {
     /// Reconfiguring restarts output at a sentence boundary, matching a
     /// receiver restart.
     pub fn set_baud_rate(&mut self, baud_rate: u32) -> bool {
-        if !(MIN_GPS_BAUD_RATE..=MAX_GPS_BAUD_RATE).contains(&baud_rate) {
+        if !SUPPORTED_GPS_BAUD_RATES.contains(&baud_rate) {
             return false;
         }
         if self.baud_rate != baud_rate {
@@ -118,6 +123,66 @@ impl GpsManager {
     /// fall back to the system clock.  Useful for reproducible tests.
     pub fn set_time(&mut self, unix_seconds: Option<i64>) {
         self.state.set_fixed_time(unix_seconds);
+    }
+
+    /// Select the static movement model.
+    pub fn set_static(&mut self) {
+        self.set_movement(MovementModel::Static);
+    }
+
+    /// Configure a validated constant-speed movement model.
+    pub fn set_linear(&mut self, speed_ms: f64, heading_deg: f64) -> bool {
+        if !speed_ms.is_finite() || speed_ms < 0.0 || !heading_deg.is_finite() {
+            return false;
+        }
+        self.set_movement(MovementModel::Linear {
+            speed_ms,
+            heading_deg,
+        });
+        true
+    }
+
+    /// Configure a validated, non-looping waypoint movement model.
+    pub fn set_waypoints(&mut self, points: Vec<(f64, f64)>, speed_ms: f64) -> bool {
+        if points.is_empty()
+            || points.len() > MAX_GPX_TRACK_POINTS
+            || !speed_ms.is_finite()
+            || speed_ms < 0.0
+            || points.iter().any(|&(lat, lon)| !valid_position(lat, lon))
+        {
+            return false;
+        }
+        self.set_movement(MovementModel::Waypoint {
+            points,
+            speed_ms,
+            current_idx: 0,
+        });
+        true
+    }
+
+    /// Configure a validated GPX replay from parsed track points.
+    pub fn set_gpx_replay(&mut self, points: Vec<GpxTrackPoint>, speed_multiplier: f64) -> bool {
+        if points.is_empty()
+            || points.len() > MAX_GPX_TRACK_POINTS
+            || !speed_multiplier.is_finite()
+            || speed_multiplier <= 0.0
+            || points
+                .iter()
+                .any(|point| !valid_position(point.latitude, point.longitude))
+        {
+            return false;
+        }
+        self.set_movement(MovementModel::GpxReplayWithTimestamps {
+            points,
+            speed_multiplier,
+            current_idx: 0,
+        });
+        true
+    }
+
+    /// Parse and configure a GPX replay, returning `false` for invalid input.
+    pub fn set_gpx_replay_xml(&mut self, xml: &str, speed_multiplier: f64) -> bool {
+        parse_gpx(xml).is_ok_and(|points| self.set_gpx_replay(points, speed_multiplier))
     }
 
     pub fn baud_rate(&self) -> u32 {
@@ -265,12 +330,10 @@ impl GpsManager {
             return;
         }
 
-        for _ in 0..elapsed_epochs {
-            self.enqueue_epoch();
-        }
-        self.uart_bytes_remaining = usize::try_from(elapsed_epochs)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(uart_bytes_per_second(self.baud_rate));
+        // Movement is advanced by the complete delta above. Emit only the
+        // latest epoch rather than replaying every skipped second; this keeps
+        // a large FFI tick bounded and avoids queuing duplicate snapshots.
+        self.enqueue_latest_epoch();
     }
 
     /// Read bytes already emitted during the current NMEA epoch.
@@ -297,17 +360,23 @@ impl GpsManager {
         len
     }
 
-    fn enqueue_epoch(&mut self) {
-        let now = Utc::now();
-        self.sentence_buffer
-            .extend(self.state.generate_gga_at(now).bytes());
-        self.sentence_buffer
-            .extend(self.state.generate_rmc_at(now).bytes());
-        self.sentence_buffer
-            .extend(self.state.generate_gsa().bytes());
+    fn enqueue_latest_epoch(&mut self) {
+        let mut epoch = Vec::new();
+        // The no-argument generators use GpsState's selected clock, including
+        // a timestamp pinned through set_time().
+        epoch.extend(self.state.generate_gga().bytes());
+        epoch.extend(self.state.generate_rmc().bytes());
+        epoch.extend(self.state.generate_gsa().bytes());
         for sentence in self.state.generate_gsv() {
-            self.sentence_buffer.extend(sentence.bytes());
+            epoch.extend(sentence.bytes());
         }
+        epoch.truncate(MAX_NMEA_BUFFER_BYTES);
+        self.sentence_buffer.clear();
+        self.sentence_buffer.extend(epoch);
+        self.uart_bytes_remaining = self
+            .sentence_buffer
+            .len()
+            .min(uart_bytes_per_second(self.baud_rate));
     }
 
     fn sync_enabled_state(&mut self) {
@@ -322,6 +391,164 @@ impl GpsManager {
         self.epoch_elapsed_ms = 0;
         self.uart_bytes_remaining = 0;
     }
+}
+
+/// Parse the track points from a GPX document.
+///
+/// The public bridge accepts GPX as a bounded UTF-8 document rather than a
+/// host path.  This parser intentionally accepts the GPX track-point shape
+/// used by common exporters (`<trkpt lat="..." lon="...">`) and rejects
+/// missing, malformed, or out-of-range values before they reach the movement
+/// model.
+pub fn parse_gpx(xml: &str) -> Result<Vec<GpxTrackPoint>, &'static str> {
+    if xml.is_empty() || xml.len() > MAX_GPX_XML_BYTES {
+        return Err("GPX document is empty or too large");
+    }
+    if find_element_start(xml, "gpx", 0).is_none() {
+        return Err("GPX root element is missing");
+    }
+
+    let mut points = Vec::new();
+    let mut cursor = 0;
+    let close_tag = "</trkpt>";
+    while let Some(point_start) = find_element_start(xml, "trkpt", cursor) {
+        let open_end = xml[point_start..]
+            .find('>')
+            .map(|offset| point_start + offset)
+            .ok_or("GPX track point has no closing tag")?;
+        let opening = &xml[point_start + 1..open_end];
+        let lat = xml_attribute(opening, "lat")
+            .ok_or("GPX track point latitude is missing")?
+            .parse::<f64>()
+            .map_err(|_| "GPX track point latitude is invalid")?;
+        let lon = xml_attribute(opening, "lon")
+            .ok_or("GPX track point longitude is missing")?
+            .parse::<f64>()
+            .map_err(|_| "GPX track point longitude is invalid")?;
+        if !valid_position(lat, lon) {
+            return Err("GPX track point position is out of range");
+        }
+
+        let (content, next_cursor) = if opening.trim_end().ends_with('/') {
+            ("", open_end + 1)
+        } else {
+            let close_start = xml[open_end + 1..]
+                .find(close_tag)
+                .map(|offset| open_end + 1 + offset)
+                .ok_or("GPX track point is not closed")?;
+            (
+                &xml[open_end + 1..close_start],
+                close_start + close_tag.len(),
+            )
+        };
+        let timestamp_ms = match xml_element_text(content, "time")? {
+            Some(value) if !value.is_empty() => Some(
+                DateTime::parse_from_rfc3339(value)
+                    .map_err(|_| "GPX track point timestamp is invalid")?
+                    .timestamp_millis(),
+            ),
+            Some(_) => return Err("GPX track point timestamp is empty"),
+            None => None,
+        };
+
+        if points.len() >= MAX_GPX_TRACK_POINTS {
+            return Err("GPX track has too many points");
+        }
+        points.push(GpxTrackPoint {
+            latitude: lat,
+            longitude: lon,
+            timestamp_ms,
+        });
+        cursor = next_cursor;
+    }
+
+    if points.is_empty() {
+        return Err("GPX track has no track points");
+    }
+    Ok(points)
+}
+
+fn valid_position(lat: f64, lon: f64) -> bool {
+    lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
+}
+
+fn find_element_start(xml: &str, name: &str, from: usize) -> Option<usize> {
+    let needle = format!("<{name}");
+    let mut search = from;
+    while let Some(offset) = xml[search..].find(&needle) {
+        let start = search + offset;
+        let boundary = xml.as_bytes().get(start + needle.len()).copied();
+        if boundary.is_some_and(|byte| byte.is_ascii_whitespace() || byte == b'>' || byte == b'/') {
+            return Some(start);
+        }
+        search = start + needle.len();
+    }
+    None
+}
+
+fn xml_attribute<'a>(opening: &'a str, wanted: &str) -> Option<&'a str> {
+    let bytes = opening.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b'/') {
+            index += 1;
+        }
+        let key_start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && bytes[index] != b'='
+            && bytes[index] != b'/'
+        {
+            index += 1;
+        }
+        let key_end = index;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'=' {
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || !matches!(bytes[index], b'"' | b'\'') {
+            return None;
+        }
+        let quote = bytes[index];
+        index += 1;
+        let value_start = index;
+        while index < bytes.len() && bytes[index] != quote {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        if &opening[key_start..key_end] == wanted {
+            return Some(&opening[value_start..index]);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn xml_element_text<'a>(content: &'a str, name: &str) -> Result<Option<&'a str>, &'static str> {
+    let Some(start) = find_element_start(content, name, 0) else {
+        return Ok(None);
+    };
+    let open_end = content[start..]
+        .find('>')
+        .map(|offset| start + offset)
+        .ok_or("GPX element has no closing tag")?;
+    let close_tag = format!("</{name}>");
+    let close_start = content[open_end + 1..]
+        .find(&close_tag)
+        .map(|offset| open_end + 1 + offset)
+        .ok_or("GPX element is not closed")?;
+    Ok(Some(content[open_end + 1..close_start].trim()))
 }
 
 fn advance_timestamped_replay(
@@ -572,12 +799,69 @@ mod tests {
         let mut manager = GpsManager::new(51.5, -0.1);
         assert_eq!(manager.baud_rate(), GPS_BAUD_RATE);
 
-        assert!(manager.set_baud_rate(GPS_BAUD_RATE_FAST));
+        for (baud_rate, accepted) in [
+            (9_600, true),
+            (38_400, true),
+            (4_800, false),
+            (19_200, false),
+            (115_200, false),
+            (0, false),
+            (1_000_000, false),
+        ] {
+            assert_eq!(manager.set_baud_rate(baud_rate), accepted, "{baud_rate}");
+        }
         assert_eq!(manager.baud_rate(), GPS_BAUD_RATE_FAST);
         assert!(manager.set_baud_rate(GPS_BAUD_RATE));
-        assert!(!manager.set_baud_rate(0));
-        assert!(!manager.set_baud_rate(1_000_000));
         assert_eq!(manager.baud_rate(), GPS_BAUD_RATE);
+    }
+
+    #[test]
+    fn set_time_controls_streamed_gga_and_rmc_timestamps() {
+        let mut manager = GpsManager::new(51.5, -0.1);
+        manager.set_time(Some(764_426_119));
+        manager.tick(1_000);
+
+        let output = String::from_utf8(drain_epoch(&mut manager, 256)).unwrap();
+        let mut lines = output.lines();
+        let gga = lines.next().unwrap();
+        let rmc = lines.next().unwrap();
+        assert_eq!(gga.split(',').nth(1), Some("123519"));
+        assert_eq!(rmc.split(',').nth(1), Some("123519"));
+        assert_eq!(rmc.split(',').nth(9), Some("230394"));
+    }
+
+    #[test]
+    fn extreme_tick_coalesces_to_one_bounded_epoch() {
+        let mut manager = GpsManager::new(51.5, -0.1);
+        manager.tick(u64::MAX);
+
+        let output = String::from_utf8(drain_epoch(&mut manager, 256)).unwrap();
+        assert_eq!(output.matches("$GPGGA,").count(), 1);
+        assert_eq!(output.matches("$GPRMC,").count(), 1);
+        assert_eq!(manager.read(&mut [0_u8; 1]), 0);
+    }
+
+    #[test]
+    fn parses_and_configures_timestamped_gpx_replay() {
+        let xml = r#"<gpx version="1.1"><trk><trkseg>
+            <trkpt lat="51.5" lon="-0.1"><time>1994-03-23T12:35:19Z</time></trkpt>
+            <trkpt lat="51.5" lon="-0.2"><time>1994-03-23T12:35:20Z</time></trkpt>
+        </trkseg></trk></gpx>"#;
+        let points = parse_gpx(xml).unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].timestamp_ms, Some(764_426_119_000));
+
+        let mut manager = GpsManager::new(0.0, 0.0);
+        assert!(manager.set_gpx_replay_xml(xml, 1.0));
+        manager.tick(1_000);
+        assert_eq!(
+            (manager.state().latitude, manager.state().longitude),
+            (51.5, -0.2)
+        );
+
+        assert!(parse_gpx("<gpx/>").is_err());
+        assert!(parse_gpx("<gpx><trkpt lat=\"91\" lon=\"0\"/></gpx>").is_err());
+        assert!(!manager.set_gpx_replay_xml(xml, 0.0));
     }
 
     #[test]
