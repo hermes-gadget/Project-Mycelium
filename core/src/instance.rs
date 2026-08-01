@@ -79,6 +79,33 @@ pub struct InstanceInfo {
     pub has_display: bool,
 }
 
+/// The one monotonic clock used by the core runtime.
+///
+/// The value is an absolute simulation timestamp. Callers advance it once per
+/// frame and pass the returned value to every absolute-time consumer; the
+/// corresponding delta is used only for subsystems whose public API is
+/// explicitly delta-based, such as the GPS manager.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SimulationClock {
+    now_ms: u64,
+}
+
+impl SimulationClock {
+    pub fn now_ms(self) -> u64 {
+        self.now_ms
+    }
+
+    pub fn advance_by(&mut self, delta_ms: u64) -> u64 {
+        self.now_ms = self.now_ms.saturating_add(delta_ms);
+        self.now_ms
+    }
+
+    pub fn advance_to(&mut self, now_ms: u64) -> u64 {
+        self.now_ms = self.now_ms.max(now_ms);
+        self.now_ms
+    }
+}
+
 pub struct Instance {
     firmware: FirmwareInstance,
     storage: StorageManager,
@@ -87,6 +114,40 @@ pub struct Instance {
     buzzer: SharedVirtualBuzzer,
     nvs: SharedVirtualNvs,
     partition_table: SharedVirtualPartitionTable,
+    resources: InstanceResourceRegistry,
+}
+
+/// Owns the registrations created for one manager instance and centralizes
+/// teardown ordering. Firmware is stopped before the host-side registries are
+/// removed, so a firmware destroy hook can release its handles while their
+/// backing instance identity is still valid.
+struct InstanceResourceRegistry {
+    id: String,
+    host_resources_registered: bool,
+    firmware_stopped: bool,
+}
+
+impl InstanceResourceRegistry {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            host_resources_registered: true,
+            firmware_stopped: false,
+        }
+    }
+
+    fn teardown(&mut self, firmware: &mut FirmwareInstance) {
+        if !self.firmware_stopped {
+            firmware.stop();
+            self.firmware_stopped = true;
+        }
+        if self.host_resources_registered {
+            remove_buzzer(&self.id);
+            remove_nvs(&self.id);
+            remove_partition_table(&self.id);
+            self.host_resources_registered = false;
+        }
+    }
 }
 
 struct InstancePeripherals {
@@ -145,12 +206,13 @@ impl Instance {
             buzzer: peripherals.buzzer,
             nvs: peripherals.nvs,
             partition_table: peripherals.partition_table,
+            resources: InstanceResourceRegistry::new(id),
         })
     }
 
-    fn start(&mut self) {
+    fn start(&mut self) -> Result<()> {
         activate_partition_table(self.firmware.name());
-        self.firmware.start();
+        self.firmware.start()
     }
 
     fn tick(&mut self, delta_ms: u64) {
@@ -212,15 +274,14 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        remove_buzzer(self.firmware.name());
-        remove_nvs(self.firmware.name());
-        remove_partition_table(self.firmware.name());
+        self.resources.teardown(&mut self.firmware);
     }
 }
 
 pub struct InstanceManager {
     instances: HashMap<String, Instance>,
     next_id: u64,
+    clock: SimulationClock,
 }
 
 impl InstanceManager {
@@ -228,6 +289,7 @@ impl InstanceManager {
         Self {
             instances: HashMap::new(),
             next_id: 1,
+            clock: SimulationClock::default(),
         }
     }
 
@@ -247,7 +309,13 @@ impl InstanceManager {
         }
 
         let mut instance = Instance::create(&id, firmware_path, &config)?;
-        instance.start();
+        if !instance.firmware.is_contextful() && !self.instances.is_empty() {
+            bail!(
+                "multiple firmware instances require the contextful v2 ABI; {} exports the legacy v1 ABI",
+                firmware_path.display()
+            );
+        }
+        instance.start()?;
         self.instances.insert(id.clone(), instance);
         Ok(id)
     }
@@ -261,14 +329,35 @@ impl InstanceManager {
 
     /// Advances all instances by the legacy one-millisecond emulator step.
     pub fn tick_all(&mut self) {
-        self.tick_all_with_delta(1);
+        let _ = self.tick_all_with_delta(1);
     }
 
-    /// Advances all instances and their time-based peripherals.
-    pub fn tick_all_with_delta(&mut self, delta_ms: u64) {
+    /// Advances the central simulation clock and all instances by one delta.
+    ///
+    /// The returned value is the new absolute simulation timestamp and should
+    /// be supplied to `meshemu_bus_tick` for the same frame.
+    pub fn tick_all_with_delta(&mut self, delta_ms: u64) -> u64 {
+        let now_ms = self.clock.advance_by(delta_ms);
+        self.tick_instances(delta_ms);
+        now_ms
+    }
+
+    /// Advances all instances to an absolute timestamp from the central
+    /// runtime clock. Backward timestamps are ignored, matching the bus clock.
+    pub fn tick_all_at(&mut self, now_ms: u64) {
+        let previous = self.clock.now_ms();
+        let now_ms = self.clock.advance_to(now_ms);
+        self.tick_instances(now_ms.saturating_sub(previous));
+    }
+
+    fn tick_instances(&mut self, delta_ms: u64) {
         for instance in self.instances.values_mut() {
             instance.tick(delta_ms);
         }
+    }
+
+    pub fn simulation_now_ms(&self) -> u64 {
+        self.clock.now_ms()
     }
 
     pub fn list(&self) -> Vec<InstanceInfo> {

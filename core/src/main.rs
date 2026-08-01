@@ -15,6 +15,8 @@ use tracing_subscriber::EnvFilter;
 
 /// Firmware API version required by this build of Mycelium.
 const REQUIRED_FIRMWARE_API_VERSION: u32 = 1;
+const CONTEXTFUL_FIRMWARE_API_VERSION: u32 = 2;
+const FRAME_INTERVAL_MS: u64 = 16;
 
 #[derive(Debug, Parser)]
 #[command(name = "meshemu", version, about = "T-Deck + Mesh emulator")]
@@ -36,6 +38,10 @@ enum Command {
         /// Skip SDL2 display — useful for headless CI / server runs.
         #[arg(long, default_value_t = false)]
         headless: bool,
+        /// Permit a known-incompatible firmware API version for deliberate
+        /// compatibility testing. The default is fail-closed.
+        #[arg(long, default_value_t = false)]
+        allow_incompatible_api: bool,
     },
     /// Serve the emulator API (requires the web GUI feature).
     Serve,
@@ -61,7 +67,8 @@ async fn main() -> Result<()> {
             firmware,
             nodes,
             headless,
-        } => run(firmware, nodes, headless).await?,
+            allow_incompatible_api,
+        } => run(firmware, nodes, headless, allow_incompatible_api).await?,
         Command::Serve => {
             println!("serve: the web GUI is planned — see gui/README.md for details");
         }
@@ -81,8 +88,7 @@ fn test_firmware(firmware: &PathBuf) -> Result<()> {
     );
 
     let instance = FirmwareInstance::load("test-probe", firmware)?;
-    println!("✓ firmware_setup     — present");
-    println!("✓ firmware_loop      — present");
+    println!("✓ firmware lifecycle — {}", instance.abi_name());
 
     let version = verify_firmware_api_version(firmware)?;
     if let Some(v) = version {
@@ -117,16 +123,21 @@ fn verify_firmware_api_version(firmware: &PathBuf) -> Result<Option<u32>> {
                 Err(_) => return Ok(None), // symbol optional for backwards compat
             };
         let version = version_fn();
-        if version != REQUIRED_FIRMWARE_API_VERSION {
+        if version != REQUIRED_FIRMWARE_API_VERSION && version != CONTEXTFUL_FIRMWARE_API_VERSION {
             anyhow::bail!(
-                "firmware API version {version} is incompatible with this Mycelium build (requires v{REQUIRED_FIRMWARE_API_VERSION})"
+                "firmware API version {version} is incompatible with this Mycelium build (supports v{REQUIRED_FIRMWARE_API_VERSION} legacy and v{CONTEXTFUL_FIRMWARE_API_VERSION} contextful ABI)"
             );
         }
         Ok(Some(version))
     }
 }
 
-async fn run(firmware: PathBuf, nodes: usize, headless: bool) -> Result<()> {
+async fn run(
+    firmware: PathBuf,
+    nodes: usize,
+    headless: bool,
+    allow_incompatible_api: bool,
+) -> Result<()> {
     ensure!(nodes > 0, "--nodes must be at least 1");
     ensure!(
         firmware.is_file(),
@@ -134,9 +145,15 @@ async fn run(firmware: PathBuf, nodes: usize, headless: bool) -> Result<()> {
         firmware.display()
     );
 
-    // Warn on API version mismatch but don't block (backwards compat).
+    // Fail closed on an explicitly incompatible ABI. Deliberate compatibility
+    // testing can opt into the old behavior with an explicit flag.
     if let Err(e) = verify_firmware_api_version(&firmware) {
-        warn!(%e, "firmware API version check failed");
+        if !allow_incompatible_api {
+            return Err(e.context(
+                "refusing to run incompatible firmware; pass --allow-incompatible-api only for deliberate testing",
+            ));
+        }
+        warn!(%e, "running firmware with an explicitly allowed incompatible API version");
     }
 
     let mut manager = InstanceManager::new();
@@ -175,9 +192,8 @@ async fn run(firmware: PathBuf, nodes: usize, headless: bool) -> Result<()> {
         info!("running headless ({} node(s))", nodes);
     }
 
-    let mut ticker = tokio::time::interval(Duration::from_millis(16));
+    let mut ticker = tokio::time::interval(Duration::from_millis(FRAME_INTERVAL_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_tick = std::time::Instant::now();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
@@ -189,10 +205,11 @@ async fn run(firmware: PathBuf, nodes: usize, headless: bool) -> Result<()> {
                 break;
             }
             _ = ticker.tick() => {
-                let elapsed = last_tick.elapsed().as_millis() as u64;
-                last_tick = std::time::Instant::now();
-                manager.tick_all_with_delta(16);
-                meshemu_bus_tick(elapsed);
+                // `meshemu_bus_tick` consumes an absolute monotonic timestamp,
+                // not a per-frame delta. Advance the one simulation clock once
+                // and feed the same timestamp to every time-based subsystem.
+                let sim_now_ms = manager.tick_all_with_delta(FRAME_INTERVAL_MS);
+                meshemu_bus_tick(sim_now_ms);
                 if let Some(displays) = display_manager.as_mut() {
                     for instance_id in displays.list_windows() {
                         let Some(pixels) = manager
@@ -237,4 +254,65 @@ async fn run(firmware: PathBuf, nodes: usize, headless: bool) -> Result<()> {
     }
     info!("all firmware instances stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mycelium_core::instance::SimulationClock;
+
+    #[test]
+    fn executable_frame_clock_accumulates_across_multiple_frames() {
+        let mut clock = SimulationClock::default();
+
+        assert_eq!(clock.advance_by(FRAME_INTERVAL_MS), 16);
+        assert_eq!(clock.advance_by(FRAME_INTERVAL_MS), 32);
+        assert_eq!(clock.advance_by(FRAME_INTERVAL_MS), 48);
+        assert_eq!(clock.now_ms(), 48);
+    }
+
+    #[test]
+    fn executable_frame_loop_feeds_cumulative_time_to_radio_bus() {
+        use std::ffi::CString;
+
+        let id = CString::new(format!("frame-clock-test-{}", std::process::id())).unwrap();
+        // SAFETY: all arguments are valid for the duration of this call and
+        // the returned handle is destroyed exactly once below.
+        let radio = unsafe {
+            meshemu_bridge::meshemu_radio_create(
+                id.as_ptr(),
+                915.0,
+                125,
+                7,
+                5,
+                14.0,
+                51.5074,
+                -0.1278,
+            )
+        };
+        assert!(!radio.is_null());
+
+        let packet = [0x42_u8; 16];
+        // SAFETY: `radio` is the live handle created above and `packet` is a
+        // valid immutable buffer for this call.
+        assert!(unsafe {
+            meshemu_bridge::meshemu_radio_start_send(radio, packet.as_ptr(), packet.len() as u32)
+        });
+
+        let mut clock = SimulationClock::default();
+        for _ in 0..3 {
+            meshemu_bus_tick(clock.advance_by(FRAME_INTERVAL_MS));
+        }
+        // The sixteen-byte LoRa frame takes longer than 48 ms. If the old
+        // per-frame delta bug regresses, all three calls would also leave the
+        // bus at 16 ms and this assertion would stay true forever.
+        assert!(!unsafe { meshemu_bridge::meshemu_radio_is_send_complete(radio) });
+
+        meshemu_bus_tick(clock.advance_by(FRAME_INTERVAL_MS));
+        // SAFETY: `radio` is still live.
+        assert!(unsafe { meshemu_bridge::meshemu_radio_is_send_complete(radio) });
+        // SAFETY: `radio` was returned by the matching create function and is
+        // not used after this call.
+        unsafe { meshemu_bridge::meshemu_radio_destroy(radio) };
+    }
 }
