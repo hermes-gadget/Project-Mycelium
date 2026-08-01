@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CStr};
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -64,6 +66,14 @@ static SD_FILE_HANDLES: LazyLock<Mutex<HashMap<u32, SdFileHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SDCARD_REQUIRES_SLOW_INIT: AtomicBool = AtomicBool::new(false);
 static SDCARD_WAKE_DELAY_MS: AtomicU32 = AtomicU32::new(0);
+// The C ABI exposes opaque pointers, but callers may invoke a handle from
+// more than one host thread. Keep each typed handle family serialized while a
+// guard is alive so no two calls can manufacture aliased Rust references.
+static RADIO_HANDLE_LOCK: Mutex<()> = Mutex::new(());
+static KEYBOARD_HANDLE_LOCK: Mutex<()> = Mutex::new(());
+static WIRE_HANDLE_LOCK: Mutex<()> = Mutex::new(());
+static GPS_HANDLE_LOCK: Mutex<()> = Mutex::new(());
+static BOARD_HANDLE_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -71,31 +81,102 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[track_caller]
-unsafe fn handle_ref<'a>(radio: *mut c_void) -> Option<&'a RadioHandle> {
-    let Some(handle) = (radio as *const RadioHandle).as_ref() else {
-        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling radio handle");
-        return None;
-    };
-    Some(handle)
+struct SharedHandleGuard<'a, T> {
+    pointer: *const T,
+    _lock: MutexGuard<'a, ()>,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<T> Deref for SharedHandleGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // The family lock prevents concurrent mutable access through these
+        // helpers. The raw pointer is only dereferenced for the guard's
+        // lifetime, instead of being turned into an unconstrained `'a` ref.
+        unsafe { &*self.pointer }
+    }
+}
+
+struct MutableHandleGuard<'a, T> {
+    pointer: *mut T,
+    _lock: MutexGuard<'a, ()>,
+    _marker: PhantomData<&'a mut T>,
+}
+
+impl<T> Deref for MutableHandleGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.pointer }
+    }
+}
+
+impl<T> DerefMut for MutableHandleGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.pointer }
+    }
 }
 
 #[track_caller]
-unsafe fn keyboard_ref<'a>(keyboard: *mut c_void) -> Option<&'a SharedI2cKeyboard> {
-    let Some(keyboard) = (unsafe { (keyboard as *const SharedI2cKeyboard).as_ref() }) else {
-        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling keyboard handle");
+fn shared_handle<'a, T>(
+    handle: *mut c_void,
+    family_lock: &'a Mutex<()>,
+    type_name: &str,
+) -> Option<SharedHandleGuard<'a, T>> {
+    let alignment = std::mem::align_of::<T>();
+    if handle.is_null() || !(handle as usize).is_multiple_of(alignment) {
+        warn!(
+            caller = %std::panic::Location::caller(),
+            handle_type = type_name,
+            "FFI call with NULL or invalid opaque handle"
+        );
         return None;
-    };
-    Some(keyboard)
+    }
+    Some(SharedHandleGuard {
+        pointer: handle.cast(),
+        _lock: lock(family_lock),
+        _marker: PhantomData,
+    })
 }
 
 #[track_caller]
-unsafe fn wire_mut<'a>(wire: *mut c_void) -> Option<&'a mut WireShim> {
-    let Some(wire) = (unsafe { (wire as *mut WireShim).as_mut() }) else {
-        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling Wire shim handle");
+fn mutable_handle<'a, T>(
+    handle: *mut c_void,
+    family_lock: &'a Mutex<()>,
+    type_name: &str,
+) -> Option<MutableHandleGuard<'a, T>> {
+    let alignment = std::mem::align_of::<T>();
+    if handle.is_null() || !(handle as usize).is_multiple_of(alignment) {
+        warn!(
+            caller = %std::panic::Location::caller(),
+            handle_type = type_name,
+            "FFI call with NULL or invalid opaque handle"
+        );
         return None;
-    };
-    Some(wire)
+    }
+    Some(MutableHandleGuard {
+        pointer: handle.cast(),
+        _lock: lock(family_lock),
+        _marker: PhantomData,
+    })
+}
+
+#[track_caller]
+unsafe fn handle_ref(radio: *mut c_void) -> Option<SharedHandleGuard<'static, RadioHandle>> {
+    shared_handle(radio, &RADIO_HANDLE_LOCK, "radio")
+}
+
+#[track_caller]
+unsafe fn keyboard_ref(
+    keyboard: *mut c_void,
+) -> Option<SharedHandleGuard<'static, SharedI2cKeyboard>> {
+    shared_handle(keyboard, &KEYBOARD_HANDLE_LOCK, "keyboard")
+}
+
+#[track_caller]
+unsafe fn wire_mut(wire: *mut c_void) -> Option<MutableHandleGuard<'static, WireShim>> {
+    mutable_handle(wire, &WIRE_HANDLE_LOCK, "Wire shim")
 }
 
 #[track_caller]
@@ -154,30 +235,18 @@ fn copy_for_caller(data: &[u8], out_len: *mut usize) -> *mut u8 {
 }
 
 #[track_caller]
-unsafe fn gps_mut<'a>(gps: *mut c_void) -> Option<&'a mut GpsHandle> {
-    let Some(gps) = (unsafe { (gps as *mut GpsHandle).as_mut() }) else {
-        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling GPS handle");
-        return None;
-    };
-    Some(gps)
+unsafe fn gps_mut(gps: *mut c_void) -> Option<MutableHandleGuard<'static, GpsHandle>> {
+    mutable_handle(gps, &GPS_HANDLE_LOCK, "GPS")
 }
 
 #[track_caller]
-unsafe fn board_ref<'a>(board: *mut c_void) -> Option<&'a VirtualBoard> {
-    let Some(board) = (unsafe { (board as *const VirtualBoard).as_ref() }) else {
-        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling board handle");
-        return None;
-    };
-    Some(board)
+unsafe fn board_ref(board: *mut c_void) -> Option<SharedHandleGuard<'static, VirtualBoard>> {
+    shared_handle(board, &BOARD_HANDLE_LOCK, "board")
 }
 
 #[track_caller]
-unsafe fn board_mut<'a>(board: *mut c_void) -> Option<&'a mut VirtualBoard> {
-    let Some(board) = (unsafe { (board as *mut VirtualBoard).as_mut() }) else {
-        warn!(caller = %std::panic::Location::caller(), "FFI call with NULL or dangling board handle");
-        return None;
-    };
-    Some(board)
+unsafe fn board_mut(board: *mut c_void) -> Option<MutableHandleGuard<'static, VirtualBoard>> {
+    mutable_handle(board, &BOARD_HANDLE_LOCK, "board")
 }
 
 #[track_caller]
@@ -791,7 +860,7 @@ pub unsafe extern "C" fn meshemu_gps_create(
 /// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_position(gps: *mut c_void, lat: f64, lon: f64, alt: f64) {
-    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+    let Some(mut gps) = (unsafe { gps_mut(gps) }) else {
         return;
     };
     if valid_position(lat, lon) && alt.is_finite() {
@@ -809,7 +878,7 @@ pub unsafe extern "C" fn meshemu_gps_set_position(gps: *mut c_void, lat: f64, lo
 /// `max_len` writable bytes when `max_len` is positive.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_len: i32) -> i32 {
-    let Some(gps) = (unsafe { gps_mut(gps) }) else {
+    let Some(mut gps) = (unsafe { gps_mut(gps) }) else {
         return 0;
     };
     if buf.is_null() || max_len <= 0 || !peripherals_powered(&gps.instance_id) {
@@ -826,7 +895,7 @@ pub unsafe extern "C" fn meshemu_gps_read(gps: *mut c_void, buf: *mut u8, max_le
 /// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
-    if let Some(gps) = unsafe { gps_mut(gps) } {
+    if let Some(mut gps) = unsafe { gps_mut(gps) } {
         if peripherals_powered(&gps.instance_id) {
             gps.manager.tick(delta_ms);
         }
@@ -840,7 +909,7 @@ pub unsafe extern "C" fn meshemu_gps_tick(gps: *mut c_void, delta_ms: u64) {
 /// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool) {
-    if let Some(gps) = unsafe { gps_mut(gps) } {
+    if let Some(mut gps) = unsafe { gps_mut(gps) } {
         gps.manager.state_mut().enabled = enabled;
     }
 }
@@ -855,7 +924,7 @@ pub unsafe extern "C" fn meshemu_gps_set_enabled(gps: *mut c_void, enabled: bool
 /// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_baud_rate(gps: *mut c_void, baud_rate: u32) -> bool {
-    unsafe { gps_mut(gps) }.is_some_and(|gps| gps.manager.set_baud_rate(baud_rate))
+    unsafe { gps_mut(gps) }.is_some_and(|mut gps| gps.manager.set_baud_rate(baud_rate))
 }
 
 /// Pins the GPS clock to a Unix timestamp for deterministic NMEA replay.
@@ -868,7 +937,7 @@ pub unsafe extern "C" fn meshemu_gps_set_baud_rate(gps: *mut c_void, baud_rate: 
 /// `gps` must be a live GPS handle returned by [`meshemu_gps_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_gps_set_time(gps: *mut c_void, unix_seconds: i64) {
-    if let Some(gps) = unsafe { gps_mut(gps) } {
+    if let Some(mut gps) = unsafe { gps_mut(gps) } {
         gps.manager
             .set_time((unix_seconds > 0).then_some(unix_seconds));
     }
@@ -918,7 +987,7 @@ pub unsafe extern "C" fn meshemu_board_create(
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_get_battery(board: *mut c_void) -> u16 {
     unsafe { board_ref(board) }
-        .map(VirtualBoard::get_battery_mv)
+        .map(|board| board.get_battery_mv())
         .unwrap_or(0)
 }
 
@@ -940,7 +1009,7 @@ pub unsafe extern "C" fn meshemu_board_get_adc(board: *mut c_void, gpio: u8) -> 
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_get_temp(board: *mut c_void) -> f32 {
     unsafe { board_ref(board) }
-        .map(VirtualBoard::get_temperature)
+        .map(|board| board.get_temperature())
         .unwrap_or(0.0)
 }
 
@@ -951,7 +1020,7 @@ pub unsafe extern "C" fn meshemu_board_get_temp(board: *mut c_void) -> f32 {
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_set_mcu_temperature(board: *mut c_void, celsius: f32) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.set_temperature(celsius);
     }
 }
@@ -964,7 +1033,7 @@ pub unsafe extern "C" fn meshemu_board_set_mcu_temperature(board: *mut c_void, c
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_get_mcu_temperature(board: *mut c_void) -> f32 {
     unsafe { board_ref(board) }
-        .map(VirtualBoard::get_temperature)
+        .map(|board| board.get_temperature())
         .unwrap_or(0.0)
 }
 
@@ -1041,7 +1110,7 @@ pub unsafe extern "C" fn meshemu_board_clear_rtc_noinit(instance_id: *const c_ch
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_psram_found(board: *mut c_void) -> bool {
-    unsafe { board_ref(board) }.is_some_and(VirtualBoard::psram_found)
+    unsafe { board_ref(board) }.is_some_and(|board| board.psram_found())
 }
 
 /// Returns bytes still allocatable from the simulated external PSRAM heap.
@@ -1052,7 +1121,7 @@ pub unsafe extern "C" fn meshemu_board_psram_found(board: *mut c_void) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_get_psram_free(board: *mut c_void) -> u32 {
     unsafe { board_ref(board) }
-        .map(VirtualBoard::psram_free_bytes)
+        .map(|board| board.psram_free_bytes())
         .unwrap_or(0)
 }
 
@@ -1063,7 +1132,7 @@ pub unsafe extern "C" fn meshemu_board_get_psram_free(board: *mut c_void) -> u32
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_psram_readback_test(board: *mut c_void) -> bool {
-    unsafe { board_mut(board) }.is_some_and(VirtualBoard::psram_readback_test)
+    unsafe { board_mut(board) }.is_some_and(|mut board| board.psram_readback_test())
 }
 
 /// Reserves simulated PSRAM for a firmware allocation.
@@ -1073,7 +1142,7 @@ pub unsafe extern "C" fn meshemu_board_psram_readback_test(board: *mut c_void) -
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_psram_reserve(board: *mut c_void, bytes: u32) -> bool {
-    unsafe { board_mut(board) }.is_some_and(|board| board.reserve_psram(bytes))
+    unsafe { board_mut(board) }.is_some_and(|mut board| board.reserve_psram(bytes))
 }
 
 /// Releases a previous simulated PSRAM reservation.
@@ -1083,7 +1152,7 @@ pub unsafe extern "C" fn meshemu_board_psram_reserve(board: *mut c_void, bytes: 
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_psram_release(board: *mut c_void, bytes: u32) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.release_psram(bytes);
     }
 }
@@ -1093,7 +1162,7 @@ pub unsafe extern "C" fn meshemu_board_psram_release(board: *mut c_void, bytes: 
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.set_battery(mv);
     }
 }
@@ -1105,7 +1174,7 @@ pub unsafe extern "C" fn meshemu_board_set_battery(board: *mut c_void, mv: u16) 
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_set_adc_calibration(board: *mut c_void, calibrated: bool) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.set_adc_calibration(calibrated);
     }
 }
@@ -1117,7 +1186,7 @@ pub unsafe extern "C" fn meshemu_board_set_adc_calibration(board: *mut c_void, c
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_digital_write(board: *mut c_void, gpio: u8, high: bool) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.digital_write(gpio, high);
     }
 }
@@ -1129,7 +1198,7 @@ pub unsafe extern "C" fn meshemu_board_digital_write(board: *mut c_void, gpio: u
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_set_periph_power(board: *mut c_void, enabled: bool) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.digital_write(mycelium_board::PERIPH_PWR_EN_GPIO, enabled);
     }
 }
@@ -1141,7 +1210,7 @@ pub unsafe extern "C" fn meshemu_board_set_periph_power(board: *mut c_void, enab
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_ledc_attach(board: *mut c_void, channel: u8, gpio: u8) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.ledc_attach(channel, gpio);
     }
 }
@@ -1159,7 +1228,7 @@ pub unsafe extern "C" fn meshemu_board_ledc_write(
     high_time_us: u32,
 ) -> bool {
     unsafe { board_mut(board) }
-        .is_some_and(|board| board.ledc_write(channel, period_us, high_time_us))
+        .is_some_and(|mut board| board.ledc_write(channel, period_us, high_time_us))
 }
 
 /// Updates external-power detection for the TP4054 charger.
@@ -1169,7 +1238,7 @@ pub unsafe extern "C" fn meshemu_board_ledc_write(
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_set_external_power(board: *mut c_void, powered: bool) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.set_external_power(powered);
     }
 }
@@ -1193,7 +1262,7 @@ pub unsafe extern "C" fn meshemu_board_get_charger_state(board: *mut c_void) -> 
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_rtc_gpio_hold(board: *mut c_void, gpio: u8, level: bool) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.rtc_gpio_hold(gpio, level);
     }
 }
@@ -1205,7 +1274,7 @@ pub unsafe extern "C" fn meshemu_board_rtc_gpio_hold(board: *mut c_void, gpio: u
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_set_reset_reason(board: *mut c_void, reason: u8) -> bool {
-    unsafe { board_mut(board) }.is_some_and(|board| board.set_reset_reason(reason))
+    unsafe { board_mut(board) }.is_some_and(|mut board| board.set_reset_reason(reason))
 }
 
 /// Returns the reset cause reported for this emulated ESP32.
@@ -1216,7 +1285,7 @@ pub unsafe extern "C" fn meshemu_board_set_reset_reason(board: *mut c_void, reas
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_get_reset_reason(board: *mut c_void) -> u8 {
     unsafe { board_ref(board) }
-        .map(VirtualBoard::reset_reason)
+        .map(|board| board.reset_reason())
         .unwrap_or(mycelium_board::RESET_REASON_UNKNOWN)
 }
 
@@ -1231,7 +1300,7 @@ pub unsafe extern "C" fn meshemu_board_wdt_init(
     timeout_sec: u32,
     panic_on_timeout: bool,
 ) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.wdt_init(timeout_sec, panic_on_timeout);
     }
 }
@@ -1243,7 +1312,7 @@ pub unsafe extern "C" fn meshemu_board_wdt_init(
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_wdt_feed(board: *mut c_void) -> bool {
-    unsafe { board_mut(board) }.is_some_and(VirtualBoard::wdt_feed)
+    unsafe { board_mut(board) }.is_some_and(|mut board| board.wdt_feed())
 }
 
 /// Returns `MESHEMU_WDT_*` for the task watchdog.
@@ -1254,7 +1323,7 @@ pub unsafe extern "C" fn meshemu_board_wdt_feed(board: *mut c_void) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_wdt_get_status(board: *mut c_void) -> u8 {
     unsafe { board_mut(board) }
-        .map(VirtualBoard::wdt_status)
+        .map(|mut board| board.wdt_status())
         .unwrap_or(mycelium_board::WDT_STATUS_DISABLED)
 }
 
@@ -1265,7 +1334,7 @@ pub unsafe extern "C" fn meshemu_board_wdt_get_status(board: *mut c_void) -> u8 
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_wdt_disable(board: *mut c_void) {
-    if let Some(board) = unsafe { board_mut(board) } {
+    if let Some(mut board) = unsafe { board_mut(board) } {
         board.wdt_disable();
     }
 }
@@ -1277,7 +1346,7 @@ pub unsafe extern "C" fn meshemu_board_wdt_disable(board: *mut c_void) {
 /// `board` must be a live board handle returned by [`meshemu_board_create`].
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_board_quiesce_peripherals(board: *mut c_void) -> bool {
-    let Some(board) = (unsafe { board_mut(board) }) else {
+    let Some(mut board) = (unsafe { board_mut(board) }) else {
         return false;
     };
     if let Some(storage) = lock(&STORAGE).get_mut(&board.instance_id) {
@@ -1384,7 +1453,7 @@ pub unsafe extern "C" fn meshemu_i2c_keyboard_inject_key_byte(keyboard: *mut c_v
     let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
         return;
     };
-    lock(keyboard).inject_key_byte(key_byte);
+    lock(&**keyboard).inject_key_byte(key_byte);
 }
 
 /// Configure whether the emulated C3 retains its backlight across host resets.
@@ -1401,7 +1470,7 @@ pub unsafe extern "C" fn meshemu_i2c_keyboard_set_cross_reset(
     let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
         return;
     };
-    lock(keyboard).set_cross_reset_persist(persist);
+    lock(&**keyboard).set_cross_reset_persist(persist);
 }
 
 /// Destroys a keyboard handle.
@@ -1454,13 +1523,13 @@ pub unsafe extern "C" fn meshemu_wire_shim_create_for_instance(
 /// Both arguments must be null or live handles of their corresponding types.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_shim_set_keyboard(wire: *mut c_void, keyboard: *mut c_void) {
-    let Some(wire) = (unsafe { wire_mut(wire) }) else {
+    let Some(mut wire) = (unsafe { wire_mut(wire) }) else {
         return;
     };
     let Some(keyboard) = (unsafe { keyboard_ref(keyboard) }) else {
         return;
     };
-    wire.set_keyboard(std::sync::Arc::clone(keyboard));
+    wire.set_keyboard(std::sync::Arc::clone(&*keyboard));
 }
 
 /// Initializes a Wire shim.
@@ -1471,6 +1540,7 @@ pub unsafe extern "C" fn meshemu_wire_shim_set_keyboard(wire: *mut c_void, keybo
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_begin(wire: *mut c_void) -> bool {
     unsafe { wire_mut(wire) }
+        .as_deref_mut()
         .map(WireShim::begin)
         .unwrap_or(false)
 }
@@ -1482,7 +1552,7 @@ pub unsafe extern "C" fn meshemu_wire_begin(wire: *mut c_void) -> bool {
 /// `wire` must be a live Wire shim handle.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_set_clock(wire: *mut c_void, clock_hz: u32) {
-    if let Some(wire) = unsafe { wire_mut(wire) } {
+    if let Some(mut wire) = unsafe { wire_mut(wire) } {
         wire.set_clock(clock_hz);
     }
 }
@@ -1539,6 +1609,7 @@ pub unsafe extern "C" fn meshemu_wire_read_idle_levels(
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_clock_out_recovery(wire: *mut c_void) -> u8 {
     unsafe { wire_mut(wire) }
+        .as_deref_mut()
         .map(WireShim::clock_out_recovery)
         .unwrap_or(2)
 }
@@ -1550,7 +1621,7 @@ pub unsafe extern "C" fn meshemu_wire_clock_out_recovery(wire: *mut c_void) -> u
 /// `wire` must be a live Wire shim handle.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_emit_stop(wire: *mut c_void) {
-    if let Some(wire) = unsafe { wire_mut(wire) } {
+    if let Some(mut wire) = unsafe { wire_mut(wire) } {
         wire.emit_stop();
     }
 }
@@ -1562,7 +1633,7 @@ pub unsafe extern "C" fn meshemu_wire_emit_stop(wire: *mut c_void) {
 /// `wire` must be a live Wire shim handle.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_set_sda_stuck(wire: *mut c_void, stuck: bool) {
-    if let Some(wire) = unsafe { wire_mut(wire) } {
+    if let Some(mut wire) = unsafe { wire_mut(wire) } {
         wire.set_sda_stuck(stuck);
     }
 }
@@ -1574,7 +1645,7 @@ pub unsafe extern "C" fn meshemu_wire_set_sda_stuck(wire: *mut c_void, stuck: bo
 /// `wire` must be a live Wire shim handle.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_begin_transmission(wire: *mut c_void, address: u8) {
-    if let Some(wire) = unsafe { wire_mut(wire) } {
+    if let Some(mut wire) = unsafe { wire_mut(wire) } {
         wire.begin_transmission(address);
     }
 }
@@ -1587,7 +1658,7 @@ pub unsafe extern "C" fn meshemu_wire_begin_transmission(wire: *mut c_void, addr
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_write(wire: *mut c_void, byte: u8) -> usize {
     unsafe { wire_mut(wire) }
-        .map(|wire| wire.write_byte(byte))
+        .map(|mut wire| wire.write_byte(byte))
         .unwrap_or(0)
 }
 
@@ -1599,6 +1670,7 @@ pub unsafe extern "C" fn meshemu_wire_write(wire: *mut c_void, byte: u8) -> usiz
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_end_transmission(wire: *mut c_void) -> u8 {
     unsafe { wire_mut(wire) }
+        .as_deref_mut()
         .map(WireShim::end_transmission)
         .unwrap_or(4)
 }
@@ -1615,7 +1687,7 @@ pub unsafe extern "C" fn meshemu_wire_request_from(
     count: u8,
 ) -> u8 {
     unsafe { wire_mut(wire) }
-        .map(|wire| wire.request_from(address, count))
+        .map(|mut wire| wire.request_from(address, count))
         .unwrap_or(0)
 }
 
@@ -1638,7 +1710,10 @@ pub unsafe extern "C" fn meshemu_wire_available(wire: *mut c_void) -> i32 {
 /// `wire` must be a live Wire shim handle.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_wire_read(wire: *mut c_void) -> i32 {
-    unsafe { wire_mut(wire) }.map(WireShim::read).unwrap_or(-1)
+    unsafe { wire_mut(wire) }
+        .as_deref_mut()
+        .map(WireShim::read)
+        .unwrap_or(-1)
 }
 
 /// Destroys a Wire shim.
@@ -2010,6 +2085,16 @@ pub unsafe extern "C" fn meshemu_input_get_gpio_intr_enabled(
     enabled
 }
 
+fn display_boundary<T>(operation: &str, call: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).map_or_else(
+        |_| {
+            warn!(%operation, "panic contained at display FFI boundary");
+            None
+        },
+        Some,
+    )
+}
+
 /// Creates an SDL display for the requested LVGL major version.
 ///
 /// Returns null for non-T-Deck geometry, an unsupported ABI, or when v9 was
@@ -2026,14 +2111,21 @@ pub unsafe extern "C" fn meshemu_display_create_v(
     window_title: *const c_char,
     lvgl_version: i32,
 ) -> *mut c_void {
-    if !matches!(lvgl_version, 8 | 9) {
-        warn!(
-            lvgl_version,
-            "Display create rejected: unsupported LVGL version"
-        );
-        return ptr::null_mut();
-    }
-    unsafe { mycelium_display::meshemu_display_create_v(width, height, window_title, lvgl_version) }
+    display_boundary("display_create_v", || {
+        if !matches!(lvgl_version, 8 | 9) {
+            warn!(
+                lvgl_version,
+                "Display create rejected: unsupported LVGL version"
+            );
+            return ptr::null_mut();
+        }
+        // SAFETY: The caller contract is forwarded to the display backend;
+        // panics from allocation or LVGL callback state are contained here.
+        unsafe {
+            mycelium_display::meshemu_display_create_v(width, height, window_title, lvgl_version)
+        }
+    })
+    .unwrap_or(ptr::null_mut())
 }
 
 /// Creates an LVGL display with explicit partial-buffer and fidelity options.
@@ -2050,15 +2142,20 @@ pub unsafe extern "C" fn meshemu_display_create_ex(
     lvgl_version: i32,
     options: *const mycelium_display::DisplayBackendOptions,
 ) -> *mut c_void {
-    unsafe {
-        mycelium_display::meshemu_display_create_ex(
-            width,
-            height,
-            window_title,
-            lvgl_version,
-            options,
-        )
-    }
+    display_boundary("display_create_ex", || {
+        // SAFETY: The caller contract is forwarded to the display backend
+        // under the contained panic boundary.
+        unsafe {
+            mycelium_display::meshemu_display_create_ex(
+                width,
+                height,
+                window_title,
+                lvgl_version,
+                options,
+            )
+        }
+    })
+    .unwrap_or(ptr::null_mut())
 }
 
 /// Creates a default LVGL v9 display.
@@ -2092,24 +2189,29 @@ pub unsafe extern "C" fn meshemu_display_capture(
     if !size_out.is_null() {
         unsafe { *size_out = 0 };
     }
-    if display.is_null() || size_out.is_null() {
-        return ptr::null_mut();
-    }
-    let pixels = unsafe { mycelium_display::capture_managed_rgb565(display) }
-        .or_else(|| unsafe { mycelium_display::lvgl_v9::capture_lvgl_rgb565(display) });
-    let Some(pixels) = pixels else {
-        return ptr::null_mut();
-    };
-    let len = pixels.len();
-    let data = unsafe { libc::malloc(len) }.cast::<u8>();
-    if data.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe {
-        ptr::copy_nonoverlapping(pixels.as_ptr(), data, len);
-    }
-    unsafe { *size_out = len };
-    data
+    display_boundary("display_capture", || {
+        if display.is_null() || size_out.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: The display and output pointer are covered by this
+        // function's FFI contract; backend panics are contained.
+        let pixels = unsafe { mycelium_display::capture_managed_rgb565(display) }
+            .or_else(|| unsafe { mycelium_display::lvgl_v9::capture_lvgl_rgb565(display) });
+        let Some(pixels) = pixels else {
+            return ptr::null_mut();
+        };
+        let len = pixels.len();
+        let data = unsafe { libc::malloc(len) }.cast::<u8>();
+        if data.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(pixels.as_ptr(), data, len);
+            *size_out = len;
+        }
+        data
+    })
+    .unwrap_or(ptr::null_mut())
 }
 
 /// Releases a buffer returned by [`meshemu_display_capture`].
@@ -2131,7 +2233,11 @@ pub unsafe extern "C" fn meshemu_display_capture_free(data: *mut u8, size: usize
 /// `display` must be null or a live handle returned by a display creator.
 #[no_mangle]
 pub unsafe extern "C" fn meshemu_display_destroy(display: *mut c_void) {
-    unsafe { mycelium_display::meshemu_display_destroy(display) };
+    let _ = display_boundary("display_destroy", || {
+        // SAFETY: The caller contract is forwarded to the display backend;
+        // backend panics are contained at this C ABI boundary.
+        unsafe { mycelium_display::meshemu_display_destroy(display) };
+    });
 }
 
 /// Creates a radio and registers its node with the process-wide radio bus.
@@ -2334,7 +2440,8 @@ pub unsafe extern "C" fn meshemu_radio_get_rssi(radio: *mut c_void) -> f32 {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0.0;
     };
-    lock(&handle.last_rx).map(|(rssi, _)| rssi).unwrap_or(0.0)
+    let rssi = lock(&handle.last_rx).map(|(rssi, _)| rssi).unwrap_or(0.0);
+    rssi
 }
 
 /// # Safety
@@ -2345,7 +2452,8 @@ pub unsafe extern "C" fn meshemu_radio_get_snr(radio: *mut c_void) -> f32 {
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return 0.0;
     };
-    lock(&handle.last_rx).map(|(_, snr)| snr).unwrap_or(0.0)
+    let snr = lock(&handle.last_rx).map(|(_, snr)| snr).unwrap_or(0.0);
+    snr
 }
 
 /// # Safety
@@ -2403,7 +2511,8 @@ pub unsafe extern "C" fn meshemu_radio_get_dio2_config(radio: *mut c_void) -> bo
     let Some(handle) = (unsafe { handle_ref(radio) }) else {
         return false;
     };
-    lock(&handle.radio).dio2_rf_switch_enabled
+    let enabled = lock(&handle.radio).dio2_rf_switch_enabled;
+    enabled
 }
 
 /// Destroys a radio handle. The caller must pass each non-null handle once.
@@ -2470,9 +2579,11 @@ mod input_ffi_tests {
         }
 
         let fresh = meshemu_i2c_keyboard_create();
-        let fresh_keyboard = unsafe { keyboard_ref(fresh) }.unwrap();
-        assert!(lock(fresh_keyboard).cross_reset_persist);
-        assert_eq!(lock(fresh_keyboard).backlight(), 128);
+        {
+            let fresh_keyboard = unsafe { keyboard_ref(fresh) }.unwrap();
+            assert!(lock(&**fresh_keyboard).cross_reset_persist);
+            assert_eq!(lock(&**fresh_keyboard).backlight(), 128);
+        }
         unsafe {
             meshemu_i2c_keyboard_set_cross_reset(fresh, false);
             meshemu_i2c_keyboard_destroy(fresh);
