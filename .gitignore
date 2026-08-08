@@ -5,3 +5,4 @@
 /examples/       Example firmware integrations (SigurdOS, minimal-mesh)
 /docs/           Design docs, API reference, architecture decisions
 /target/
+.tokensave/
